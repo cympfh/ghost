@@ -40,6 +40,12 @@ pub struct RunSpec {
 }
 
 pub fn run(spec: RunSpec) -> Result<i32> {
+    if spec.mode == RunMode::Picker {
+        if let Some(message) = skip_empty_picker(&spec)? {
+            println!("{message}");
+            return Ok(0);
+        }
+    }
     let header = spec.header.clone();
     tui::run(header, move |tx, rx| {
         if let Err(err) = babysit(spec, tx.clone(), rx) {
@@ -803,6 +809,28 @@ fn log(tx: &Sender<UiEvent>, kind: LogKind, text: impl Into<String>) {
     }));
 }
 
+/// Repo-only mode with nothing open prints this and exits 0 instead of the picker.
+fn empty_repo_notice(slug: &str, empty: bool) -> Option<String> {
+    if empty {
+        Some(format!("No open issues or PRs in {slug}."))
+    } else {
+        None
+    }
+}
+
+/// List open PRs and issues before the TUI. An empty repo skips the picker.
+/// Preflight or `gh` failures fall through so the TUI can show them.
+fn skip_empty_picker(spec: &RunSpec) -> Result<Option<String>> {
+    if run_preflight(&spec.target.slug()).is_err() {
+        return Ok(None);
+    }
+    let items = match Gh::new(spec.target.slug()).open_items() {
+        Ok(items) => items,
+        Err(_) => return Ok(None),
+    };
+    Ok(empty_repo_notice(&spec.target.slug(), items.is_empty()))
+}
+
 fn run_preflight(slug: &str) -> Result<Option<String>, String> {
     let path = std::env::var("PATH").unwrap_or_default();
     let found = which("gh", &path).is_some();
@@ -881,4 +909,18 @@ fn mode_name(mode: RunMode) -> &'static str {
 fn short_id(id: &str) -> &str {
     let n = id.len().min(8);
     &id[..n]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_repo_notice;
+
+    #[test]
+    fn empty_repo_skips_the_picker() {
+        assert_eq!(
+            empty_repo_notice("OWNER/REPO", true).as_deref(),
+            Some("No open issues or PRs in OWNER/REPO.")
+        );
+        assert!(empty_repo_notice("OWNER/REPO", false).is_none());
+    }
 }
