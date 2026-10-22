@@ -1,0 +1,25 @@
+[package]
+name = "ghost"
+version = "0.1.0"
+edition = "2021"
+description = "TUI that babysits GitHub PRs and issues with a local AI coding agent"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "ghost"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "=1.0.93"
+clap = { version = "=4.5.20", features = ["derive"] }
+crossterm = "=0.28.1"
+ratatui = "=0.28.1"
+serde = { version = "=1.0.215", features = ["derive"] }
+serde_json = "=1.0.133"
+unicode-width = "=0.1.14"
+# Direct pins keep transitive crates on Rust 1.83 (newer releases set rust-version
+# above 1.83 or use edition 2024). These ranges match ratatui 0.28.1.
+instability = "=0.3.7"
+unicode-segmentation = "=1.12.0"
+unicode-truncate = "=1.1.0"
