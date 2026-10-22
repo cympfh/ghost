@@ -29,7 +29,8 @@ use crate::state::{self, GhostState, SessionSlot};
 use crate::target::GhTarget;
 use crate::text::{format_countdown, short_sha};
 use crate::tui::{
-    self, ConfirmAnswer, ConfirmKind, LogKind, LogLine, Side, Status, UiCmd, UiEvent,
+    self, merge_question, ConfirmAnswer, ConfirmKind, LogKind, LogLine, MergeStyle, Side, Status,
+    UiCmd, UiEvent,
 };
 use crate::watch::{
     after_opening_survey, after_review_verdict, approve_signal, auto_review_exit,
@@ -690,8 +691,8 @@ impl Ctx {
 
     fn review_exit_prompt(&mut self, number: u64) -> Result<bool> {
         let message = self.say(
-            &format!("PR #{number} は問題なしと判断しました。終了しますか？ [y/c]"),
-            &format!("PR #{number} looks fine. Exit? [y/c]"),
+            &format!("PR #{number} は問題なしと判断しました。終了しますか？"),
+            &format!("PR #{number} looks fine. Exit?"),
         );
         let answer = match auto_review_exit(self.spec.yes, stdin_is_tty()) {
             Some(answer) => {
@@ -704,12 +705,13 @@ impl Ctx {
                     number,
                     message,
                     kind: ConfirmKind::ReviewExit,
+                    lang: self.spec.lang,
                 });
                 self.status.phase = "confirm".into();
                 self.push_status();
                 match self.wait_confirm()? {
                     None => return Ok(true),
-                    Some(answer) => confirm_review_answer(answer),
+                    Some((answer, _)) => confirm_review_answer(answer),
                 }
             }
         };
@@ -1018,36 +1020,38 @@ impl Ctx {
     }
 
     fn offer_merge(&mut self, number: u64, snap: &PrSnap) -> Result<bool> {
-        let message = self.say(
-            &format!("PR #{number} を merge しますか？ [y/n/c]"),
-            &format!("Merge PR #{number}? [y/n/c]"),
-        );
-        let answer = match auto_merge_answer(self.spec.merge_yes, self.spec.yes, stdin_is_tty()) {
-            Some(answer) => {
-                let why = if self.spec.merge_yes {
-                    "y (--merge-yes)"
-                } else if stdin_is_tty() {
-                    "n"
-                } else {
-                    "n (not a TTY)"
-                };
-                self.log(format!("{message} {why}"));
-                answer
-            }
-            None => {
-                let _ = self.tx.send(UiEvent::Confirm {
-                    number,
-                    message,
-                    kind: ConfirmKind::Merge,
-                });
-                self.status.phase = "confirm".into();
-                self.push_status();
-                match self.wait_confirm()? {
-                    None => return Ok(true),
-                    Some(answer) => confirm_merge_answer(answer),
+        let initial = MergeStyle::from_flag(self.spec.merge_method.as_deref());
+        let message = merge_question(number, initial, self.spec.lang);
+        let (answer, method) =
+            match auto_merge_answer(self.spec.merge_yes, self.spec.yes, stdin_is_tty()) {
+                Some(answer) => {
+                    let why = if self.spec.merge_yes {
+                        "y (--merge-yes)"
+                    } else if stdin_is_tty() {
+                        "n"
+                    } else {
+                        "n (not a TTY)"
+                    };
+                    self.log(format!("{message} {why}"));
+                    (answer, initial)
                 }
-            }
-        };
+                None => {
+                    let _ = self.tx.send(UiEvent::Confirm {
+                        number,
+                        message,
+                        kind: ConfirmKind::Merge(initial),
+                        lang: self.spec.lang,
+                    });
+                    self.status.phase = "confirm".into();
+                    self.push_status();
+                    match self.wait_confirm()? {
+                        None => return Ok(true),
+                        Some((answer, chosen)) => {
+                            (confirm_merge_answer(answer), chosen.unwrap_or(initial))
+                        }
+                    }
+                }
+            };
         match answer {
             MergeAnswer::Continue => {
                 self.log(self.say(
@@ -1066,11 +1070,11 @@ impl Ctx {
                 );
                 Ok(true)
             }
-            MergeAnswer::Merge => self.merge_now(number, &snap.head_sha),
+            MergeAnswer::Merge => self.merge_now(number, &snap.head_sha, method),
         }
     }
 
-    fn merge_now(&mut self, number: u64, expected_sha: &str) -> Result<bool> {
+    fn merge_now(&mut self, number: u64, expected_sha: &str, method: MergeStyle) -> Result<bool> {
         let fresh = match self.gh.pr(number) {
             Ok(snap) => snap,
             Err(err) => {
@@ -1085,15 +1089,12 @@ impl Ctx {
             ));
             return Ok(false);
         }
-        let method = crate::github::merge_method_flag(self.spec.merge_method.as_deref());
+        let flag = method.flag();
         self.log(self.say(
-            &format!("merge 方法: {method}"),
-            &format!("merge method: {method}"),
+            &format!("merge 方法: {flag}"),
+            &format!("merge method: {flag}"),
         ));
-        match self
-            .gh
-            .merge_pr(number, self.spec.merge_method.as_deref(), &fresh.head_sha)
-        {
+        match self.gh.merge_pr(number, Some(flag), &fresh.head_sha) {
             Ok(()) => {
                 let message = if self.spec.merge_yes {
                     self.say(
@@ -1343,8 +1344,8 @@ impl Ctx {
 
     fn confirm_and_code(&mut self, pr: u64) -> Result<()> {
         let message = self.say(
-            &format!("PR #{pr} を --code として続けますか？ [Y/n]"),
-            &format!("Continue as --code on PR #{pr}? [Y/n]"),
+            &format!("PR #{pr} を --code として続けますか？"),
+            &format!("Continue as --code on PR #{pr}?"),
         );
         let yes = if self.spec.yes {
             self.log(format!("{message} yes (--yes)"));
@@ -1354,13 +1355,14 @@ impl Ctx {
                 number: pr,
                 message: message.clone(),
                 kind: ConfirmKind::ContinueAsCode,
+                lang: self.spec.lang,
             });
             self.status.phase = "confirm".into();
             self.push_status();
             match self.wait_confirm()? {
                 None => return Ok(()),
-                Some(ConfirmAnswer::Yes) => true,
-                Some(ConfirmAnswer::No | ConfirmAnswer::Continue) => false,
+                Some((ConfirmAnswer::Yes, _)) => true,
+                Some((ConfirmAnswer::No | ConfirmAnswer::Continue, _)) => false,
             }
         };
         if !yes {
@@ -1846,10 +1848,10 @@ impl Ctx {
         }
     }
 
-    fn wait_confirm(&mut self) -> Result<Option<ConfirmAnswer>> {
+    fn wait_confirm(&mut self) -> Result<Option<(ConfirmAnswer, Option<MergeStyle>)>> {
         loop {
             match self.rx.recv() {
-                Ok(UiCmd::Confirm(answer)) => return Ok(Some(answer)),
+                Ok(UiCmd::Confirm { answer, method }) => return Ok(Some((answer, method))),
                 Ok(UiCmd::Quit) | Err(_) => {
                     self.stop(0, "quit".into());
                     return Ok(None);
@@ -1870,7 +1872,7 @@ impl Ctx {
                 self.log("interrupted the agent; the session stays open");
             }
             UiCmd::Input(text) => self.on_input(text, self.agent.turn_open())?,
-            UiCmd::Pick { .. } | UiCmd::Choose(_) | UiCmd::Confirm(_) => {}
+            UiCmd::Pick { .. } | UiCmd::Choose(_) | UiCmd::Confirm { .. } => {}
         }
         Ok(())
     }

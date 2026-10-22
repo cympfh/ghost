@@ -18,6 +18,7 @@ use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
 use crate::github::{ItemKind, OpenItem};
+use crate::lang::Lang;
 use crate::text::{pad_cols, truncate_cols, wrap_cols};
 use crate::theme;
 
@@ -83,6 +84,7 @@ pub enum View {
         number: u64,
         message: String,
         kind: ConfirmKind,
+        lang: Lang,
     },
     Fatal {
         message: String,
@@ -102,6 +104,7 @@ pub enum UiEvent {
         number: u64,
         message: String,
         kind: ConfirmKind,
+        lang: Lang,
     },
     Fatal(String),
     Exit {
@@ -121,17 +124,101 @@ pub enum UiCmd {
         side: Option<Side>,
     },
     Choose(Side),
-    Confirm(ConfirmAnswer),
+    Confirm {
+        answer: ConfirmAnswer,
+        /// Method selected on the merge dialog. Other prompts leave this empty.
+        method: Option<MergeStyle>,
+    },
+}
+
+/// `gh pr merge` strategy shown on the merge dialog. `m`, Tab, and the arrow
+/// keys walk squash → merge → rebase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeStyle {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeStyle {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Squash => Self::Merge,
+            Self::Merge => Self::Rebase,
+            Self::Rebase => Self::Squash,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Squash => "squash",
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+        }
+    }
+
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Squash => "--squash",
+            Self::Merge => "--merge",
+            Self::Rebase => "--rebase",
+        }
+    }
+
+    /// `--merge-method`, or squash when the flag was omitted.
+    pub fn from_flag(method: Option<&str>) -> Self {
+        match crate::github::merge_method_flag(method) {
+            "--merge" => Self::Merge,
+            "--rebase" => Self::Rebase,
+            _ => Self::Squash,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmKind {
-    /// Issue handoff. Enter accepts yes.
+    /// Issue handoff. Enter is yes.
     ContinueAsCode,
-    /// Merge prompt. Enter, Esc, and Ctrl-C mean no.
-    Merge,
-    /// Approve verdict. Enter, Esc, and Ctrl-C mean exit. No merge.
+    /// Merge prompt. Enter, Esc, and Ctrl-C are no. `m` changes [`MergeStyle`].
+    Merge(MergeStyle),
+    /// Approve verdict. Enter, Esc, and Ctrl-C exit. No merge.
     ReviewExit,
+}
+
+/// Question line for the merge dialog. The footer is [`confirm_footer`].
+pub fn merge_question(number: u64, method: MergeStyle, lang: Lang) -> String {
+    match lang {
+        Lang::Ja => format!("PR #{number} を merge しますか？ 方法: {}", method.word()),
+        Lang::En => format!("Merge PR #{number}? method: {}", method.word()),
+    }
+}
+
+/// Keys and the Enter default, derived from the prompt kind. Capital letter is Enter.
+pub fn confirm_footer(kind: ConfirmKind, lang: Lang) -> String {
+    match (kind, lang) {
+        (ConfirmKind::Merge(method), Lang::Ja) => format!(
+            "y merge / N(Enter) やめる / c 続ける / m 方法: {}",
+            method.word()
+        ),
+        (ConfirmKind::Merge(method), Lang::En) => format!(
+            "y merge / N(Enter) cancel / c continue / m method: {}",
+            method.word()
+        ),
+        (ConfirmKind::ReviewExit, Lang::Ja) => "Y(Enter) 終了 / c 続ける".into(),
+        (ConfirmKind::ReviewExit, Lang::En) => "Y(Enter) exit / c continue".into(),
+        (ConfirmKind::ContinueAsCode, Lang::Ja) => "Y(Enter) 続ける / n やめる".into(),
+        (ConfirmKind::ContinueAsCode, Lang::En) => "Y(Enter) yes / n no".into(),
+    }
+}
+
+fn confirm_title(kind: ConfirmKind, lang: Lang) -> &'static str {
+    match (kind, lang) {
+        (ConfirmKind::Merge(_), _) => " merge ",
+        (ConfirmKind::ReviewExit, Lang::Ja) => " 終了 ",
+        (ConfirmKind::ReviewExit, Lang::En) => " exit ",
+        (ConfirmKind::ContinueAsCode, Lang::Ja) => " 続ける ",
+        (ConfirmKind::ContinueAsCode, Lang::En) => " continue ",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,11 +363,13 @@ fn apply(app: &mut App, event: UiEvent) {
             number,
             message,
             kind,
+            lang,
         } => {
             app.view = View::Confirm {
                 number,
                 message,
                 kind,
+                lang,
             };
             app.input_mode = false;
         }
@@ -308,8 +397,14 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Option<UiCmd> {
         }
         if let View::Confirm { kind, .. } = app.view {
             return Some(match kind {
-                ConfirmKind::Merge => UiCmd::Confirm(ConfirmAnswer::No),
-                ConfirmKind::ReviewExit => UiCmd::Confirm(ConfirmAnswer::Yes),
+                ConfirmKind::Merge(method) => UiCmd::Confirm {
+                    answer: ConfirmAnswer::No,
+                    method: Some(method),
+                },
+                ConfirmKind::ReviewExit => UiCmd::Confirm {
+                    answer: ConfirmAnswer::Yes,
+                    method: None,
+                },
                 ConfirmKind::ContinueAsCode => UiCmd::Interrupt,
             });
         }
@@ -339,22 +434,36 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Option<UiCmd> {
             Some(UiCmd::Quit)
         }
         (ViewKind::Confirm, KeyCode::Char('y') | KeyCode::Char('Y')) => {
+            let method = merge_style(&app.view);
             app.view = View::Log;
-            Some(UiCmd::Confirm(ConfirmAnswer::Yes))
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::Yes,
+                method,
+            })
         }
         (ViewKind::Confirm, KeyCode::Char('c') | KeyCode::Char('C')) => {
             if matches!(
                 app.view,
                 View::Confirm {
-                    kind: ConfirmKind::Merge | ConfirmKind::ReviewExit,
+                    kind: ConfirmKind::Merge(_) | ConfirmKind::ReviewExit,
                     ..
                 }
             ) {
                 app.view = View::Log;
-                Some(UiCmd::Confirm(ConfirmAnswer::Continue))
+                Some(UiCmd::Confirm {
+                    answer: ConfirmAnswer::Continue,
+                    method: None,
+                })
             } else {
                 None
             }
+        }
+        (
+            ViewKind::Confirm,
+            KeyCode::Char('m') | KeyCode::Char('M') | KeyCode::Tab | KeyCode::Left | KeyCode::Right,
+        ) => {
+            cycle_merge_method(app);
+            None
         }
         (ViewKind::Confirm, KeyCode::Enter) => confirm_enter(app),
         (ViewKind::Confirm, KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc) => {
@@ -549,8 +658,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let View::Choose { number, title } = &app.view {
         draw_choose(frame, chunks[1], *number, title);
     }
-    if let View::Confirm { message, .. } = &app.view {
-        draw_confirm(frame, chunks[1], message);
+    if let View::Confirm {
+        message,
+        kind,
+        lang,
+        ..
+    } = &app.view
+    {
+        draw_confirm(frame, chunks[1], message, *kind, *lang);
     }
 }
 
@@ -772,51 +887,72 @@ fn window_str(text: &str, cursor: usize, width: usize) -> (String, usize) {
     (shown, cursor - start)
 }
 
-fn confirm_enter(app: &mut App) -> Option<UiCmd> {
-    let answer = match app.view {
+fn merge_style(view: &View) -> Option<MergeStyle> {
+    match view {
         View::Confirm {
-            kind: ConfirmKind::Merge,
+            kind: ConfirmKind::Merge(style),
             ..
-        } => ConfirmAnswer::No,
+        } => Some(*style),
+        _ => None,
+    }
+}
+
+fn cycle_merge_method(app: &mut App) {
+    let View::Confirm {
+        kind: ConfirmKind::Merge(style),
+        message,
+        number,
+        lang,
+        ..
+    } = &mut app.view
+    else {
+        return;
+    };
+    *style = style.cycle();
+    *message = merge_question(*number, *style, *lang);
+}
+
+fn confirm_enter(app: &mut App) -> Option<UiCmd> {
+    let (answer, method) = match app.view {
+        View::Confirm {
+            kind: ConfirmKind::Merge(style),
+            ..
+        } => (ConfirmAnswer::No, Some(style)),
         View::Confirm {
             kind: ConfirmKind::ReviewExit | ConfirmKind::ContinueAsCode,
             ..
-        } => ConfirmAnswer::Yes,
+        } => (ConfirmAnswer::Yes, None),
         _ => return None,
     };
     app.view = View::Log;
-    Some(UiCmd::Confirm(answer))
+    Some(UiCmd::Confirm { answer, method })
 }
 
 fn confirm_decline(app: &mut App) -> Option<UiCmd> {
-    let answer = match app.view {
+    let (answer, method) = match app.view {
         View::Confirm {
             kind: ConfirmKind::ReviewExit,
             ..
-        } => ConfirmAnswer::Yes,
+        } => (ConfirmAnswer::Yes, None),
         View::Confirm {
-            kind: ConfirmKind::Merge | ConfirmKind::ContinueAsCode,
+            kind: ConfirmKind::Merge(style),
             ..
-        } => ConfirmAnswer::No,
+        } => (ConfirmAnswer::No, Some(style)),
+        View::Confirm {
+            kind: ConfirmKind::ContinueAsCode,
+            ..
+        } => (ConfirmAnswer::No, None),
         _ => return None,
     };
     app.view = View::Log;
-    Some(UiCmd::Confirm(answer))
+    Some(UiCmd::Confirm { answer, method })
 }
 
 fn idle_hint(view: &View) -> String {
     match view {
         View::Picker { .. } => "r review · c code · enter select".into(),
         View::Choose { .. } => "r review · c code · esc back".into(),
-        View::Confirm {
-            kind: ConfirmKind::Merge,
-            ..
-        } => "y merge · n exit · c continue · enter = n".into(),
-        View::Confirm {
-            kind: ConfirmKind::ReviewExit,
-            ..
-        } => "y exit · c continue · enter = y".into(),
-        View::Confirm { .. } => "Y yes · n no · enter accepts yes".into(),
+        View::Confirm { kind, lang, .. } => confirm_footer(*kind, *lang),
         View::Fatal { .. } => "q quit".into(),
         View::Log => "i message the agent".into(),
     }
@@ -848,20 +984,19 @@ fn status_line(app: &App, width: usize) -> Paragraph<'static> {
 
 fn hint_line(app: &App) -> Paragraph<'static> {
     let text = if app.input_mode {
-        " enter send · esc cancel · backspace delete"
+        " enter send · esc cancel · backspace delete".to_string()
     } else {
-        match app.view {
-            View::Picker { .. } => " j/k move · enter select · r review · c code · q quit",
-            View::Choose { .. } => " r review · c code · esc back · q quit",
-            View::Confirm { .. } => " y / enter yes · n no · q quit",
-            View::Fatal { .. } => " q quit",
-            View::Log => " q quit · i input · j/k scroll · ctrl-c interrupt · g/G top/bottom",
+        match &app.view {
+            View::Picker { .. } => " j/k move · enter select · r review · c code · q quit".into(),
+            View::Choose { .. } => " r review · c code · esc back · q quit".into(),
+            View::Confirm { kind, lang, .. } => confirm_footer(*kind, *lang),
+            View::Fatal { .. } => " q quit".into(),
+            View::Log => {
+                " q quit · i input · j/k scroll · ctrl-c interrupt · g/G top/bottom".into()
+            }
         }
     };
-    Paragraph::new(Line::from(Span::styled(
-        text.to_string(),
-        theme::secondary(),
-    )))
+    Paragraph::new(Line::from(Span::styled(text, theme::secondary())))
 }
 
 fn draw_choose(frame: &mut Frame, area: Rect, number: u64, title: &str) {
@@ -889,24 +1024,21 @@ fn draw_choose(frame: &mut Frame, area: Rect, number: u64, title: &str) {
     frame.render_widget(body, rect);
 }
 
-fn draw_confirm(frame: &mut Frame, area: Rect, message: &str) {
-    let width = 56.min(area.width);
+fn draw_confirm(frame: &mut Frame, area: Rect, message: &str, kind: ConfirmKind, lang: Lang) {
+    let width = 74.min(area.width);
     let height = 9.min(area.height);
     let rect = centered(area, width, height);
     frame.render_widget(Clear, rect);
+    let footer = confirm_footer(kind, lang);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::border_confirm())
-        .title(" continue? ");
+        .title(confirm_title(kind, lang));
     let body = Paragraph::new(vec![
         Line::from(""),
         Line::from(Span::styled(message.to_string(), theme::title())),
         Line::from(""),
-        Line::from(Span::styled(" [Y] yes     n no", theme::warn())),
-        Line::from(Span::styled(
-            " enter accepts the default",
-            theme::secondary(),
-        )),
+        Line::from(Span::styled(footer, theme::warn())),
     ])
     .block(block)
     .wrap(Wrap { trim: false });
@@ -951,71 +1083,207 @@ mod tests {
         s
     }
 
+    fn confirm(number: u64, message: &str, kind: ConfirmKind, lang: Lang) -> View {
+        View::Confirm {
+            number,
+            message: message.into(),
+            kind,
+            lang,
+        }
+    }
+
     #[test]
-    fn confirm_defaults_yes_and_n_declines() {
+    fn confirm_defaults_match_each_prompt() {
         let mut app = App::new("ghost github.com/acme/app/issue/7".into());
-        app.view = View::Confirm {
-            number: 12,
-            message: "Continue as --code on PR #12? [Y/n]".into(),
-            kind: ConfirmKind::ContinueAsCode,
-        };
+        app.view = confirm(
+            12,
+            "Continue as --code on PR #12?",
+            ConfirmKind::ContinueAsCode,
+            Lang::En,
+        );
         assert_eq!(
             on_key(&mut app, key(KeyCode::Enter)),
-            Some(UiCmd::Confirm(ConfirmAnswer::Yes))
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::Yes,
+                method: None,
+            })
         );
-        app.view = View::Confirm {
-            number: 12,
-            message: "Continue as --code on PR #12? [Y/n]".into(),
-            kind: ConfirmKind::ContinueAsCode,
-        };
+        app.view = confirm(
+            12,
+            "Continue as --code on PR #12?",
+            ConfirmKind::ContinueAsCode,
+            Lang::En,
+        );
         assert_eq!(
             on_key(&mut app, key(KeyCode::Char('n'))),
-            Some(UiCmd::Confirm(ConfirmAnswer::No))
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::No,
+                method: None,
+            })
         );
-        app.view = View::Confirm {
-            number: 3,
-            message: "PR #3 を merge しますか？ [y/n/c]".into(),
-            kind: ConfirmKind::Merge,
-        };
+
+        app.view = confirm(
+            3,
+            &merge_question(3, MergeStyle::Squash, Lang::Ja),
+            ConfirmKind::Merge(MergeStyle::Squash),
+            Lang::Ja,
+        );
+        assert_eq!(on_key(&mut app, key(KeyCode::Char('m'))), None);
+        assert_eq!(on_key(&mut app, key(KeyCode::Tab)), None);
+        match &app.view {
+            View::Confirm {
+                kind: ConfirmKind::Merge(MergeStyle::Rebase),
+                message,
+                ..
+            } => {
+                assert!(message.contains("方法: rebase"), "{message}");
+            }
+            other => panic!("expected rebase, {other:?}"),
+        }
         assert_eq!(
             on_key(&mut app, key(KeyCode::Char('y'))),
-            Some(UiCmd::Confirm(ConfirmAnswer::Yes))
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::Yes,
+                method: Some(MergeStyle::Rebase),
+            })
         );
-        app.view = View::Confirm {
-            number: 3,
-            message: "PR #3 を merge しますか？ [y/n/c]".into(),
-            kind: ConfirmKind::Merge,
-        };
+
+        app.view = confirm(
+            3,
+            &merge_question(3, MergeStyle::Squash, Lang::Ja),
+            ConfirmKind::Merge(MergeStyle::Squash),
+            Lang::Ja,
+        );
         assert_eq!(
             on_key(&mut app, key(KeyCode::Enter)),
-            Some(UiCmd::Confirm(ConfirmAnswer::No))
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::No,
+                method: Some(MergeStyle::Squash),
+            })
         );
-        app.view = View::Confirm {
-            number: 3,
-            message: "PR #3 を merge しますか？ [y/n/c]".into(),
-            kind: ConfirmKind::Merge,
-        };
+        app.view = confirm(
+            3,
+            &merge_question(3, MergeStyle::Merge, Lang::Ja),
+            ConfirmKind::Merge(MergeStyle::Merge),
+            Lang::Ja,
+        );
+        assert_eq!(
+            on_key(&mut app, key(KeyCode::Esc)),
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::No,
+                method: Some(MergeStyle::Merge),
+            })
+        );
+        app.view = confirm(
+            3,
+            &merge_question(3, MergeStyle::Squash, Lang::Ja),
+            ConfirmKind::Merge(MergeStyle::Squash),
+            Lang::Ja,
+        );
         assert_eq!(
             on_key(&mut app, key(KeyCode::Char('c'))),
-            Some(UiCmd::Confirm(ConfirmAnswer::Continue))
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::Continue,
+                method: None,
+            })
         );
-        app.view = View::Confirm {
-            number: 3,
-            message: "PR #3 は問題なしと判断しました。終了しますか？ [y/c]".into(),
-            kind: ConfirmKind::ReviewExit,
-        };
+
+        app.view = confirm(
+            3,
+            "PR #3 は問題なしと判断しました。終了しますか？",
+            ConfirmKind::ReviewExit,
+            Lang::Ja,
+        );
         assert_eq!(
             on_key(&mut app, key(KeyCode::Enter)),
-            Some(UiCmd::Confirm(ConfirmAnswer::Yes))
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::Yes,
+                method: None,
+            })
         );
-        app.view = View::Confirm {
-            number: 3,
-            message: "PR #3 は問題なしと判断しました。終了しますか？ [y/c]".into(),
-            kind: ConfirmKind::ReviewExit,
-        };
+        app.view = confirm(
+            3,
+            "PR #3 は問題なしと判断しました。終了しますか？",
+            ConfirmKind::ReviewExit,
+            Lang::Ja,
+        );
         assert_eq!(
             on_key(&mut app, key(KeyCode::Char('c'))),
-            Some(UiCmd::Confirm(ConfirmAnswer::Continue))
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::Continue,
+                method: None,
+            })
+        );
+    }
+
+    #[test]
+    fn merge_dialog_renders_enter_as_no_and_the_method() {
+        let mut app = App::new("ghost github.com/acme/app/pr/3 --code".into());
+        app.view = confirm(
+            3,
+            &merge_question(3, MergeStyle::Squash, Lang::Ja),
+            ConfirmKind::Merge(MergeStyle::Squash),
+            Lang::Ja,
+        );
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(
+            !text.contains("[Y]"),
+            "merge dialog must not use the generic yes bracket\n{text}"
+        );
+        assert!(
+            !text.to_ascii_lowercase().contains("accepts the default"),
+            "merge dialog must not say enter accepts\n{text}"
+        );
+        assert!(text.contains("N(Enter)"), "{text}");
+        assert!(text.contains("やめる"), "{text}");
+        assert!(text.contains("方法: squash"), "{text}");
+        assert!(text.contains("y merge"), "{text}");
+        assert!(!text.contains("continue?"), "{text}");
+
+        app.view = confirm(
+            3,
+            &merge_question(3, MergeStyle::Squash, Lang::En),
+            ConfirmKind::Merge(MergeStyle::Squash),
+            Lang::En,
+        );
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let en = buffer_text(term.backend().buffer());
+        assert!(!en.contains("[Y]"), "{en}");
+        assert!(
+            !en.to_ascii_lowercase().contains("accepts the default"),
+            "{en}"
+        );
+        assert!(en.contains("N(Enter)"), "{en}");
+        assert!(en.contains("m method: squash"), "{en}");
+
+        app.view = confirm(
+            3,
+            "PR #3 は問題なしと判断しました。終了しますか？",
+            ConfirmKind::ReviewExit,
+            Lang::Ja,
+        );
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let review = buffer_text(term.backend().buffer());
+        assert!(review.contains("Y(Enter) 終了 / c 続ける"), "{review}");
+        assert!(
+            !review.to_ascii_lowercase().contains("accepts the default"),
+            "{review}"
+        );
+
+        app.view = confirm(
+            12,
+            "Continue as --code on PR #12?",
+            ConfirmKind::ContinueAsCode,
+            Lang::En,
+        );
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let handoff = buffer_text(term.backend().buffer());
+        assert!(handoff.contains("Y(Enter) yes / n no"), "{handoff}");
+        assert!(
+            !handoff.to_ascii_lowercase().contains("accepts the default"),
+            "{handoff}"
         );
     }
 

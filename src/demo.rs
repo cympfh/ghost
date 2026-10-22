@@ -7,7 +7,10 @@ use std::time::Duration;
 use clap::ValueEnum;
 
 use crate::github::{ItemKind, OpenItem};
-use crate::tui::{self, LogKind, LogLine, Side, Status, UiCmd, UiEvent};
+use crate::lang::Lang;
+use crate::tui::{
+    self, merge_question, LogKind, LogLine, MergeStyle, Side, Status, UiCmd, UiEvent,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DemoScene {
@@ -48,8 +51,8 @@ fn play(scene: DemoScene, tx: Sender<UiEvent>, rx: Receiver<UiCmd>) {
             wait_quit(&rx);
         }
         DemoScene::Confirm => {
-            confirm_scene(&tx);
-            wait_confirm(&tx, &rx);
+            merge_confirm_scene(&tx);
+            wait_merge_confirm(&tx, &rx);
         }
         DemoScene::Preflight => {
             let _ = tx.send(UiEvent::Fatal(
@@ -177,8 +180,26 @@ fn confirm_scene(tx: &Sender<UiEvent>) {
     sys(tx, "opened PR #12 · keeping this claude session");
     let _ = tx.send(UiEvent::Confirm {
         number: 12,
-        message: "Continue as --code on PR #12? [Y/n]".into(),
+        message: "Continue as --code on PR #12?".into(),
         kind: tui::ConfirmKind::ContinueAsCode,
+        lang: Lang::En,
+    });
+}
+
+fn merge_confirm_scene(tx: &Sender<UiEvent>) {
+    send_status(
+        tx, "code", "PR #3", "confirm", "abc1234", "none", "1/20", "codex", "—",
+    );
+    sys(
+        tx,
+        "merge-ready? CI none(ok) / CLEAN / changes requested 0 → yes",
+    );
+    let method = MergeStyle::Squash;
+    let _ = tx.send(UiEvent::Confirm {
+        number: 3,
+        message: merge_question(3, method, Lang::Ja),
+        kind: tui::ConfirmKind::Merge(method),
+        lang: Lang::Ja,
     });
 }
 
@@ -205,13 +226,16 @@ fn wait_picker(tx: &Sender<UiEvent>, rx: &Receiver<UiCmd>) {
             }
             Ok(UiCmd::Choose(Side::Code)) => code_scene(tx),
             Ok(UiCmd::Choose(Side::Review)) => review_scene(tx),
-            Ok(UiCmd::Confirm(tui::ConfirmAnswer::Yes)) => {
+            Ok(UiCmd::Confirm {
+                answer: tui::ConfirmAnswer::Yes,
+                ..
+            }) => {
                 code_scene(tx);
             }
-            Ok(
-                UiCmd::Confirm(tui::ConfirmAnswer::No)
-                | UiCmd::Confirm(tui::ConfirmAnswer::Continue),
-            ) => {
+            Ok(UiCmd::Confirm {
+                answer: tui::ConfirmAnswer::No | tui::ConfirmAnswer::Continue,
+                ..
+            }) => {
                 let _ = tx.send(UiEvent::Exit {
                     code: 0,
                     message: "not continuing as --code".into(),
@@ -223,22 +247,39 @@ fn wait_picker(tx: &Sender<UiEvent>, rx: &Receiver<UiCmd>) {
     }
 }
 
-fn wait_confirm(tx: &Sender<UiEvent>, rx: &Receiver<UiCmd>) {
+fn wait_merge_confirm(tx: &Sender<UiEvent>, rx: &Receiver<UiCmd>) {
     loop {
         match rx.recv() {
-            Ok(UiCmd::Confirm(tui::ConfirmAnswer::Yes)) => {
-                sys(tx, "continuing as --code on PR #12 in the same session");
-                code_scene(tx);
-                wait_quit(rx);
-                return;
-            }
-            Ok(
-                UiCmd::Confirm(tui::ConfirmAnswer::No)
-                | UiCmd::Confirm(tui::ConfirmAnswer::Continue),
-            ) => {
+            Ok(UiCmd::Confirm {
+                answer: tui::ConfirmAnswer::Yes,
+                method,
+            }) => {
+                let word = method.map(MergeStyle::word).unwrap_or("squash");
+                sys(tx, &format!("merge method: --{word}"));
                 let _ = tx.send(UiEvent::Exit {
                     code: 0,
-                    message: "PR #12 left as-is. Not continuing as --code.".into(),
+                    message: format!("merged with {word}"),
+                });
+                return;
+            }
+            Ok(UiCmd::Confirm {
+                answer: tui::ConfirmAnswer::No,
+                ..
+            }) => {
+                let _ = tx.send(UiEvent::Exit {
+                    code: 0,
+                    message: "PR #3 はマージせずに終了します。".into(),
+                });
+                return;
+            }
+            Ok(UiCmd::Confirm {
+                answer: tui::ConfirmAnswer::Continue,
+                ..
+            }) => {
+                sys(tx, "監視を続けます。次にマージ可能になったら再度尋ねます。");
+                let _ = tx.send(UiEvent::Exit {
+                    code: 0,
+                    message: "continue".into(),
                 });
                 return;
             }
