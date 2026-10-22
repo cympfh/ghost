@@ -506,6 +506,32 @@ pub fn agent_on_path(kind: AgentKind) -> bool {
     which(kind.as_str(), &path).is_some()
 }
 
+/// Prompt files are per process and per slot. Two ghost processes must not
+/// share `~/.ghost/prompts/codex.md`.
+pub fn prompt_directory(home: &Path, slot: &str) -> PathBuf {
+    let raw = slot.trim();
+    let slot = if raw.is_empty() { "main" } else { raw };
+    let slot = slot.replace(['/', ' '], "-");
+    home.join("prompts")
+        .join(format!("pid{}-{slot}", std::process::id()))
+}
+
+/// Directory the agent process can actually start in. A missing worktree
+/// falls back to `~/.ghost/work` (created when needed).
+pub fn existing_cwd(preferred: &Path, fallback: &Path) -> PathBuf {
+    if preferred.is_dir() {
+        return preferred.to_path_buf();
+    }
+    if !fallback.is_dir() {
+        let _ = fs::create_dir_all(fallback);
+    }
+    if fallback.is_dir() {
+        fallback.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 /// Where `git push` from the agent is allowed to go. Review is read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushPlan {
@@ -519,6 +545,8 @@ pub struct PushPlan {
 pub struct AgentSession {
     kind: AgentKind,
     workdir: PathBuf,
+    ghost_home: PathBuf,
+    fallback_dir: PathBuf,
     prompt_dir: PathBuf,
     session_id: Option<String>,
     child: Option<Child>,
@@ -540,11 +568,13 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    pub fn new(kind: AgentKind, workdir: PathBuf, ghost_home: &Path) -> Self {
+    pub fn new(kind: AgentKind, workdir: PathBuf, ghost_home: &Path, slot: &str) -> Self {
         Self {
             kind,
             workdir,
-            prompt_dir: ghost_home.join("prompts"),
+            ghost_home: ghost_home.to_path_buf(),
+            fallback_dir: ghost_home.join("work"),
+            prompt_dir: prompt_directory(ghost_home, slot),
             session_id: None,
             child: None,
             stdin: None,
@@ -565,6 +595,18 @@ impl AgentSession {
 
     pub fn set_workdir(&mut self, dir: PathBuf) {
         self.workdir = dir;
+    }
+
+    pub fn set_prompt_slot(&mut self, slot: &str) {
+        self.prompt_dir = prompt_directory(&self.ghost_home, slot);
+    }
+
+    pub fn workdir_is_dir(&self) -> bool {
+        self.workdir.is_dir()
+    }
+
+    pub fn fallback_dir(&self) -> PathBuf {
+        self.fallback_dir.clone()
     }
 
     pub fn set_push_plan(&mut self, plan: PushPlan) {
@@ -725,6 +767,9 @@ impl AgentSession {
     }
 
     fn spawn(&mut self, launch: &Launch, prompt: &str) -> Result<()> {
+        // A missing slot must not make `current_dir` fail with ENOENT.
+        // The agent runs in ~/.ghost/work and the prompt carries the failed step.
+        self.workdir = existing_cwd(&self.workdir, &self.fallback_dir);
         fs::create_dir_all(&self.prompt_dir)?;
         let file_key = match launch {
             Launch::Resume { session_id } => session_id.clone(),
@@ -1101,12 +1146,38 @@ exec "$real" "$@"
 
 const GIT_GUARD: &str = r#"#!/bin/sh
 # Keeps a fork PR from updating origin's same-name branch. Not a security boundary.
+# Global options are skipped before the subcommand, so `git -C . push` is still a push.
 real="${GHOST_REAL_GIT:-}"
 if [ -z "$real" ] || [ ! -x "$real" ]; then
   echo "ghost: real git is not available" >&2
   exit 127
 fi
-if [ "$1" = "push" ]; then
+cmd=""
+expect=""
+for arg in "$@"; do
+  if [ -n "$expect" ]; then
+    expect=""
+    continue
+  fi
+  case "$arg" in
+    -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix|--config-env|--list-cmds)
+      expect=arg
+      ;;
+    -C*|-c*|--git-dir=*|--work-tree=*|--namespace=*|--exec-path=*|--super-prefix=*|--config-env=*|--list-cmds=*)
+      ;;
+    --)
+      ;;
+    -P|--no-pager|--paginate|-p|--bare|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-advice|--version|--help|-v|-h)
+      ;;
+    -*)
+      ;;
+    *)
+      cmd=$arg
+      break
+      ;;
+  esac
+done
+if [ "$cmd" = "push" ]; then
   if [ "$GHOST_PUSH_MODE" = "readonly" ]; then
     echo "ghost: refusing git push${GHOST_PUSH_REASON:+: $GHOST_PUSH_REASON}" >&2
     exit 99
@@ -1491,7 +1562,7 @@ mod tests {
             std::fs::set_permissions(&stub, perms).unwrap();
         }
         let home = dir.join("home");
-        let mut session = AgentSession::new(AgentKind::Codex, work.clone(), &home);
+        let mut session = AgentSession::new(AgentKind::Codex, work.clone(), &home, "main");
         session.set_stub(stub);
         session.seed(Some("01a16307".into()));
         let launch = session.dispatch("follow up").unwrap();
@@ -1565,7 +1636,7 @@ mod tests {
         let home = dir.join("home");
         let work = dir.join("work");
         std::fs::create_dir_all(&work).unwrap();
-        let mut session = AgentSession::new(AgentKind::Codex, work, &home);
+        let mut session = AgentSession::new(AgentKind::Codex, work, &home, "main");
         session.set_stub(stub);
         session.seed(Some("dead-session".into()));
         let launch = session
@@ -1627,7 +1698,7 @@ mod tests {
         let home = dir.join("home");
         let work = dir.join("work");
         std::fs::create_dir_all(&work).unwrap();
-        let mut session = AgentSession::new(AgentKind::Codex, work, &home);
+        let mut session = AgentSession::new(AgentKind::Codex, work, &home, "main");
         session.set_stub(stub);
         session.seed(Some("ec326e07-1111-4111-8111-111111111111".into()));
         let prompt = "SITUATION CHECK please";
@@ -1805,6 +1876,183 @@ mod tests {
             ],
             "merge",
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_files_are_per_process_and_per_slot() {
+        let home = Path::new("/home/u/.ghost");
+        let code = prompt_directory(home, "pr-4-code");
+        let review = prompt_directory(home, "pr-4-review");
+        assert_ne!(code, review);
+        let pid = std::process::id();
+        assert!(code.ends_with(format!("pid{pid}-pr-4-code")));
+        assert!(!code.ends_with("prompts"));
+        assert_ne!(
+            prompt_directory(home, "issue-1"),
+            prompt_directory(home, "pr-1-code")
+        );
+    }
+
+    #[test]
+    fn missing_workdir_spawns_in_ghost_work() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-cwd-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = dir.join("home");
+        let missing = dir.join("no-such-slot");
+        let stub = dir.join("stub-agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&stub, "#!/bin/sh\npwd -P\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).unwrap();
+        }
+        let mut session = AgentSession::new(AgentKind::Codex, missing.clone(), &home, "pr-2-code");
+        session.set_stub(stub);
+        assert!(!missing.exists());
+        session.dispatch("setup failed").unwrap();
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(session.last_exit_code(), Some(0));
+        let fallback = home.join("work").canonicalize().unwrap();
+        assert_eq!(
+            session.recent_output().trim(),
+            fallback.display().to_string()
+        );
+        let shared = home.join("prompts").join("codex.md");
+        assert!(!shared.exists(), "prompts must not be a shared file");
+        assert!(prompt_directory(&home, "pr-2-code")
+            .join("codex.md")
+            .is_file());
+        session.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_exe(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    #[test]
+    fn git_guard_skips_global_options_and_readonly_never_pushes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-git-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = dir.join("pushed");
+        let real = dir.join("real-git");
+        write_exe(
+            &real,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 0\n",
+                marker.display()
+            ),
+        );
+        install_git_guard(&bin).unwrap();
+        let guard = bin.join("git");
+        let run = |args: &[&str], mode: &str, remote: &str, refspec: &str| {
+            let _ = std::fs::remove_file(&marker);
+            std::process::Command::new(&guard)
+                .args(args)
+                .env("GHOST_REAL_GIT", &real)
+                .env("GHOST_PUSH_MODE", mode)
+                .env("GHOST_PUSH_REASON", "fork head main is not pushable")
+                .env("GHOST_PUSH_REMOTE", remote)
+                .env("GHOST_PUSH_REFSPEC", refspec)
+                .output()
+                .unwrap()
+        };
+
+        let bypasses = [
+            vec!["-C", ".", "push", "origin", "HEAD:main"],
+            vec!["-C.", "push", "origin", "HEAD:main"],
+            vec!["--git-dir", "/tmp/x", "push", "origin", "HEAD:main"],
+            vec!["--git-dir=/tmp/x", "push", "origin", "HEAD:main"],
+            vec!["--work-tree", "/tmp/y", "push", "origin", "HEAD:main"],
+            vec![
+                "--work-tree=/tmp/y",
+                "-c",
+                "user.name=t",
+                "push",
+                "origin",
+                "HEAD:main",
+            ],
+            vec![
+                "-c",
+                "user.name=t",
+                "-P",
+                "--bare",
+                "--namespace",
+                "ns",
+                "push",
+                "origin",
+                "HEAD:main",
+            ],
+            vec!["--no-pager", "--", "push", "origin", "HEAD:main"],
+        ];
+        for args in &bypasses {
+            let out = run(args, "readonly", "", "");
+            assert_eq!(
+                out.status.code(),
+                Some(99),
+                "{args:?} stderr {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("refusing git push"),
+                "{args:?}"
+            );
+            assert!(
+                !marker.exists(),
+                "readonly must not exec real git for {args:?}; removing the readonly check would push"
+            );
+        }
+
+        let out = run(
+            &["-C", ".", "push", "origin", "HEAD:main"],
+            "push",
+            "git@github.com:forker/app.git",
+            "HEAD:feature",
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let recorded = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            recorded,
+            "push\ngit@github.com:forker/app.git\nHEAD:feature\n"
+        );
+
+        let out = run(&["-C", ".", "status"], "readonly", "", "");
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "-C\n.\nstatus\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

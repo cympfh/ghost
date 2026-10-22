@@ -900,7 +900,8 @@ pub fn plan_code_push(q: &PushQuery<'_>) -> CodePush {
 fn push_remote(owner: &str, name: &str, url: &str) -> String {
     let url = url.trim();
     if url.is_empty() {
-        return format!("https://github.com/{owner}/{name}.git");
+        // ssh, not https, so `--ssh-key` / GIT_SSH_COMMAND applies.
+        return format!("git@github.com:{owner}/{name}.git");
     }
     if (url.starts_with("https://github.com/") || url.starts_with("http://github.com/"))
         && !url.ends_with(".git")
@@ -1936,18 +1937,45 @@ detached
             rev_parse(&dest, "HEAD")
         );
         assert_eq!(rev_parse(&origin, "refs/heads/main"), sha_a);
+        let fork_sha = rev_parse(&fork, "refs/heads/main");
         let blocked = plan_code_push(&PushQuery {
             base_owner: "acme",
             base_repo: "app",
             head_owner: "forker",
             head_name: "app",
             head_ref: "main",
-            head_url: "",
+            head_url: fork.to_str().unwrap(),
             is_cross: true,
             maintainer_can_modify: false,
         });
+        assert!(
+            matches!(blocked, CodePush::ReadOnly { .. }),
+            "a fork without maintainerCanModify must not be a push, got {blocked:?}"
+        );
         assert!(apply_push(&dest, &blocked).is_err());
+        assert_eq!(
+            rev_parse(&fork, "refs/heads/main"),
+            fork_sha,
+            "removing the maintainerCanModify check would push to the fork"
+        );
         assert_eq!(rev_parse(&origin, "refs/heads/main"), sha_a);
+        let ssh = plan_code_push(&PushQuery {
+            base_owner: "acme",
+            base_repo: "app",
+            head_owner: "forker",
+            head_name: "app",
+            head_ref: "feature",
+            head_url: "",
+            is_cross: true,
+            maintainer_can_modify: true,
+        });
+        match ssh {
+            CodePush::Push { remote, refspec } => {
+                assert_eq!(remote, "git@github.com:forker/app.git");
+                assert_eq!(refspec, "HEAD:feature");
+            }
+            CodePush::ReadOnly { .. } => panic!("maintainer can modify; push the ssh url"),
+        }
         let same = plan_code_push(&PushQuery {
             base_owner: "acme",
             base_repo: "app",

@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
+
 use serde_json::Value;
 
 /// Open, closed without merge, or merged.
@@ -209,25 +212,115 @@ pub fn commit_merge(ready: bool, expected_sha: &str, current_sha: &str) -> bool 
     ready && !expected_sha.is_empty() && expected_sha == current_sha
 }
 
-/// Merge is offered only after the same head has been merge-ready twice in a row.
+/// Merge is offered only after the same head has been merge-ready twice,
+/// and those two looks are at least one poll interval apart.
 /// The first CLEAN poll after a push, before CI has registered, does not merge.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A refetch in the same turn does not move the timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeReadyStreak {
     sha: Option<String>,
+    seen_at: Option<Instant>,
+    gap: Duration,
+}
+
+impl Default for MergeReadyStreak {
+    fn default() -> Self {
+        Self::with_gap(Duration::from_secs(20))
+    }
 }
 
 impl MergeReadyStreak {
-    pub fn observe(&mut self, sha: &str, ready: bool) -> bool {
+    pub fn with_gap(gap: Duration) -> Self {
+        Self {
+            sha: None,
+            seen_at: None,
+            gap,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.sha = None;
+        self.seen_at = None;
+    }
+
+    pub fn holds(&self, sha: &str) -> bool {
+        !sha.is_empty() && self.sha.as_deref() == Some(sha)
+    }
+
+    /// `now` is the poll time. The second ready look confirms only when
+    /// `now - first` is at least the poll interval. A look inside that
+    /// window does not move the first timestamp.
+    pub fn observe_at(&mut self, sha: &str, ready: bool, now: Instant) -> bool {
         if !ready || sha.is_empty() {
-            self.sha = None;
+            self.reset();
             return false;
         }
-        if self.sha.as_deref() == Some(sha) {
-            return true;
+        if self.holds(sha) {
+            if let Some(at) = self.seen_at {
+                return now.saturating_duration_since(at) >= self.gap;
+            }
         }
         self.sha = Some(sha.to_string());
+        self.seen_at = Some(now);
         false
     }
+
+    pub fn observe(&mut self, sha: &str, ready: bool) -> bool {
+        self.observe_at(sha, ready, Instant::now())
+    }
+}
+
+/// The refetch right after the launch survey is the same moment as the poll
+/// that started that turn. It must not count as another merge-ready look
+/// and must not offer merge. Returns whether to offer (always false).
+pub fn accept_survey_refetch(streak: &mut MergeReadyStreak, head: &str, ready: bool) -> bool {
+    if !(ready && streak.holds(head)) {
+        streak.reset();
+    }
+    false
+}
+
+/// After `c` on the merge confirm, ask again only when the head, the
+/// comment set, the review counts, or the agent turn count changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeHold {
+    pub sha: String,
+    pub notes: BTreeSet<String>,
+    pub reviews: usize,
+    pub inline: usize,
+    pub comments: usize,
+    pub turns: u32,
+}
+
+pub fn merge_prompt_again(
+    hold: Option<&MergeHold>,
+    sha: &str,
+    notes: &BTreeSet<String>,
+    feedback: (usize, usize, usize),
+    turns: u32,
+) -> bool {
+    let Some(hold) = hold else {
+        return true;
+    };
+    hold.sha != sha
+        || &hold.notes != notes
+        || hold.reviews != feedback.0
+        || hold.inline != feedback.1
+        || hold.comments != feedback.2
+        || hold.turns != turns
+}
+
+/// GitHub rejected the method flag (`squash` disabled, and the same for
+/// merge or rebase). ghost does not guess another method.
+pub fn merge_method_rejected(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let method =
+        lower.contains("squash") || lower.contains("rebase") || lower.contains("merge method");
+    let denied = lower.contains("not allowed")
+        || lower.contains("not permitted")
+        || lower.contains("disabled")
+        || lower.contains("not enabled");
+    method && denied
 }
 
 pub fn stop_reason(input: &MergeInput) -> Option<StopReason> {
@@ -532,20 +625,114 @@ mod tests {
 
     #[test]
     fn merge_ready_must_repeat_on_the_same_sha() {
-        let mut streak = MergeReadyStreak::default();
+        let mut streak = MergeReadyStreak::with_gap(Duration::from_secs(20));
+        let t0 = Instant::now();
         assert!(
-            !streak.observe("abc", true),
+            !streak.observe_at("abc", true, t0),
             "the first CLEAN poll, including empty CI right after a push, does not merge"
         );
-        assert!(streak.observe("abc", true));
-        assert!(!streak.observe("def", true), "a new head starts over");
-        assert!(streak.observe("def", true));
-        assert!(!streak.observe("def", false));
+        assert!(streak.observe_at("abc", true, t0 + Duration::from_secs(20)));
         assert!(
-            !streak.observe("def", true),
+            !streak.observe_at("def", true, t0 + Duration::from_secs(40)),
+            "a new head starts over"
+        );
+        assert!(streak.observe_at("def", true, t0 + Duration::from_secs(60)));
+        assert!(!streak.observe_at("def", false, t0 + Duration::from_secs(80)));
+        assert!(
+            !streak.observe_at("def", true, t0 + Duration::from_secs(80)),
             "a not-ready poll clears the streak"
         );
-        assert!(!streak.observe("", true));
+        assert!(!streak.observe_at("", true, t0));
+    }
+
+    #[test]
+    fn merge_ready_observations_must_be_one_interval_apart() {
+        let mut streak = MergeReadyStreak::with_gap(Duration::from_secs(20));
+        let t0 = Instant::now();
+        assert!(!streak.observe_at("abc", true, t0));
+        assert!(
+            !streak.observe_at("abc", true, t0 + Duration::from_secs(1)),
+            "a second look about a second later, including the post-survey refetch, does not merge"
+        );
+        assert!(
+            streak.holds("abc"),
+            "an early second look must not move the first timestamp"
+        );
+        assert!(streak.observe_at("abc", true, t0 + Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn post_survey_refetch_does_not_offer_merge() {
+        let gap = Duration::from_secs(20);
+        let t0 = Instant::now();
+        let mut streak = MergeReadyStreak::with_gap(gap);
+        assert!(!streak.observe_at("abc", true, t0));
+        assert!(
+            !accept_survey_refetch(&mut streak, "abc", true),
+            "the launch survey refetch must not offer merge"
+        );
+        assert!(
+            streak.holds("abc"),
+            "a same-head ready refetch keeps the first observation"
+        );
+        assert!(
+            !streak.observe_at("abc", true, t0 + Duration::from_secs(1)),
+            "the first observation is still not enough inside the interval"
+        );
+        assert!(
+            streak.observe_at("abc", true, t0 + gap),
+            "the refetch must not move the first observation's timestamp"
+        );
+
+        let mut fresh = MergeReadyStreak::with_gap(gap);
+        assert!(!accept_survey_refetch(&mut fresh, "abc", true));
+        assert!(
+            !fresh.holds("abc"),
+            "a refetch is not the first observation either"
+        );
+
+        let mut moved = MergeReadyStreak::with_gap(gap);
+        assert!(!moved.observe_at("abc", true, t0));
+        assert!(!accept_survey_refetch(&mut moved, "def", true));
+        assert!(!moved.holds("abc"));
+        assert!(!moved.holds("def"));
+    }
+
+    #[test]
+    fn continue_asks_again_only_after_a_change() {
+        let notes = BTreeSet::from(["c1".to_string()]);
+        let hold = MergeHold {
+            sha: "abc".into(),
+            notes: notes.clone(),
+            reviews: 1,
+            inline: 0,
+            comments: 0,
+            turns: 2,
+        };
+        let same = (1, 0, 0);
+        assert!(!merge_prompt_again(Some(&hold), "abc", &notes, same, 2));
+        assert!(merge_prompt_again(Some(&hold), "def", &notes, same, 2));
+        let mut more = notes.clone();
+        more.insert("c2".into());
+        assert!(merge_prompt_again(Some(&hold), "abc", &more, same, 2));
+        assert!(merge_prompt_again(Some(&hold), "abc", &notes, (2, 0, 0), 2));
+        assert!(merge_prompt_again(Some(&hold), "abc", &notes, same, 3));
+        assert!(merge_prompt_again(None, "abc", &notes, same, 2));
+    }
+
+    #[test]
+    fn rejected_merge_method_is_reported_without_guessing() {
+        assert!(merge_method_rejected(
+            "GraphQL: Squash merges are not allowed on this repository"
+        ));
+        assert!(merge_method_rejected("rebase merges are disabled"));
+        assert!(merge_method_rejected(
+            "merge method squash is not permitted"
+        ));
+        assert!(!merge_method_rejected(
+            "not allowed to push to this repository"
+        ));
+        assert!(!merge_method_rejected("merge conflict"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Terminal UI: command line, streaming agent pane, input, and status bar.
 
-use std::io::{self, Stdout};
+use std::io::{self, IsTerminal, Stdout};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -285,10 +285,24 @@ impl App {
     }
 }
 
+/// True only when both streams are already terminals. crossterm opens
+/// `/dev/tty` when stdin is not a terminal, and that open fails with ENXIO
+/// (os error 6) when the process has no controlling terminal.
+pub fn should_open_terminal(stdin_tty: bool, stdout_tty: bool) -> bool {
+    stdin_tty && stdout_tty
+}
+
+pub fn interactive_terminal() -> bool {
+    should_open_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())
+}
+
 pub fn run<F>(header: String, worker: F) -> anyhow::Result<i32>
 where
     F: FnOnce(Sender<UiEvent>, Receiver<UiCmd>) + Send + 'static,
 {
+    if !interactive_terminal() {
+        return run_headless(header, worker);
+    }
     let (ev_tx, ev_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let join = thread::spawn(move || worker(ev_tx, cmd_rx));
@@ -336,6 +350,71 @@ where
         println!("{}", app.exit_message);
     }
     Ok(app.exit_code)
+}
+
+/// No `/dev/tty`. Logs go to stdout. Confirms are answered by the engine
+/// before they are sent; a confirm that still arrives quits without merging.
+fn run_headless<F>(header: String, worker: F) -> anyhow::Result<i32>
+where
+    F: FnOnce(Sender<UiEvent>, Receiver<UiCmd>) + Send + 'static,
+{
+    let (ev_tx, ev_rx) = mpsc::channel();
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let join = thread::spawn(move || worker(ev_tx, cmd_rx));
+    if !header.is_empty() {
+        println!("{header}");
+    }
+    let mut exit_code = 0;
+    let mut exit_message = String::new();
+    let mut forced = false;
+    loop {
+        match ev_rx.recv() {
+            Ok(UiEvent::Log(line)) => {
+                if !line.text.is_empty() {
+                    println!("{}", line.text);
+                }
+            }
+            Ok(UiEvent::Status(_)) => {}
+            Ok(UiEvent::Picker(_)) | Ok(UiEvent::ChooseMode { .. }) => {
+                forced = true;
+                exit_code = 1;
+                exit_message = "not a TTY; pass a pull request or issue URL".into();
+                eprintln!("ghost: {exit_message}");
+                let _ = cmd_tx.send(UiCmd::Quit);
+            }
+            Ok(UiEvent::Confirm { message, .. }) => {
+                println!("{message}");
+                forced = true;
+                exit_code = 0;
+                exit_message = "not a TTY; not waiting for a key".into();
+                println!("ghost: {exit_message}");
+                let _ = cmd_tx.send(UiCmd::Quit);
+            }
+            Ok(UiEvent::Fatal(message)) => {
+                eprintln!("{message}");
+                exit_code = 1;
+                exit_message = message;
+                // Unblock a worker waiting on the command channel (preflight).
+                let _ = cmd_tx.send(UiCmd::Quit);
+            }
+            Ok(UiEvent::Exit { code, message }) => {
+                if !forced {
+                    exit_code = code;
+                    if !message.is_empty() {
+                        exit_message = message;
+                    }
+                }
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    drop(cmd_tx);
+    let _ = join.join();
+    if !exit_message.is_empty() {
+        println!("{exit_message}");
+    }
+    Ok(exit_code)
 }
 
 fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
@@ -1064,6 +1143,33 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn non_tty_does_not_open_the_terminal() {
+        assert!(!super::should_open_terminal(false, false));
+        assert!(
+            !super::should_open_terminal(false, true),
+            "stdin is not a tty; opening /dev/tty is what returns os error 6"
+        );
+        assert!(!super::should_open_terminal(true, false));
+        assert!(super::should_open_terminal(true, true));
+    }
+
+    #[test]
+    fn headless_exits_without_opening_a_terminal() {
+        let code = super::run_headless("ghost".into(), |tx, _rx| {
+            let _ = tx.send(UiEvent::Log(LogLine {
+                kind: LogKind::System,
+                text: "headless ok".into(),
+            }));
+            let _ = tx.send(UiEvent::Exit {
+                code: 0,
+                message: "done".into(),
+            });
+        })
+        .unwrap();
+        assert_eq!(code, 0);
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

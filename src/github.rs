@@ -491,12 +491,15 @@ pub fn parse_pr_view(json: &str) -> Result<PrSnap, String> {
         .and_then(|s| s.as_str())
         .unwrap_or("")
         .to_string();
-    let head_url = v
+    let mut head_url = v
         .pointer("/headRepository/sshUrl")
         .or_else(|| v.pointer("/headRepository/url"))
         .and_then(|s| s.as_str())
         .unwrap_or("")
         .to_string();
+    if head_url.is_empty() && !head_owner.is_empty() && !head_repo.is_empty() {
+        head_url = format!("git@github.com:{head_owner}/{head_repo}.git");
+    }
     let maintainer_can_modify = v
         .get("maintainerCanModify")
         .and_then(|d| d.as_bool())
@@ -998,6 +1001,19 @@ mod tests {
         assert_eq!(fork.head_repo, "app");
         assert_eq!(fork.head_url, "git@github.com:forker/app.git");
         assert_eq!(fork.head_branch, "main");
+
+        let no_url = r#"{
+            "number": 9,
+            "state": "OPEN",
+            "headRefOid": "bbbbbbbb",
+            "headRefName": "feature",
+            "isCrossRepository": true,
+            "maintainerCanModify": true,
+            "headRepositoryOwner": {"login": "forker"},
+            "headRepository": {"name": "app"}
+        }"#;
+        let no_url = parse_pr_view(no_url).unwrap();
+        assert_eq!(no_url.head_url, "git@github.com:forker/app.git");
     }
 
     #[test]

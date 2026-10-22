@@ -20,8 +20,8 @@ use crate::agent::{
 use crate::github::Gh;
 use crate::lang::Lang;
 use crate::merge::{
-    auto_merge_answer, commit_merge, is_merge_ready, merge_ready_line, MergeAnswer,
-    MergeReadyStreak, StopReason,
+    accept_survey_refetch, auto_merge_answer, commit_merge, is_merge_ready, merge_method_rejected,
+    merge_prompt_again, merge_ready_line, MergeAnswer, MergeHold, MergeReadyStreak, StopReason,
 };
 use crate::preflight::{evaluate, failure_message, is_fatal, AuthProbe, RepoProbe};
 use crate::prompt::{self, truncate};
@@ -35,11 +35,10 @@ use crate::tui::{
     UiCmd, UiEvent,
 };
 use crate::watch::{
-    after_opening_survey, after_review_verdict, approve_signal, auto_review_exit,
-    baseline_agent_comments, code_step, decide_code, decide_review, ensure_closing_line,
-    feedback_log, filter_notes, mark_viewer, review_step, seen_after_survey, AfterSurvey,
-    CiHandled, CodeAction, CodeLaunch, CodeStep, CommentTrust, MaxTurns, Note, PrSnap,
-    ReviewAction, ReviewExitAnswer, ReviewLaunch, ReviewSignal, ReviewStep,
+    after_review_verdict, approve_signal, auto_review_exit, baseline_agent_comments, code_step,
+    decide_code, decide_review, ensure_closing_line, feedback_log, filter_notes, mark_viewer,
+    review_step, seen_after_survey, CiHandled, CodeAction, CodeLaunch, CodeStep, CommentTrust,
+    MaxTurns, Note, PrSnap, ReviewAction, ReviewExitAnswer, ReviewLaunch, ReviewSignal, ReviewStep,
 };
 use crate::workdir::{self, Checkout};
 
@@ -480,6 +479,11 @@ fn babysit(
         log(&tx, LogKind::Error, prompt::setup_warning(failure));
     }
 
+    let interval = spec.interval;
+    let slot_name = slot_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("main");
     let kind = pick_agent(spec.agent, agent_on_path).map_err(|e| anyhow!(e))?;
     status.agent = kind.to_string();
     let _ = tx.send(UiEvent::Status(status.clone()));
@@ -493,7 +497,7 @@ fn babysit(
         slug,
         owner,
         repo,
-        agent: AgentSession::new(kind, workdir.clone(), &home),
+        agent: AgentSession::new(kind, workdir.clone(), &home, slot_name),
         workdir,
         slot_dir,
         main_clone,
@@ -513,7 +517,9 @@ fn babysit(
         quit: false,
         interrupted: false,
         last_idle_sha: None,
-        merge_streak: MergeReadyStreak::default(),
+        merge_streak: MergeReadyStreak::with_gap(interval),
+        merge_hold: None,
+        cwd_fallback_logged: false,
         code_pr: None,
         code_path: None,
         code_seen: BTreeSet::new(),
@@ -574,6 +580,8 @@ struct Ctx {
     interrupted: bool,
     last_idle_sha: Option<String>,
     merge_streak: MergeReadyStreak,
+    merge_hold: Option<MergeHold>,
+    cwd_fallback_logged: bool,
     code_pr: Option<u64>,
     code_path: Option<PathBuf>,
     code_seen: BTreeSet<String>,
@@ -695,6 +703,7 @@ impl Ctx {
             prompt::review_initial(
                 &self.slug,
                 number,
+                &snap.title,
                 &snap.head_sha,
                 &self.workdir,
                 &diff,
@@ -705,6 +714,7 @@ impl Ctx {
             prompt::review_followup(
                 &self.slug,
                 number,
+                &snap.title,
                 previous.unwrap_or("unreviewed"),
                 &snap.head_sha,
                 &self.workdir,
@@ -964,14 +974,14 @@ impl Ctx {
             }
         };
         self.log(merge_ready_line(&fresh.merge));
-        if after_opening_survey(is_merge_ready(&fresh.merge)) == AfterSurvey::MergePrompt {
-            let leave = self.offer_if_merge_repeated(number, &fresh)?;
-            return Ok((leave, true));
-        }
-        let _ = self
-            .merge_streak
-            .observe(&fresh.head_sha, is_merge_ready(&fresh.merge));
-        Ok((false, true))
+        // The survey refetch is the same moment as the poll above. Counting it
+        // would merge about a second after launch when CI has not registered.
+        let leave = accept_survey_refetch(
+            &mut self.merge_streak,
+            &fresh.head_sha,
+            is_merge_ready(&fresh.merge),
+        );
+        Ok((leave, true))
     }
 
     fn run_code_fix(
@@ -1082,17 +1092,33 @@ impl Ctx {
 
     fn log_merge_wait(&mut self, sha: &str) {
         let short = short_sha(sha);
+        let secs = self.spec.interval.as_secs();
         self.log(self.say(
             &format!(
-                "merge-ready を一度確認しました（{short}）。次の poll でも同じ head なら merge を尋ねます。"
+                "merge-ready を一度確認しました（{short}）。{secs}秒以上あとに同じ head なら merge を尋ねます。"
             ),
             &format!(
-                "Saw merge-ready once ({short}). The next poll of this same head will ask to merge."
+                "Saw merge-ready once ({short}). The same head at least {secs}s later will ask to merge."
             ),
         ));
     }
 
     fn offer_merge(&mut self, number: u64, snap: &PrSnap) -> Result<bool> {
+        let notes: BTreeSet<String> = snap.notes.iter().map(|note| note.id.clone()).collect();
+        let feedback = (
+            snap.feedback.reviews,
+            snap.feedback.inline,
+            snap.feedback.comments,
+        );
+        if !merge_prompt_again(
+            self.merge_hold.as_ref(),
+            &snap.head_sha,
+            &notes,
+            feedback,
+            self.turns,
+        ) {
+            return Ok(false);
+        }
         let initial = MergeStyle::from_flag(self.spec.merge_method.as_deref());
         let message = merge_question(number, initial, self.spec.lang);
         let (answer, method) =
@@ -1127,9 +1153,17 @@ impl Ctx {
             };
         match answer {
             MergeAnswer::Continue => {
+                self.merge_hold = Some(MergeHold {
+                    sha: snap.head_sha.clone(),
+                    notes,
+                    reviews: feedback.0,
+                    inline: feedback.1,
+                    comments: feedback.2,
+                    turns: self.turns,
+                });
                 self.log(self.say(
-                    "監視を続けます。次にマージ可能になったら再度尋ねます。",
-                    "Continuing to watch. The merge prompt will be asked again the next time this PR is merge-ready.",
+                    "監視を続けます。head、レビュー、コメント、またはエージェントのターンが変わったら、また尋ねます。",
+                    "Continuing to watch. The merge prompt returns after the head, a review or comment, or an agent turn changes.",
                 ));
                 Ok(false)
             }
@@ -1184,7 +1218,28 @@ impl Ctx {
                 Ok(true)
             }
             Err(err) => {
-                self.log_kind(LogKind::Error, format!("gh pr merge failed: {err:#}"));
+                let detail = format!("{err:#}");
+                let flag = method.flag();
+                let message = if merge_method_rejected(&detail) {
+                    self.say(
+                        &format!(
+                            "方法 {flag} はこのリポジトリで許可されていません。自動では切り替えません。--merge-method で別の方法を指定するか、確認画面の m キーで切り替えてください。\n{detail}"
+                        ),
+                        &format!(
+                            "Method {flag} is not allowed on this repository. ghost will not switch methods. Pass --merge-method, or press m on the confirm dialog.\n{detail}"
+                        ),
+                    )
+                } else {
+                    self.say(
+                        &format!("gh pr merge に失敗しました: {detail}"),
+                        &format!("gh pr merge failed: {detail}"),
+                    )
+                };
+                if self.spec.merge_yes {
+                    self.stop(1, message);
+                    return Ok(true);
+                }
+                self.log_kind(LogKind::Error, message);
                 Ok(false)
             }
         }
@@ -1811,6 +1866,31 @@ impl Ctx {
         self.gh.pr_diff(number)
     }
 
+    /// A missing worktree must not make the agent spawn fail with ENOENT.
+    /// The process starts in `~/.ghost/work`. The prompt already has the failed step.
+    fn ensure_spawn_dir(&mut self) {
+        if self.agent.workdir_is_dir() {
+            return;
+        }
+        let fallback = self.agent.fallback_dir();
+        if self.cwd_fallback_logged {
+            return;
+        }
+        self.cwd_fallback_logged = true;
+        self.log(self.say(
+            &format!(
+                "作業ディレクトリ {} が無いので、エージェントは {} で起動します。失敗した準備手順はプロンプトに渡します。",
+                self.workdir.display(),
+                fallback.display()
+            ),
+            &format!(
+                "Working directory {} does not exist. Starting the agent in {} and handing it the failed setup step.",
+                self.workdir.display(),
+                fallback.display()
+            ),
+        ));
+    }
+
     /// `Ok(true)` only after a completed turn with exit 0 (or a live clean end).
     /// A failed resume is retried once as a fresh session with the same prompt.
     fn dispatch_task(&mut self, prompt: &str) -> Result<bool> {
@@ -1823,6 +1903,7 @@ impl Ctx {
                 self.stop(3, self.max_message());
                 return Ok(false);
             }
+            self.ensure_spawn_dir();
             let launch = self.agent.dispatch(prompt)?;
             self.turns += 1;
             self.interrupted = false;
@@ -2270,6 +2351,7 @@ impl Ctx {
                 self.slot_dir = dest.clone();
                 self.workdir = dest.clone();
                 self.agent.set_workdir(dest);
+                self.agent.set_prompt_slot(slot);
                 true
             }
             Err(err) => {
@@ -2573,7 +2655,13 @@ pub fn input_delivery_log(plan: InputPlan, lang: Lang) -> String {
 }
 
 fn stdin_is_tty() -> bool {
-    std::io::stdin().is_terminal()
+    // Do not open /dev/tty to ask. crossterm does that when stdin is not a
+    // terminal, and with no controlling terminal the open fails with ENXIO
+    // (os error 6) before any confirm can take the non-TTY answer.
+    crate::tui::should_open_terminal(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )
 }
 
 pub fn confirm_review_answer(answer: ConfirmAnswer) -> ReviewExitAnswer {
@@ -2687,5 +2775,197 @@ mod tests {
         assert_eq!(panic_message(&payload), "worker panicked: boom");
         let payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
         assert_eq!(panic_message(&payload), "worker panicked: boom");
+    }
+
+    fn path_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
+    struct RestoreVar(&'static str, Option<String>);
+    impl Drop for RestoreVar {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    fn merge_ctx(merge_yes: bool) -> (super::Ctx, std::sync::mpsc::Receiver<crate::tui::UiEvent>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let home = std::env::temp_dir();
+        let target = crate::target::parse_target("github.com/acme/app/pr/1").unwrap();
+        let ctx = super::Ctx {
+            spec: super::RunSpec {
+                header: String::new(),
+                target,
+                mode: super::RunMode::Code,
+                interval: Duration::from_secs(20),
+                agent: None,
+                yes: false,
+                merge_yes,
+                merge_method: None,
+                max_turns: 20,
+                lang: Lang::Ja,
+                ssh_key: None,
+                trust: crate::watch::CommentTrust::All,
+            },
+            tx,
+            rx: cmd_rx,
+            gh: crate::github::Gh::new("acme/app"),
+            slug: "acme/app".into(),
+            owner: "acme".into(),
+            repo: "app".into(),
+            workdir: home.clone(),
+            slot_dir: home.clone(),
+            main_clone: home.clone(),
+            setup_failures: Vec::new(),
+            setup_handed: false,
+            slot_lock: None,
+            login: None,
+            agent: crate::agent::AgentSession::new(
+                crate::agent::AgentKind::Codex,
+                home.clone(),
+                &home,
+                "pr-1-code",
+            ),
+            turns: 0,
+            fail_streak: 0,
+            queued: Vec::new(),
+            delivering_queue: false,
+            turn_signal: String::new(),
+            status: crate::tui::Status::default(),
+            quit: false,
+            interrupted: false,
+            last_idle_sha: None,
+            merge_streak: crate::merge::MergeReadyStreak::with_gap(Duration::from_secs(20)),
+            merge_hold: None,
+            cwd_fallback_logged: false,
+            code_pr: None,
+            code_path: None,
+            code_seen: std::collections::BTreeSet::new(),
+            code_agent_ids: std::collections::BTreeSet::new(),
+            state_root: home,
+        };
+        (ctx, rx)
+    }
+
+    fn write_exe(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    /// `merge_now` re-reads the head. A moved SHA must not call `gh pr merge`.
+    #[test]
+    fn merge_now_rechecks_head_sha_before_gh_merge() {
+        let _lock = path_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-merge-now-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("gh");
+        let view = dir.join("view.json");
+        let marker = dir.join("merged");
+        write_exe(
+            &stub,
+            "#!/bin/sh\ncase \" $* \" in\n  *\" pr merge \"*)\n    if [ \"${GHOST_TEST_MERGE_CODE:-0}\" != 0 ]; then echo \"$GHOST_TEST_MERGE_ERR\" >&2; exit 1; fi\n    : > \"$GHOST_TEST_MARKER\"\n    exit 0 ;;\n  *\" pr view \"*) cat \"$GHOST_TEST_VIEW\"; exit 0 ;;\nesac\nprintf '%s\\n' '[]'\nexit 0\n",
+        );
+        let old_path = std::env::var("PATH").ok();
+        let _path = RestoreVar("PATH", old_path.clone());
+        let mut path = dir.display().to_string();
+        if let Some(old) = &old_path {
+            path.push(':');
+            path.push_str(old);
+        }
+        std::env::set_var("PATH", &path);
+        let _marker = RestoreVar("GHOST_TEST_MARKER", std::env::var("GHOST_TEST_MARKER").ok());
+        let _view = RestoreVar("GHOST_TEST_VIEW", std::env::var("GHOST_TEST_VIEW").ok());
+        let _code = RestoreVar(
+            "GHOST_TEST_MERGE_CODE",
+            std::env::var("GHOST_TEST_MERGE_CODE").ok(),
+        );
+        let _err = RestoreVar(
+            "GHOST_TEST_MERGE_ERR",
+            std::env::var("GHOST_TEST_MERGE_ERR").ok(),
+        );
+        std::env::set_var("GHOST_TEST_MARKER", &marker);
+        std::env::set_var("GHOST_TEST_VIEW", &view);
+        std::env::remove_var("GHOST_TEST_MERGE_CODE");
+        std::env::remove_var("GHOST_TEST_MERGE_ERR");
+
+        let ready = |sha: &str| {
+            format!(
+                r#"{{"number":1,"title":"t","state":"OPEN","isDraft":false,"headRefOid":"{sha}","headRefName":"feature","baseRefName":"main","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"","statusCheckRollup":[],"reviews":[],"comments":[],"author":{{"login":"me"}},"isCrossRepository":false,"maintainerCanModify":true}}"#
+            )
+        };
+        std::fs::write(&view, ready("def")).unwrap();
+        let _ = std::fs::remove_file(&marker);
+        let (mut ctx, rx) = merge_ctx(true);
+        let merged = ctx
+            .merge_now(1, "abc", crate::tui::MergeStyle::Squash)
+            .unwrap();
+        assert!(!merged, "a moved head must not merge");
+        assert!(
+            !marker.exists(),
+            "merge_now must recheck the head SHA before gh pr merge"
+        );
+        assert!(rx.try_recv().is_err() || !marker.exists());
+
+        std::fs::write(&view, ready("abc")).unwrap();
+        let (mut ctx, rx) = merge_ctx(true);
+        let merged = ctx
+            .merge_now(1, "abc", crate::tui::MergeStyle::Squash)
+            .unwrap();
+        assert!(merged);
+        assert!(marker.exists(), "unchanged head still merges");
+        let mut code = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::tui::UiEvent::Exit { code: c, .. } = ev {
+                code = Some(c);
+            }
+        }
+        assert_eq!(code, Some(0));
+
+        let _ = std::fs::remove_file(&marker);
+        std::env::set_var("GHOST_TEST_MERGE_CODE", "1");
+        std::env::set_var(
+            "GHOST_TEST_MERGE_ERR",
+            "GraphQL: Squash merges are not allowed on this repository",
+        );
+        let (mut ctx, rx) = merge_ctx(true);
+        let merged = ctx
+            .merge_now(1, "abc", crate::tui::MergeStyle::Squash)
+            .unwrap();
+        assert!(merged, "merge-yes failure leaves the loop");
+        assert!(!marker.exists());
+        let mut saw = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::tui::UiEvent::Exit { code, message } = ev {
+                saw = Some((code, message));
+            }
+        }
+        let (code, message) = saw.expect("merge-yes failure exits");
+        assert_eq!(code, 1);
+        assert!(
+            message.contains("許可されていません"),
+            "method rejection must name the flag and not guess another method: {message}"
+        );
+        assert!(message.contains("--merge-method") || message.contains("m "));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
