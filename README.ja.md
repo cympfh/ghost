@@ -45,7 +45,7 @@ ghost github.com/OWNER/REPO/issue/N --yes    # 続行の確認を自動で受け
 
 ![ピッカー](docs/screenshots/picker.png)
 
-ghost は `gh` だけで poll します。各 poll は `gh api` で取ったレビュー本文、インラインコメント、issue コメントの件数を `reviews N, inline N, comments N` とログします。`-t` で落とされたコメントは `filtered N (untrusted author)` と出ます。最初の実作業でエージェントを起動し、その後の更新は同じセッションへの follow-up です。更新が無い poll（review では SHA が同じ、code では新しいフィードバックも新しい CI 失敗シグネチャも無い）はエージェントを呼びません。失敗したターンでは SHA やコメントを処理済みにしません。resume の失敗は、同じ文脈の新しいセッションで一度だけ再試行します。エージェントの失敗が続くと待ち時間を延ばし、5 回連続で止みます。同じ SHA の同じ CI 失敗は、SHA か失敗チェックの集合が変わるまで再送しません。
+ghost は `gh` だけで poll します。各 poll は `gh api` で取ったレビュー本文、インラインコメント、issue コメントの件数を `reviews N, inline N, comments N` とログします。code の各 poll は `filtered 0` も出します。`-t` で落とすと `filtered N (untrusted author)` です。デフォルトの `all` では Copilot のレビュー本文（`copilot-pull-request-reviewer[bot]`）とインラインコメント（`Copilot`、または同じ bot ログイン）を残します。最初の実作業でエージェントを起動し、その後の更新は同じセッションへの follow-up です。更新が無い poll（review では SHA が同じ、code では新しいフィードバックも新しい CI 失敗シグネチャも無い）はエージェントを呼びません。失敗したターンでは SHA やコメントを処理済みにしません。resume の失敗は、同じ文脈の新しいセッションで一度だけ再試行します。エージェントの失敗が続くと待ち時間を延ばし、5 回連続で止みます。同じ SHA の同じ CI 失敗は、SHA か失敗チェックの集合が変わるまで再送しません。
 
 `issue/N` が PR を開く（または既存の PR を見つける）と、デフォルトでは日本語で `PR #M を --code として続けますか？ [Y/n]` と尋ね、issue の文脈を持つ同じセッションを維持します。PR 作成より後に付いたコメントは、その引き継ぎ時に既読にしません。エージェント自身の返信は後から無視しますが、同じ GitHub ユーザーによるレビューは無視しません。ghost が PR 本文を編集するとき、`Closes #N` の行が無ければ足します。issue のブランチは `fix/12-crash-on-empty-config` の形で、`ghost/issue-N` にはしません。
 
@@ -60,6 +60,8 @@ PR がマージ可能、マージ済み、またはクローズになるとエ�
 - Grok: `grok --prompt-file <file> --session-id <uuid> --output-format streaming-json --yolo --cwd <dir>`。続きは `--session-id` なしの `--resume <uuid>`。
 
 プロンプトは、GitHub の操作に `gh` を使うこと、選んだ言語で返答すること、マージしないことをエージェントに伝えます。
+
+補助の文字は ANSI の灰色で、明るい黒は使いません。`NO_COLOR` が空でない値のときは色を消し、未設定か空のときは色を付けます。
 
 ![--code として続ける](docs/screenshots/confirm.png)
 

@@ -630,9 +630,8 @@ impl Ctx {
             }
             let snap = match self.poll_pr(number)? {
                 Some(mut snap) => {
-                    if let Some(line) = self.prepare_notes(&mut snap, &agent_ids) {
-                        self.log(line);
-                    }
+                    let filtered = self.prepare_notes(&mut snap, &agent_ids);
+                    self.log(filtered);
                     snap
                 }
                 None => return Ok(()),
@@ -1571,9 +1570,8 @@ impl Ctx {
         }
     }
 
-    /// Returns a poll line when comments were dropped, such as
-    /// `filtered 3 (untrusted author)`.
-    fn prepare_notes(&self, snap: &mut PrSnap, agent_ids: &BTreeSet<String>) -> Option<String> {
+    /// Filter line for this poll, including `filtered 0` when nothing was dropped.
+    fn prepare_notes(&self, snap: &mut PrSnap, agent_ids: &BTreeSet<String>) -> String {
         let login = self.login();
         mark_viewer(&mut snap.notes, &login);
         let filtered = filter_notes(

@@ -45,7 +45,7 @@ A PR URL with no flag asks review or code. `--review` / `--code` on a repo URL i
 
 ![Picker](docs/screenshots/picker.png)
 
-Ghost polls with `gh` only. Each poll logs `reviews N, inline N, comments N` from `gh api` (review submissions, inline review comments, and issue comments). Comments dropped by `-t` are logged as `filtered N (untrusted author)`. It starts the agent on the first real task and later updates are follow-ups in that same session. A poll with no new SHA (review) or no new feedback and no new CI failure signature (code) makes no agent call. A failed agent turn does not mark that SHA or those comments done; a failed resume is retried once as a fresh session with the same context. Repeated agent failures wait longer each time and ghost stops after five in a row. The same CI failure on the same SHA is not sent again until the SHA or the failing-check set changes.
+Ghost polls with `gh` only. Each poll logs `reviews N, inline N, comments N` from `gh api` (review submissions, inline review comments, and issue comments). Each code poll also logs `filtered 0`, or `filtered N (untrusted author)` when `-t` drops authors. Copilot review bodies (`copilot-pull-request-reviewer[bot]`) and inline comments (`Copilot`, or the same bot login) are kept under the default `all`. It starts the agent on the first real task and later updates are follow-ups in that same session. A poll with no new SHA (review) or no new feedback and no new CI failure signature (code) makes no agent call. A failed agent turn does not mark that SHA or those comments done; a failed resume is retried once as a fresh session with the same context. Repeated agent failures wait longer each time and ghost stops after five in a row. The same CI failure on the same SHA is not sent again until the SHA or the failing-check set changes.
 
 After `issue/N` opens (or finds) a PR, ghost asks `Continue as --code on PR #M? [Y/n]` (Japanese by default) and keeps the session that already has the issue context. Comments posted after the PR was opened are not marked seen at that handoff. The agent's own replies are ignored later; a review from the same GitHub user is not. The PR body is given a `Closes #N` line when ghost is editing it and the line is missing. Issue branches look like `fix/12-crash-on-empty-config`, never `ghost/issue-N`.
 
@@ -60,6 +60,8 @@ Continuation flags:
 - Grok: `grok --prompt-file <file> --session-id <uuid> --output-format streaming-json --yolo --cwd <dir>`, then `--resume <uuid>` without `--session-id`.
 
 Prompts tell the agent to use `gh` for every GitHub action, to reply in the selected language, and not to merge.
+
+Secondary text is ANSI gray, not bright black. A non-empty `NO_COLOR` turns color off. Unset or empty `NO_COLOR` leaves color on.
 
 ![Continue as --code](docs/screenshots/confirm.png)
 

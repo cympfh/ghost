@@ -18,6 +18,7 @@ pub mod shell;
 pub mod state;
 pub mod target;
 pub mod text;
+pub mod theme;
 pub mod tui;
 pub mod watch;
 pub mod workdir;

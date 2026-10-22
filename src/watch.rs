@@ -262,14 +262,15 @@ impl FilterStats {
         self.untrusted + self.empty + self.own
     }
 
-    /// `filtered 3 (untrusted author)` when authors were dropped.
-    /// Mixed reasons name each count. Nothing dropped returns `None`.
-    pub fn log_line(self) -> Option<String> {
+    /// Every code poll logs this. Nothing dropped is `filtered 0`.
+    /// Author-only drops are `filtered 3 (untrusted author)`.
+    /// Mixed reasons name each count.
+    pub fn log_line(self) -> String {
         if self.total() == 0 {
-            return None;
+            return "filtered 0".to_string();
         }
         if self.empty == 0 && self.own == 0 {
-            return Some(format!("filtered {} (untrusted author)", self.untrusted));
+            return format!("filtered {} (untrusted author)", self.untrusted);
         }
         let mut reasons = Vec::new();
         if self.untrusted > 0 {
@@ -281,11 +282,7 @@ impl FilterStats {
         if self.own > 0 {
             reasons.push(format!("own reply {}", self.own));
         }
-        Some(format!(
-            "filtered {} ({})",
-            self.total(),
-            reasons.join(", ")
-        ))
+        format!("filtered {} ({})", self.total(), reasons.join(", "))
     }
 }
 
@@ -825,6 +822,15 @@ mod tests {
             &BTreeSet::new(),
         );
         assert_eq!(kept.len(), 3, "default trust is all authors: {kept:?}");
+        let kept_stats = filter_notes(
+            &notes,
+            CommentTrust::default(),
+            "cympfh",
+            "author",
+            "cympfh",
+            &BTreeSet::new(),
+        );
+        assert_eq!(kept_stats.stats.log_line(), "filtered 0");
         let restricted = filter_notes(
             &notes,
             CommentTrust::Collaborators,
@@ -834,10 +840,7 @@ mod tests {
             &BTreeSet::new(),
         );
         assert!(restricted.kept.is_empty());
-        assert_eq!(
-            restricted.stats.log_line().as_deref(),
-            Some("filtered 3 (untrusted author)")
-        );
+        assert_eq!(restricted.stats.log_line(), "filtered 3 (untrusted author)");
         let mut pr = snap("abc", ChecksVerdict::None);
         pr.notes = kept;
         match decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap() {

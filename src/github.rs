@@ -989,6 +989,15 @@ mod tests {
               "path": "src/main.rs",
               "line": 4,
               "created_at": "2024-06-02T00:00:01Z"
+            },
+            {
+              "id": 2003,
+              "user": {"login": "copilot-pull-request-reviewer[bot]", "id": 175728472, "type": "Bot"},
+              "body": "inline from the review bot",
+              "author_association": "NONE",
+              "path": "src/lib.rs",
+              "line": 8,
+              "created_at": "2024-06-02T00:00:02Z"
             }
         ]"#;
         let reviews = parse_api_values(reviews).unwrap();
@@ -998,14 +1007,16 @@ mod tests {
             .filter_map(note_from_review)
             .chain(inline.iter().filter_map(note_from_inline))
             .collect();
-        assert_eq!(notes.len(), 2);
+        assert_eq!(notes.len(), 3);
         assert_eq!(notes[0].author, "copilot-pull-request-reviewer[bot]");
         assert_eq!(notes[0].association, "NONE");
         assert_eq!(notes[0].id, "review:1001");
         assert_eq!(notes[1].author, "Copilot");
         assert_eq!(notes[1].association, "CONTRIBUTOR");
         assert!(notes[1].body.contains("src/main.rs:4"));
-        let kept = crate::watch::actionable_notes(
+        assert_eq!(notes[2].author, "copilot-pull-request-reviewer[bot]");
+        assert_eq!(notes[2].kind, "inline");
+        let kept = crate::watch::filter_notes(
             &notes,
             crate::watch::CommentTrust::default(),
             "cympfh",
@@ -1013,8 +1024,9 @@ mod tests {
             "cympfh",
             &std::collections::BTreeSet::new(),
         );
-        assert_eq!(kept.len(), 2);
-        let dropped = crate::watch::actionable_notes(
+        assert_eq!(kept.kept.len(), 3);
+        assert_eq!(kept.stats.log_line(), "filtered 0");
+        let dropped = crate::watch::filter_notes(
             &notes,
             crate::watch::CommentTrust::Collaborators,
             "cympfh",
@@ -1022,7 +1034,8 @@ mod tests {
             "cympfh",
             &std::collections::BTreeSet::new(),
         );
-        assert!(dropped.is_empty());
+        assert!(dropped.kept.is_empty());
+        assert_eq!(dropped.stats.log_line(), "filtered 3 (untrusted author)");
     }
 
     #[test]

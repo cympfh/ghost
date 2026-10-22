@@ -12,7 +12,6 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -20,6 +19,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::github::{ItemKind, OpenItem};
 use crate::text::{pad_cols, truncate_cols, wrap_cols};
+use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -499,44 +499,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn header_line(header: &str) -> Paragraph<'_> {
     Paragraph::new(Line::from(vec![
-        Span::styled(
-            "$ ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            header.to_string(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("$ ", theme::prompt()),
+        Span::styled(header.to_string(), theme::title()),
     ]))
 }
 
-fn border_color(app: &App) -> Color {
+fn border_style(app: &App) -> ratatui::style::Style {
     if matches!(app.view, View::Fatal { .. }) {
-        Color::Red
+        theme::border_fatal()
     } else if app.input_mode {
-        Color::Yellow
+        theme::border_input()
     } else if app.status.phase == "running" {
-        Color::Cyan
+        theme::border_running()
     } else if matches!(app.view, View::Confirm { .. }) {
-        Color::Yellow
+        theme::border_confirm()
     } else {
-        Color::White
+        theme::border_idle()
     }
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
-    let border = border_color(app);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border));
+        .border_style(border_style(app));
     match &app.view {
         View::Fatal { message } => {
             let para = Paragraph::new(message.clone())
-                .style(Style::default().fg(Color::White))
+                .style(theme::text())
                 .block(block)
                 .wrap(Wrap { trim: false });
             frame.render_widget(para, area);
@@ -570,26 +559,21 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn log_rows(lines: &[LogLine], width: usize) -> Vec<Line<'static>> {
     if lines.is_empty() {
-        return vec![Line::from(Span::styled(
-            "· …",
-            Style::default().fg(Color::DarkGray),
-        ))];
+        return vec![Line::from(Span::styled("· …", theme::secondary()))];
     }
     let mut rows = Vec::new();
     for line in lines {
         let (prefix, style) = match line.kind {
-            LogKind::Agent => ("> ", Style::default().fg(Color::White)),
-            LogKind::System => ("· ", Style::default().fg(Color::DarkGray)),
-            LogKind::User => ("› ", Style::default().fg(Color::Yellow)),
-            LogKind::Error => ("! ", Style::default().fg(Color::Red)),
+            LogKind::Agent => ("> ", theme::text()),
+            LogKind::System => ("· ", theme::secondary()),
+            LogKind::User => ("› ", theme::warn()),
+            LogKind::Error => ("! ", theme::error()),
         };
         let prefix_style = match line.kind {
-            LogKind::Agent => Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            LogKind::User => Style::default().fg(Color::Yellow),
-            LogKind::Error => Style::default().fg(Color::Red),
-            LogKind::System => Style::default().fg(Color::DarkGray),
+            LogKind::Agent => theme::accent_bold(),
+            LogKind::User => theme::warn(),
+            LogKind::Error => theme::error(),
+            LogKind::System => theme::secondary(),
         };
         let wrapped = wrap_cols(&line.text, width.max(1));
         for (i, part) in wrapped.into_iter().enumerate() {
@@ -611,7 +595,7 @@ fn picker_rows(items: &[OpenItem], selected: usize, width: usize) -> (Vec<Line<'
         return (
             vec![Line::from(Span::styled(
                 "  no open pull requests or issues",
-                Style::default().fg(Color::DarkGray),
+                theme::secondary(),
             ))],
             0,
         );
@@ -638,12 +622,7 @@ fn picker_rows(items: &[OpenItem], selected: usize, width: usize) -> (Vec<Line<'
 }
 
 fn section(label: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        format!(" {label}"),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ))
+    Line::from(Span::styled(format!(" {label}"), theme::accent_bold()))
 }
 
 fn item_line(item: &OpenItem, selected: bool, width: usize) -> Line<'static> {
@@ -674,76 +653,44 @@ fn item_line(item: &OpenItem, selected: bool, width: usize) -> Line<'static> {
     if selected {
         return Line::from(Span::styled(
             truncate_cols(&plain, width),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            theme::selected(),
         ));
     }
     Line::from(vec![
-        Span::styled(prefix, Style::default().fg(Color::White)),
-        Span::styled(title, Style::default().fg(Color::White)),
+        Span::styled(prefix, theme::text()),
+        Span::styled(title, theme::text()),
         Span::raw(" "),
-        Span::styled(author, Style::default().fg(Color::DarkGray)),
+        Span::styled(author, theme::secondary()),
         Span::raw(" "),
-        Span::styled(labels, Style::default().fg(Color::Cyan)),
+        Span::styled(labels, theme::accent()),
         Span::raw(" "),
-        Span::styled(ci, badge_style(item.ci.as_deref().unwrap_or(""))),
+        Span::styled(ci, theme::badge(item.ci.as_deref().unwrap_or(""))),
         Span::raw(" "),
-        Span::styled(review, badge_style(item.review.as_deref().unwrap_or(""))),
+        Span::styled(review, theme::badge(item.review.as_deref().unwrap_or(""))),
     ])
-}
-
-fn badge_style(text: &str) -> Style {
-    if text.contains('✓') || text.contains("approved") {
-        Style::default().fg(Color::Green)
-    } else if text.contains('✗') || text.contains("changes") {
-        Style::default().fg(Color::Red)
-    } else if text.contains('…') || text.contains("review") {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    }
 }
 
 fn input_line(app: &App, width: usize) -> Paragraph<'static> {
     if app.input_mode {
         let avail = width.saturating_sub(4).max(1);
         let (shown, cursor) = window_str(&app.input, app.cursor, avail);
-        let mut spans = vec![Span::styled(
-            " ❯ ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )];
+        let mut spans = vec![Span::styled(" ❯ ", theme::warn_bold())];
         let chars: Vec<char> = shown.chars().collect();
         for (i, ch) in chars.iter().enumerate() {
             if i == cursor {
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                spans.push(Span::styled(ch.to_string(), theme::cursor()));
             } else {
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default().fg(Color::White),
-                ));
+                spans.push(Span::styled(ch.to_string(), theme::text()));
             }
         }
         if cursor >= chars.len() {
-            spans.push(Span::styled(
-                " ",
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            ));
+            spans.push(Span::styled(" ", theme::cursor_block()));
         }
         Paragraph::new(Line::from(spans))
     } else {
         Paragraph::new(Line::from(vec![
-            Span::styled(" ❯ ", Style::default().fg(Color::Yellow)),
-            Span::styled(idle_hint(&app.view), Style::default().fg(Color::DarkGray)),
+            Span::styled(" ❯ ", theme::warn()),
+            Span::styled(idle_hint(&app.view), theme::secondary()),
         ]))
     }
 }
@@ -798,10 +745,7 @@ fn status_line(app: &App, width: usize) -> Paragraph<'static> {
     );
     Paragraph::new(Line::from(Span::styled(
         pad_cols(&text, width.max(1)),
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::White)
-            .add_modifier(Modifier::BOLD),
+        theme::status_bar(),
     )))
 }
 
@@ -819,7 +763,7 @@ fn hint_line(app: &App) -> Paragraph<'static> {
     };
     Paragraph::new(Line::from(Span::styled(
         text.to_string(),
-        Style::default().fg(Color::DarkGray),
+        theme::secondary(),
     )))
 }
 
@@ -828,32 +772,21 @@ fn draw_choose(frame: &mut Frame, area: Rect, number: u64, title: &str) {
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(theme::border_choose())
         .title(" mode ");
     let body = Paragraph::new(vec![
         Line::from(""),
-        Line::from(Span::styled(
-            format!(" PR #{number}"),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(format!(" PR #{number}"), theme::title())),
         Line::from(Span::styled(
             format!(
                 " {}",
                 truncate_cols(title, rect.width.saturating_sub(4) as usize)
             ),
-            Style::default().fg(Color::DarkGray),
+            theme::secondary(),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            " r  review",
-            Style::default().fg(Color::Magenta),
-        )),
-        Line::from(Span::styled(
-            " c  code as the author",
-            Style::default().fg(Color::Green),
-        )),
+        Line::from(Span::styled(" r  review", theme::review_choice())),
+        Line::from(Span::styled(" c  code as the author", theme::code_choice())),
     ])
     .block(block);
     frame.render_widget(body, rect);
@@ -866,24 +799,16 @@ fn draw_confirm(frame: &mut Frame, area: Rect, message: &str) {
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(theme::border_confirm())
         .title(" continue? ");
     let body = Paragraph::new(vec![
         Line::from(""),
-        Line::from(Span::styled(
-            message.to_string(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(message.to_string(), theme::title())),
         Line::from(""),
-        Line::from(Span::styled(
-            " [Y] yes     n no",
-            Style::default().fg(Color::Yellow),
-        )),
+        Line::from(Span::styled(" [Y] yes     n no", theme::warn())),
         Line::from(Span::styled(
             " enter accepts the default",
-            Style::default().fg(Color::DarkGray),
+            theme::secondary(),
         )),
     ])
     .block(block)
@@ -1036,5 +961,51 @@ mod tests {
             text.contains("running") || text.contains("review"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn secondary_text_is_gray_and_no_color_is_plain() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = App::new("ghost github.com/cympfh/xxx/pr/3 --review".into());
+        app.lines.push(LogLine {
+            kind: LogKind::System,
+            text: "reviews 1, inline 1, comments 0".into(),
+        });
+        app.lines.push(LogLine {
+            kind: LogKind::System,
+            text: "filtered 0".into(),
+        });
+
+        theme::force_colors_for_test(Some(true));
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut saw_gray = false;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                assert_ne!(cell.fg, Color::DarkGray);
+                assert!(!cell.modifier.contains(Modifier::DIM));
+                if cell.fg == Color::Gray {
+                    saw_gray = true;
+                }
+            }
+        }
+        assert!(saw_gray, "system and hint text use gray");
+
+        theme::force_colors_for_test(Some(false));
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                assert_eq!(cell.fg, Color::Reset);
+                assert_eq!(cell.bg, Color::Reset);
+                assert!(!cell.modifier.contains(Modifier::DIM));
+            }
+        }
+        theme::force_colors_for_test(None);
     }
 }
