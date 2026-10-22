@@ -23,8 +23,8 @@ use crate::target::GhTarget;
 use crate::text::{format_countdown, short_sha};
 use crate::tui::{self, LogKind, LogLine, Side, Status, UiCmd, UiEvent};
 use crate::watch::{
-    actionable_notes, baseline_agent_comments, decide_code, decide_review, ensure_closing_line,
-    feedback_log, mark_viewer, CiHandled, CodeAction, CommentTrust, MaxTurns, Note, PrSnap,
+    baseline_agent_comments, decide_code, decide_review, ensure_closing_line, feedback_log,
+    filter_notes, mark_viewer, CiHandled, CodeAction, CommentTrust, MaxTurns, Note, PrSnap,
     ReviewAction,
 };
 use crate::workdir::{self, Checkout};
@@ -236,14 +236,14 @@ fn prime_issue(
                 dest,
                 gh_failure(
                     format!("{purpose} の内容を読むため"),
-                    format!("gh issue view {number} --repo {slug} --json number,title,body,state"),
+                    format!("gh issue view {number} --repo {slug} --json number,title,body,state,labels"),
                     format!("{purpose} のタイトルと本文が分かっている状態にしてから作業して"),
                     &err,
                 ),
             );
         }
     };
-    let branch = workdir::issue_branch(number, &issue.title, &issue.body);
+    let branch = workdir::issue_branch(number, &issue.title, &label_refs(&issue.labels));
     match gh.find_issue_pr(number, &branch) {
         Ok(Some(pr)) => {
             let purpose = pr_purpose(RunMode::Issue, pr);
@@ -453,6 +453,7 @@ fn babysit(
         tx,
         rx,
         turns: 0,
+        fail_streak: 0,
         queued: Vec::new(),
         status,
         quit: false,
@@ -501,6 +502,8 @@ struct Ctx {
     login: Option<String>,
     agent: AgentSession,
     turns: u32,
+    /// Real agent failures in a row. A successful turn clears it.
+    fail_streak: u32,
     queued: Vec<String>,
     status: Status,
     quit: bool,
@@ -627,7 +630,9 @@ impl Ctx {
             }
             let snap = match self.poll_pr(number)? {
                 Some(mut snap) => {
-                    self.prepare_notes(&mut snap, &agent_ids);
+                    if let Some(line) = self.prepare_notes(&mut snap, &agent_ids) {
+                        self.log(line);
+                    }
                     snap
                 }
                 None => return Ok(()),
@@ -756,7 +761,7 @@ impl Ctx {
                 self.push_setup_failure(gh_failure(
                     format!("issue #{number} の内容を読むため"),
                     format!(
-                        "gh issue view {number} --repo {} --json number,title,body,state",
+                        "gh issue view {number} --repo {} --json number,title,body,state,labels",
                         self.slug
                     ),
                     format!("issue #{number} のタイトルと本文が分かっている状態にしてから作業して"),
@@ -767,10 +772,11 @@ impl Ctx {
                     title: String::new(),
                     body: String::new(),
                     state: String::new(),
+                    labels: Vec::new(),
                 }
             }
         };
-        let branch = workdir::issue_branch(number, &issue.title, &issue.body);
+        let branch = workdir::issue_branch(number, &issue.title, &label_refs(&issue.labels));
         let existing = match self.gh.find_issue_pr(number, &branch) {
             Ok(pr) => pr,
             Err(err) => {
@@ -1211,11 +1217,17 @@ impl Ctx {
                 self.agent.saw_error(),
             );
             if ok {
+                self.fail_streak = 0;
                 return Ok(true);
             }
             if self.interrupted {
                 return Ok(false);
             }
+            let usage = !counts_as_agent_turn(
+                &launch,
+                self.agent.last_exit_code(),
+                self.agent.recent_output(),
+            );
             if allow_fresh && matches!(launch, Launch::Resume { .. }) {
                 self.log(self.say(
                     "resume に失敗したので、同じ文脈で新しいセッションを開始します",
@@ -1223,6 +1235,12 @@ impl Ctx {
                 ));
                 self.agent.forget_session();
                 allow_fresh = false;
+                if !usage {
+                    self.backoff_after_failure()?;
+                    if self.quit {
+                        return Ok(false);
+                    }
+                }
                 continue;
             }
             let code = self
@@ -1234,8 +1252,67 @@ impl Ctx {
                 &format!("エージェントのターンが失敗しました（exit {code}）"),
                 &format!("agent turn failed (exit {code})"),
             ));
+            if !usage {
+                self.backoff_after_failure()?;
+            }
             return Ok(false);
         }
+    }
+
+    /// Wait longer after each real failure, and stop after a short streak
+    /// so a broken agent cannot spend the whole turn budget in one poll cycle.
+    fn backoff_after_failure(&mut self) -> Result<()> {
+        self.fail_streak += 1;
+        if stop_after_failures(self.fail_streak) {
+            let n = MAX_CONSECUTIVE_AGENT_FAILURES;
+            self.stop(
+                1,
+                self.say(
+                    &format!(
+                        "エージェントが {n} 回連続で失敗したので停止します。ログを確認してから再実行してください。"
+                    ),
+                    &format!(
+                        "Stopped after {n} consecutive agent failures. Check the log, then re-run ghost."
+                    ),
+                ),
+            );
+            return Ok(());
+        }
+        let wait = agent_backoff(self.fail_streak);
+        let left = format_countdown(wait);
+        let n = MAX_CONSECUTIVE_AGENT_FAILURES;
+        self.log(self.say(
+            &format!(
+                "エージェントが失敗しました（連続 {}/{}）。{left} 待ってから次を試します。",
+                self.fail_streak, n
+            ),
+            &format!(
+                "agent failed ({}/{} in a row); waiting {left} before the next attempt",
+                self.fail_streak, n
+            ),
+        ));
+        self.wait_for(wait)
+    }
+
+    fn wait_for(&mut self, total: Duration) -> Result<()> {
+        let start = Instant::now();
+        while start.elapsed() < total {
+            if self.quit {
+                return Ok(());
+            }
+            let left = total.saturating_sub(start.elapsed());
+            self.status.phase = format!("backoff {}", format_countdown(left));
+            self.push_status();
+            match self.rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(UiCmd::Quit) | Err(RecvTimeoutError::Disconnected) => {
+                    self.stop(0, "quit".into());
+                    return Ok(());
+                }
+                Ok(cmd) => self.handle_cmd(cmd)?,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+        Ok(())
     }
 
     fn wait_turn(&mut self) -> Result<()> {
@@ -1494,10 +1571,12 @@ impl Ctx {
         }
     }
 
-    fn prepare_notes(&self, snap: &mut PrSnap, agent_ids: &BTreeSet<String>) {
+    /// Returns a poll line when comments were dropped, such as
+    /// `filtered 3 (untrusted author)`.
+    fn prepare_notes(&self, snap: &mut PrSnap, agent_ids: &BTreeSet<String>) -> Option<String> {
         let login = self.login();
         mark_viewer(&mut snap.notes, &login);
-        snap.notes = actionable_notes(
+        let filtered = filter_notes(
             &snap.notes,
             self.spec.trust,
             &login,
@@ -1505,6 +1584,9 @@ impl Ctx {
             &self.owner,
             agent_ids,
         );
+        let line = filtered.stats.log_line();
+        snap.notes = filtered.kept;
+        line
     }
 
     fn push_status(&mut self) {
@@ -1724,6 +1806,23 @@ fn mode_name(mode: RunMode) -> &'static str {
     }
 }
 
+/// Real failures in a row before ghost stops instead of retrying.
+pub const MAX_CONSECUTIVE_AGENT_FAILURES: u32 = 5;
+
+/// 20s, 40s, 80s, … capped at 10 minutes.
+pub fn agent_backoff(consecutive_failures: u32) -> Duration {
+    let exp = consecutive_failures.saturating_sub(1).min(5);
+    Duration::from_secs((20u64 << exp).min(10 * 60))
+}
+
+pub fn stop_after_failures(streak: u32) -> bool {
+    streak >= MAX_CONSECUTIVE_AGENT_FAILURES
+}
+
+fn label_refs(labels: &[String]) -> Vec<&str> {
+    labels.iter().map(String::as_str).collect()
+}
+
 fn short_id(id: &str) -> &str {
     let n = id.len().min(8);
     &id[..n]
@@ -1731,8 +1830,23 @@ fn short_id(id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::empty_repo_notice;
+    use std::time::Duration;
+
+    use super::{
+        agent_backoff, empty_repo_notice, stop_after_failures, MAX_CONSECUTIVE_AGENT_FAILURES,
+    };
     use crate::lang::Lang;
+
+    #[test]
+    fn agent_failure_backoff_grows_and_then_stops() {
+        assert_eq!(agent_backoff(1), Duration::from_secs(20));
+        assert_eq!(agent_backoff(2), Duration::from_secs(40));
+        assert_eq!(agent_backoff(3), Duration::from_secs(80));
+        assert_eq!(agent_backoff(4), Duration::from_secs(160));
+        assert!(agent_backoff(20) <= Duration::from_secs(10 * 60));
+        assert!(!stop_after_failures(MAX_CONSECUTIVE_AGENT_FAILURES - 1));
+        assert!(stop_after_failures(MAX_CONSECUTIVE_AGENT_FAILURES));
+    }
 
     #[test]
     fn empty_repo_skips_the_picker() {

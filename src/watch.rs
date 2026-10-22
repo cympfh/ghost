@@ -53,14 +53,15 @@ pub fn feedback_log(counts: FeedbackCounts) -> String {
 }
 
 /// Who may wake code mode besides the PR author and the repo owner.
+/// The default is everyone: humans, Copilot, other bots, and outsiders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum CommentTrust {
     /// `OWNER`, `MEMBER`, and `COLLABORATOR`.
-    #[default]
     Collaborators,
     /// Collaborators plus `CONTRIBUTOR`.
     Contributors,
-    /// Every author association.
+    /// Every author: humans, review bots, and outsiders.
+    #[default]
     All,
 }
 
@@ -248,6 +249,79 @@ pub fn note_trusted(note: &Note, trust: CommentTrust, pr_author: &str, repo_owne
     association_trusted(&note.association, trust)
 }
 
+/// Why a polled comment was not handed to the agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilterStats {
+    pub untrusted: usize,
+    pub empty: usize,
+    pub own: usize,
+}
+
+impl FilterStats {
+    pub fn total(self) -> usize {
+        self.untrusted + self.empty + self.own
+    }
+
+    /// `filtered 3 (untrusted author)` when authors were dropped.
+    /// Mixed reasons name each count. Nothing dropped returns `None`.
+    pub fn log_line(self) -> Option<String> {
+        if self.total() == 0 {
+            return None;
+        }
+        if self.empty == 0 && self.own == 0 {
+            return Some(format!("filtered {} (untrusted author)", self.untrusted));
+        }
+        let mut reasons = Vec::new();
+        if self.untrusted > 0 {
+            reasons.push(format!("untrusted author {}", self.untrusted));
+        }
+        if self.empty > 0 {
+            reasons.push(format!("empty {}", self.empty));
+        }
+        if self.own > 0 {
+            reasons.push(format!("own reply {}", self.own));
+        }
+        Some(format!(
+            "filtered {} ({})",
+            self.total(),
+            reasons.join(", ")
+        ))
+    }
+}
+
+pub struct FilteredNotes {
+    pub kept: Vec<Note>,
+    pub stats: FilterStats,
+}
+
+pub fn filter_notes(
+    notes: &[Note],
+    trust: CommentTrust,
+    login: &str,
+    pr_author: &str,
+    repo_owner: &str,
+    agent_ids: &BTreeSet<String>,
+) -> FilteredNotes {
+    let mut kept = Vec::new();
+    let mut stats = FilterStats::default();
+    for note in notes {
+        if note.body.trim().is_empty() {
+            stats.empty += 1;
+            continue;
+        }
+        if is_self_generated(note, login, agent_ids) {
+            stats.own += 1;
+            continue;
+        }
+        if !note_trusted(note, trust, pr_author, repo_owner) {
+            stats.untrusted += 1;
+            continue;
+        }
+        kept.push(note.clone());
+    }
+    FilteredNotes { kept, stats }
+}
+
 pub fn actionable_notes(
     notes: &[Note],
     trust: CommentTrust,
@@ -256,15 +330,7 @@ pub fn actionable_notes(
     repo_owner: &str,
     agent_ids: &BTreeSet<String>,
 ) -> Vec<Note> {
-    notes
-        .iter()
-        .filter(|n| {
-            !n.body.trim().is_empty()
-                && !is_self_generated(n, login, agent_ids)
-                && note_trusted(n, trust, pr_author, repo_owner)
-        })
-        .cloned()
-        .collect()
+    filter_notes(notes, trust, login, pr_author, repo_owner, agent_ids).kept
 }
 
 /// Ids to treat as the agent's own at the issue → code handoff.
@@ -665,6 +731,125 @@ mod tests {
         );
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].id, "comment:2");
+    }
+
+    #[test]
+    fn contributor_is_outside_collaborators_and_inside_contributors() {
+        let note = Note {
+            id: "inline:4".into(),
+            author: "pat".into(),
+            body: "please rename this".into(),
+            kind: "inline".into(),
+            association: "CONTRIBUTOR".into(),
+            created_at: String::new(),
+            viewer_authored: false,
+        };
+        let dropped = actionable_notes(
+            &[note.clone()],
+            CommentTrust::Collaborators,
+            "ghost-user",
+            "owner",
+            "owner",
+            &BTreeSet::new(),
+        );
+        assert!(
+            dropped.is_empty(),
+            "CONTRIBUTOR is not a collaborator: {dropped:?}"
+        );
+        let kept = actionable_notes(
+            &[note.clone()],
+            CommentTrust::Contributors,
+            "ghost-user",
+            "owner",
+            "owner",
+            &BTreeSet::new(),
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "inline:4");
+        let member = Note {
+            association: "MEMBER".into(),
+            id: "inline:5".into(),
+            ..note
+        };
+        assert_eq!(
+            actionable_notes(
+                &[member],
+                CommentTrust::Collaborators,
+                "ghost-user",
+                "owner",
+                "owner",
+                &BTreeSet::new(),
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn default_trust_keeps_copilot_and_outsiders() {
+        assert_eq!(CommentTrust::default(), CommentTrust::All);
+        let review = Note {
+            id: "review:10".into(),
+            author: "copilot-pull-request-reviewer[bot]".into(),
+            body: "Consider renaming this helper.".into(),
+            kind: "review COMMENTED".into(),
+            association: "NONE".into(),
+            created_at: "2024-06-01T00:05:00Z".into(),
+            viewer_authored: false,
+        };
+        let inline = Note {
+            id: "inline:21".into(),
+            author: "Copilot".into(),
+            body: "src/main.rs:4: this branch is wrong".into(),
+            kind: "inline".into(),
+            association: "CONTRIBUTOR".into(),
+            created_at: "2024-06-01T00:05:02Z".into(),
+            viewer_authored: false,
+        };
+        let outsider = Note {
+            id: "comment:3".into(),
+            author: "stranger".into(),
+            body: "this looks wrong".into(),
+            kind: "comment".into(),
+            association: "NONE".into(),
+            created_at: String::new(),
+            viewer_authored: false,
+        };
+        let notes = [review, inline, outsider.clone()];
+        let kept = actionable_notes(
+            &notes,
+            CommentTrust::default(),
+            "cympfh",
+            "author",
+            "cympfh",
+            &BTreeSet::new(),
+        );
+        assert_eq!(kept.len(), 3, "default trust is all authors: {kept:?}");
+        let restricted = filter_notes(
+            &notes,
+            CommentTrust::Collaborators,
+            "cympfh",
+            "author",
+            "cympfh",
+            &BTreeSet::new(),
+        );
+        assert!(restricted.kept.is_empty());
+        assert_eq!(
+            restricted.stats.log_line().as_deref(),
+            Some("filtered 3 (untrusted author)")
+        );
+        let mut pr = snap("abc", ChecksVerdict::None);
+        pr.notes = kept;
+        match decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap() {
+            CodeAction::Fix { new_notes, .. } => {
+                assert!(new_notes.iter().any(|n| n.author == "Copilot"));
+                assert!(new_notes
+                    .iter()
+                    .any(|n| n.author == "copilot-pull-request-reviewer[bot]"));
+            }
+            other => panic!("copilot comments were idle: {other:?}"),
+        }
+        let _ = outsider;
     }
 
     #[test]

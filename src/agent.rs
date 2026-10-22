@@ -922,43 +922,72 @@ extern "C" fn on_fatal(sig: i32) {
 }
 
 const GH_GUARD: &str = r#"#!/bin/sh
+# Accident guard only. The deny scan never rewrites argv; exec keeps "$@".
 real="${GHOST_REAL_GH:-}"
 if [ -z "$real" ] || [ ! -x "$real" ]; then
   echo "ghost: real gh is not available" >&2
   exit 127
 fi
-words=""
 expect=""
+pos=0
+a1=""
+a2=""
+method=""
+merge_api=0
 for arg in "$@"; do
   if [ -n "$expect" ]; then
     if [ "$expect" = "method" ]; then
       up=$(printf '%s' "$arg" | tr '[:lower:]' '[:upper:]')
       if [ "$up" = "DELETE" ]; then
-        echo "ghost: refusing gh api DELETE" >&2
-        exit 99
+        method=DELETE
       fi
     fi
+    case "$arg" in
+      *[Mm][Ee][Rr][Gg][Ee][Pp][Uu][Ll][Ll][Rr][Ee][Qq][Uu][Ee][Ss][Tt]*) merge_api=1 ;;
+    esac
     expect=""
     continue
   fi
   case "$arg" in
     -X|--method) expect=method ;;
-    --method=DELETE|--method=delete) echo "ghost: refusing gh api DELETE" >&2; exit 99 ;;
-    -R|--repo|--hostname|--jq|--template|--cache) expect=skip ;;
-    --repo=*|--hostname=*) ;;
+    -XDELETE|-Xdelete|-XDelete|--method=DELETE|--method=delete|--method=Delete)
+      method=DELETE ;;
+    -R|--repo|--hostname|--jq|--template|--cache|-f|-F|--raw-field|--input|-H|--header|--field)
+      expect=skip ;;
+    --repo=*|--hostname=*|--jq=*|--field=*|--raw-field=*|--input=*|--header=*|--cache=*|--template=*|--method=*)
+      case "$arg" in
+        --method=DELETE|--method=delete|--method=Delete) method=DELETE ;;
+        *[Mm][Ee][Rr][Gg][Ee][Pp][Uu][Ll][Ll][Rr][Ee][Qq][Uu][Ee][Ss][Tt]*) merge_api=1 ;;
+      esac
+      ;;
     -*) ;;
-    *) words="$words $arg" ;;
+    *)
+      pos=$((pos + 1))
+      if [ "$pos" -eq 1 ]; then a1=$arg; fi
+      if [ "$pos" -eq 2 ]; then a2=$arg; fi
+      case "$arg" in
+        *[Mm][Ee][Rr][Gg][Ee][Pp][Uu][Ll][Ll][Rr][Ee][Qq][Uu][Ee][Ss][Tt]*) merge_api=1 ;;
+        */merge|*/merge/|*/merge\?*|*/merges|*/merges/|*/merges\?*) merge_api=1 ;;
+      esac
+      ;;
   esac
 done
-set -- $words
-a1="${1:-}"
-a2="${2:-}"
 case "$a1 $a2" in
   "pr merge"|"repo delete"|"repo archive"|"issue delete"|"release delete")
     echo "ghost: refusing gh $a1 $a2" >&2
     exit 99
     ;;
 esac
+if [ "$a1" = "api" ]; then
+  if [ "$method" = "DELETE" ]; then
+    echo "ghost: refusing gh api DELETE" >&2
+    exit 99
+  fi
+  if [ "$merge_api" -eq 1 ]; then
+    echo "ghost: refusing gh api merge" >&2
+    exit 99
+  fi
+fi
 exec "$real" "$@"
 "#;
 
@@ -1420,7 +1449,16 @@ mod tests {
     }
 
     #[test]
-    fn gh_wrapper_refuses_merge_and_delete() {
+    fn saw_error_blocks_progress_even_on_a_zero_exit() {
+        assert!(!record_progress(false, Some(0), false, true));
+        assert!(record_progress(false, Some(0), false, false));
+        assert!(!record_progress(false, None, true, true));
+        assert!(record_progress(false, None, true, false));
+        assert!(!record_progress(true, Some(0), false, false));
+    }
+
+    #[test]
+    fn gh_wrapper_passes_argv_through_and_blocks_accidental_merge() {
         let dir = std::env::temp_dir().join(format!(
             "ghost-gh-{}-{}",
             std::process::id(),
@@ -1431,7 +1469,12 @@ mod tests {
         ));
         let bin = install_gh_guard(&dir).unwrap();
         let real = dir.join("real-gh");
-        std::fs::write(&real, "#!/bin/sh\necho ok \"$@\"\nexit 0\n").unwrap();
+        let argv_out = dir.join("argv");
+        std::fs::write(
+            &real,
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$GHOST_ARGV_OUT\"\nexit 0\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1441,27 +1484,94 @@ mod tests {
         }
         let guard = bin.join("gh");
         let run = |args: &[&str]| {
+            let _ = std::fs::remove_file(&argv_out);
             std::process::Command::new(&guard)
                 .args(args)
                 .env("GHOST_REAL_GH", &real)
+                .env("GHOST_ARGV_OUT", &argv_out)
                 .output()
                 .unwrap()
         };
-        let merge = run(&["pr", "merge", "2", "--squash"]);
-        assert_eq!(merge.status.code(), Some(99));
-        assert!(String::from_utf8_lossy(&merge.stderr).contains("refusing"));
-        let delete = run(&["repo", "delete", "acme/app", "--yes"]);
-        assert_eq!(delete.status.code(), Some(99));
-        let api = run(&["api", "-X", "DELETE", "repos/acme/app"]);
-        assert_eq!(api.status.code(), Some(99));
-        let view = run(&["pr", "view", "2"]);
-        assert_eq!(
-            view.status.code(),
-            Some(0),
-            "{}",
-            String::from_utf8_lossy(&view.stderr)
+        let passed = |args: &[&str]| {
+            let out = run(args);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "stderr {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let bytes = std::fs::read(&argv_out).unwrap();
+            bytes
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8(s.to_vec()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let comment = [
+            "pr",
+            "comment",
+            "1",
+            "--repo",
+            "o/r",
+            "--body",
+            "hello world",
+            "--body=say \"hi there\"",
+            "--json",
+            "title,body",
+        ];
+        assert_eq!(passed(&comment), comment);
+        let create = [
+            "pr",
+            "create",
+            "--repo",
+            "o/r",
+            "--title",
+            "hello world",
+            "--body",
+            "line one\nline two",
+            "-f",
+            "body=hello world",
+        ];
+        assert_eq!(passed(&create), create);
+        let reply = [
+            "api",
+            "--method",
+            "POST",
+            "repos/o/r/pulls/1/comments/9/replies",
+            "-f",
+            "body=hello world",
+        ];
+        assert_eq!(passed(&reply), reply);
+
+        let refused = |args: &[&str], needle: &str| {
+            let out = run(args);
+            assert_eq!(out.status.code(), Some(99), "{args:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(needle),
+                "{args:?} stderr {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !argv_out.exists(),
+                "denied command must not reach real gh: {args:?}"
+            );
+        };
+        refused(&["pr", "merge", "2", "--squash"], "refusing");
+        refused(&["repo", "delete", "acme/app", "--yes"], "refusing");
+        refused(&["api", "-X", "DELETE", "repos/acme/app"], "DELETE");
+        refused(&["api", "--method=DELETE", "repos/acme/app"], "DELETE");
+        refused(&["api", "-XDELETE", "repos/acme/app"], "DELETE");
+        refused(&["api", "repos/o/r/pulls/1/merge"], "merge");
+        refused(&["api", "-X", "PUT", "repos/o/r/pulls/1/merge"], "merge");
+        refused(
+            &[
+                "api",
+                "graphql",
+                "-f",
+                "query=mutation { mergePullRequest(input:{}) { clientMutationId } }",
+            ],
+            "merge",
         );
-        assert!(String::from_utf8_lossy(&view.stdout).contains("ok"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

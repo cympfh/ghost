@@ -29,14 +29,14 @@ ghost github.com/OWNER/REPO/issue/N --yes    # 続行の確認を自動で受け
 | 短縮 | 長い形 | デフォルト | |
 | --- | --- | --- | --- |
 | `-r` | `--review` | | head SHA が変わったらレビュー。`-c` と同時には付けられない。 |
-| `-c` | `--code` | | 赤い CI と、信頼できる新しいレビューコメントを直す。`-r` と同時には付けられない。 |
+| `-c` | `--code` | | 赤い CI と新しいレビューコメントを直す。`-r` と同時には付けられない。 |
 | `-i` | `--interval` | `20s` | poll 間隔（`30s`、`2m`、`1h30m`、または単位なしの秒数）。 |
 | `-a` | `--agent` | `PATH` 上の最初 | `codex`、`claude`、`grok`。 |
 | `-k` | `--ssh-key` | ssh の設定、または `GHOST_SSH_KEY` | `ssh -i PATH -o IdentitiesOnly=yes`。鍵を省略すると identity を強制しない（`~/.ssh/id_rsa` は仮定しない）。 |
 | `-l` | `--lang` | `ja`（フラグが無いとき `GHOST_LANG`） | `ja` または `en`。 |
 | `-y` | `--yes` | | 続行の確認を受け入れる。 |
 | `-n` | `--max-iterations` | `20` | このプロセスのエージェントターンの上限。 |
-| `-t` | `--trust-comments` | `collaborators` | PR 作者とリポジトリオーナー以外に、だれが code モードを起こすか。`collaborators`、`contributors`、`all`。 |
+| `-t` | `--trust-comments` | `all` | PR 作者とリポジトリオーナー以外に、だれが code モードを起こすか。デフォルトは全員（人間、Copilot、その他の bot、外部の人）。`collaborators` または `contributors` で絞れる。 |
 | `-d` | `--demo` | | `picker`、`review`、`code`、`confirm`、`preflight`。 |
 | `-h` | `--help` | | ヘルプ。 |
 | `-V` | `--version` | | バージョン。 |
@@ -45,11 +45,11 @@ ghost github.com/OWNER/REPO/issue/N --yes    # 続行の確認を自動で受け
 
 ![ピッカー](docs/screenshots/picker.png)
 
-ghost は `gh` だけで poll します。各 poll は `gh api` で取ったレビュー本文、インラインコメント、issue コメントの件数を `reviews N, inline N, comments N` とログします。最初の実作業でエージェントを起動し、その後の更新は同じセッションへの follow-up です。更新が無い poll（review では SHA が同じ、code では信頼できる新しいフィードバックも新しい CI 失敗シグネチャも無い）はエージェントを呼びません。失敗したターンでは SHA やコメントを処理済みにしません。resume の失敗は、同じ文脈の新しいセッションで一度だけ再試行します。同じ SHA の同じ CI 失敗は、SHA か失敗チェックの集合が変わるまで再送しません。
+ghost は `gh` だけで poll します。各 poll は `gh api` で取ったレビュー本文、インラインコメント、issue コメントの件数を `reviews N, inline N, comments N` とログします。`-t` で落とされたコメントは `filtered N (untrusted author)` と出ます。最初の実作業でエージェントを起動し、その後の更新は同じセッションへの follow-up です。更新が無い poll（review では SHA が同じ、code では新しいフィードバックも新しい CI 失敗シグネチャも無い）はエージェントを呼びません。失敗したターンでは SHA やコメントを処理済みにしません。resume の失敗は、同じ文脈の新しいセッションで一度だけ再試行します。エージェントの失敗が続くと待ち時間を延ばし、5 回連続で止みます。同じ SHA の同じ CI 失敗は、SHA か失敗チェックの集合が変わるまで再送しません。
 
 `issue/N` が PR を開く（または既存の PR を見つける）と、デフォルトでは日本語で `PR #M を --code として続けますか？ [Y/n]` と尋ね、issue の文脈を持つ同じセッションを維持します。PR 作成より後に付いたコメントは、その引き継ぎ時に既読にしません。エージェント自身の返信は後から無視しますが、同じ GitHub ユーザーによるレビューは無視しません。ghost が PR 本文を編集するとき、`Closes #N` の行が無ければ足します。issue のブランチは `fix/12-crash-on-empty-config` の形で、`ghost/issue-N` にはしません。
 
-PR がマージ可能、マージ済み、またはクローズになるとエージェントは止まります。ghost はマージしません。エージェントの `PATH` の先頭には、`gh pr merge` や `gh repo delete` などの破壊的なコマンドを拒否する `gh` ラッパーがあります。
+PR がマージ可能、マージ済み、またはクローズになるとエージェントは止まります。ghost はマージしません。エージェントの `PATH` の先頭の `gh` は、誤って `gh pr merge` や `gh repo delete`、`gh api` の DELETE、`mergePullRequest` のような merge エンドポイントを叩いたときのための事故防止です。セキュリティ境界ではありません。デフォルトブランチへの `git push`、`gh` の alias、絶対パスの `/usr/bin/gh`、別の API の形は通ります。本当に止めたいときは、merge 権限の無いトークンを使ってください。
 
 ![同じセッションの code モード](docs/screenshots/code.png)
 

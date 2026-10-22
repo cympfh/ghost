@@ -30,8 +30,10 @@ pub fn work_path(home: &Path, owner: &str, repo: &str) -> PathBuf {
 }
 
 /// `<type>/<number>-<kebab>` with no tool prefix. ASCII-less titles become `<type>/<number>`.
-pub fn issue_branch(number: u64, title: &str, body: &str) -> String {
-    let kind = branch_type(title, body);
+/// The type comes from the title and labels. The issue body is not consulted:
+/// a mention of "docs" in the body must not turn a bug fix into `docs/...`.
+pub fn issue_branch(number: u64, title: &str, labels: &[&str]) -> String {
+    let kind = branch_type(title, labels);
     let slug = kebab_slug(title);
     if slug.is_empty() {
         format!("{kind}/{number}")
@@ -40,8 +42,12 @@ pub fn issue_branch(number: u64, title: &str, body: &str) -> String {
     }
 }
 
-fn branch_type(title: &str, body: &str) -> &'static str {
-    let text = format!("{title}\n{body}");
+fn branch_type(title: &str, labels: &[&str]) -> &'static str {
+    let mut text = title.to_string();
+    for label in labels {
+        text.push('\n');
+        text.push_str(label);
+    }
     if has_kw(&text, &["test", "tests", "testing"], &["テスト"]) {
         "test"
     } else if has_kw(&text, &["docs", "doc", "readme"], &["ドキュメント", "文書"]) {
@@ -277,7 +283,56 @@ fn reclone(path: &Path, slug: &str, reason: &str) -> Result<PrepareOutcome, Setu
     }
     let mut outcome = clone_into(path, slug, "recloned")?;
     outcome.note = format!("recloned ({reason})");
+    let retired = retire_broken_worktrees(path);
+    if !retired.is_empty() {
+        outcome.note.push_str("; ");
+        outcome.note.push_str(&retired.join("; "));
+    }
     Ok(outcome)
+}
+
+/// After a reclone, per-PR worktrees still point at the old git dir and
+/// `git status` exits 128. Try `git worktree repair`, then move anything
+/// still broken aside so the next checkout can create it again.
+pub fn retire_broken_worktrees(main: &Path) -> Vec<String> {
+    let Some(name) = main.file_name() else {
+        return Vec::new();
+    };
+    let wt_root = main.with_file_name(format!("{}.wt", name.to_string_lossy()));
+    if !wt_root.is_dir() {
+        return Vec::new();
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut notes = Vec::new();
+    let entries = match fs::read_dir(&wt_root) {
+        Ok(entries) => entries,
+        Err(_) => return notes,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let path_s = path.display().to_string();
+        let _ = git(main, &["worktree".into(), "repair".into(), path_s.clone()]);
+        let _ = git(&path, &["worktree".into(), "repair".into()]);
+        if git_ok(&path) {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let aside = wt_root.join(format!("{file_name}.broken-{stamp}"));
+        if fs::rename(&path, &aside).is_ok() {
+            notes.push(format!(
+                "moved broken worktree {} aside so it can be recreated",
+                path.display()
+            ));
+        }
+    }
+    let _ = git(main, &["worktree".into(), "prune".into()]);
+    notes
 }
 
 fn clone_into(path: &Path, slug: &str, verb: &str) -> Result<PrepareOutcome, SetupFailure> {
@@ -1352,16 +1407,29 @@ mod tests {
             PathBuf::from("/home/u/.ghost/work/Cympfh__Ghost")
         );
         assert_eq!(
-            issue_branch(12, "Crash on empty config", ""),
+            issue_branch(12, "Crash on empty config", &[]),
             "fix/12-crash-on-empty-config"
         );
-        assert_eq!(issue_branch(12, "クラッシュする", ""), "fix/12");
-        assert_eq!(issue_branch(3, "Add a picker", ""), "feat/3-add-a-picker");
+        assert_eq!(issue_branch(12, "クラッシュする", &[]), "fix/12");
+        assert_eq!(issue_branch(3, "Add a picker", &[]), "feat/3-add-a-picker");
         assert_eq!(
-            issue_branch(1, "Add fixture loader", ""),
+            issue_branch(1, "Add fixture loader", &[]),
             "feat/1-add-fixture-loader"
         );
-        assert!(issue_branch(9, &"word ".repeat(30), "").len() <= "feat/9-".len() + 40);
+        assert!(issue_branch(9, &"word ".repeat(30), &[]).len() <= "feat/9-".len() + 40);
+        // A docs mention in the body used to win. The title (and labels) decide.
+        assert_eq!(
+            issue_branch(2, "Fix crash on empty config", &[]),
+            "fix/2-fix-crash-on-empty-config"
+        );
+        assert_eq!(
+            issue_branch(5, "Update the overview", &["docs"]),
+            "docs/5-update-the-overview"
+        );
+        assert_eq!(
+            issue_branch(6, "Something odd", &["bug"]),
+            "fix/6-something-odd"
+        );
         assert!(origin_matches(
             "https://github.com/Cympfh/Ghost.git",
             "cympfh",
@@ -1382,6 +1450,85 @@ mod tests {
             "cympfh",
             "ghost"
         ));
+    }
+
+    #[test]
+    fn broken_slot_worktree_is_moved_aside_so_it_can_be_recreated() {
+        let root = std::env::temp_dir().join(format!(
+            "ghost-repair-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let main = root.join("acme__app");
+        let wt_root = root.join("acme__app.wt");
+        let slot = wt_root.join("pr-2");
+        fs::create_dir_all(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "ghost")
+                .env("GIT_AUTHOR_EMAIL", "ghost@example.com")
+                .env("GIT_COMMITTER_NAME", "ghost")
+                .env("GIT_COMMITTER_EMAIL", "ghost@example.com")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&root, &["init", "-b", "main", "acme__app"]);
+        fs::write(main.join("f"), "a\n").unwrap();
+        git(&main, &["add", "f"]);
+        git(&main, &["commit", "-m", "init"]);
+        fs::create_dir_all(&wt_root).unwrap();
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "fix/2-crash",
+                slot.to_str().unwrap(),
+            ],
+        );
+        assert!(git_ok(&slot));
+        fs::write(slot.join(".git"), "gitdir: /no/such/gitdir\n").unwrap();
+        assert!(!git_ok(&slot), "broken gitdir should fail rev-parse");
+        let repaired = retire_broken_worktrees(&main);
+        assert!(
+            repaired.is_empty(),
+            "a registered worktree is repaired in place: {repaired:?}"
+        );
+        assert!(git_ok(&slot), "repair rewrites the gitdir");
+
+        let orphan = wt_root.join("pr-9");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join(".git"), "gitdir: /no/such/gitdir\n").unwrap();
+        fs::write(orphan.join("leftover"), "keep\n").unwrap();
+        assert!(!git_ok(&orphan));
+        let notes = retire_broken_worktrees(&main);
+        assert!(
+            notes.iter().any(|n| n.contains("pr-9")),
+            "unregistered orphan is moved aside: {notes:?}"
+        );
+        assert!(!orphan.exists(), "orphan path is free for a new worktree");
+        assert!(
+            wt_root.read_dir().unwrap().any(|e| {
+                e.unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pr-9.broken-")
+            }),
+            "the old checkout is kept aside"
+        );
+        assert!(git_ok(&slot), "repaired slot stays usable");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub struct IssueDetails {
     pub title: String,
     pub body: String,
     pub state: String,
+    pub labels: Vec<String>,
 }
 
 pub struct Gh {
@@ -175,7 +176,7 @@ impl Gh {
             "--repo".into(),
             self.slug.clone(),
             "--json".into(),
-            "number,title,body,state".into(),
+            "number,title,body,state,labels".into(),
         ])?;
         ensure_ok("gh issue view", &out)?;
         parse_issue(&out.stdout).map_err(|e| anyhow!(e))
@@ -813,6 +814,7 @@ pub fn parse_issue(json: &str) -> Result<IssueDetails, String> {
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string(),
+        labels: labels_of(&v),
     })
 }
 
@@ -962,6 +964,65 @@ mod tests {
             }),
             "reviews 2, inline 2, comments 0"
         );
+    }
+
+    #[test]
+    fn parses_copilot_review_and_inline_comment() {
+        // Reviews use copilot-pull-request-reviewer[bot]; inline comments use Copilot.
+        // author_association is NONE or CONTRIBUTOR, user.type is Bot.
+        let reviews = r#"[
+            {
+              "id": 1001,
+              "user": {"login": "copilot-pull-request-reviewer[bot]", "id": 175728472, "type": "Bot"},
+              "body": "Consider renaming this helper.",
+              "state": "COMMENTED",
+              "author_association": "NONE",
+              "submitted_at": "2024-06-02T00:00:00Z"
+            }
+        ]"#;
+        let inline = r#"[
+            {
+              "id": 2002,
+              "user": {"login": "Copilot", "id": 175728472, "type": "Bot"},
+              "body": "this branch is wrong",
+              "author_association": "CONTRIBUTOR",
+              "path": "src/main.rs",
+              "line": 4,
+              "created_at": "2024-06-02T00:00:01Z"
+            }
+        ]"#;
+        let reviews = parse_api_values(reviews).unwrap();
+        let inline = parse_api_values(inline).unwrap();
+        let notes: Vec<_> = reviews
+            .iter()
+            .filter_map(note_from_review)
+            .chain(inline.iter().filter_map(note_from_inline))
+            .collect();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].author, "copilot-pull-request-reviewer[bot]");
+        assert_eq!(notes[0].association, "NONE");
+        assert_eq!(notes[0].id, "review:1001");
+        assert_eq!(notes[1].author, "Copilot");
+        assert_eq!(notes[1].association, "CONTRIBUTOR");
+        assert!(notes[1].body.contains("src/main.rs:4"));
+        let kept = crate::watch::actionable_notes(
+            &notes,
+            crate::watch::CommentTrust::default(),
+            "cympfh",
+            "author",
+            "cympfh",
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(kept.len(), 2);
+        let dropped = crate::watch::actionable_notes(
+            &notes,
+            crate::watch::CommentTrust::Collaborators,
+            "cympfh",
+            "author",
+            "cympfh",
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(dropped.is_empty());
     }
 
     #[test]

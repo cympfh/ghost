@@ -29,14 +29,14 @@ ghost github.com/OWNER/REPO/issue/N --yes    # same, accepting the continue prom
 | Short | Long | Default | |
 | --- | --- | --- | --- |
 | `-r` | `--review` | | Review when the head SHA changes. Conflicts with `-c`. |
-| `-c` | `--code` | | Fix red CI and new trusted review comments. Conflicts with `-r`. |
+| `-c` | `--code` | | Fix red CI and new review comments. Conflicts with `-r`. |
 | `-i` | `--interval` | `20s` | Poll interval (`30s`, `2m`, `1h30m`, or a bare number of seconds). |
 | `-a` | `--agent` | first on `PATH` | `codex`, `claude`, or `grok`. |
 | `-k` | `--ssh-key` | ssh config, or `GHOST_SSH_KEY` | `ssh -i PATH -o IdentitiesOnly=yes`. No key means no forced identity (`~/.ssh/id_rsa` is not assumed). |
 | `-l` | `--lang` | `ja` (`GHOST_LANG` if the flag is omitted) | `ja` or `en`. |
 | `-y` | `--yes` | | Accept the continue prompt. |
 | `-n` | `--max-iterations` | `20` | Cap agent turns for this process. |
-| `-t` | `--trust-comments` | `collaborators` | Who, besides the PR author and repo owner, may wake code mode: `collaborators`, `contributors`, or `all`. |
+| `-t` | `--trust-comments` | `all` | Who, besides the PR author and repo owner, may wake code mode. Default: every author (humans, Copilot, other bots, outsiders). `collaborators` or `contributors` still restricts. |
 | `-d` | `--demo` | | `picker`, `review`, `code`, `confirm`, or `preflight`. |
 | `-h` | `--help` | | Help. |
 | `-V` | `--version` | | Version. |
@@ -45,11 +45,11 @@ A PR URL with no flag asks review or code. `--review` / `--code` on a repo URL i
 
 ![Picker](docs/screenshots/picker.png)
 
-Ghost polls with `gh` only. Each poll logs `reviews N, inline N, comments N` from `gh api` (review submissions, inline review comments, and issue comments). It starts the agent on the first real task and later updates are follow-ups in that same session. A poll with no new SHA (review) or no new trusted feedback and no new CI failure signature (code) makes no agent call. A failed agent turn does not mark that SHA or those comments done; a failed resume is retried once as a fresh session with the same context. The same CI failure on the same SHA is not sent again until the SHA or the failing-check set changes.
+Ghost polls with `gh` only. Each poll logs `reviews N, inline N, comments N` from `gh api` (review submissions, inline review comments, and issue comments). Comments dropped by `-t` are logged as `filtered N (untrusted author)`. It starts the agent on the first real task and later updates are follow-ups in that same session. A poll with no new SHA (review) or no new feedback and no new CI failure signature (code) makes no agent call. A failed agent turn does not mark that SHA or those comments done; a failed resume is retried once as a fresh session with the same context. Repeated agent failures wait longer each time and ghost stops after five in a row. The same CI failure on the same SHA is not sent again until the SHA or the failing-check set changes.
 
 After `issue/N` opens (or finds) a PR, ghost asks `Continue as --code on PR #M? [Y/n]` (Japanese by default) and keeps the session that already has the issue context. Comments posted after the PR was opened are not marked seen at that handoff. The agent's own replies are ignored later; a review from the same GitHub user is not. The PR body is given a `Closes #N` line when ghost is editing it and the line is missing. Issue branches look like `fix/12-crash-on-empty-config`, never `ghost/issue-N`.
 
-The agent stops when the PR is merge-ready, merged, or closed. Ghost never merges, and the agent's `PATH` starts with a `gh` wrapper that refuses `gh pr merge`, `gh repo delete`, and similar destructive commands.
+The agent stops when the PR is merge-ready, merged, or closed. Ghost never merges. The agent's `PATH` starts with a `gh` wrapper that catches accidental `gh pr merge`, `gh repo delete`, `gh api` DELETE, and merge endpoints such as `mergePullRequest`. That wrapper is not a security boundary: `git push` to the default branch, a `gh` alias, an absolute `/usr/bin/gh`, and other API shapes still get through. For real enforcement, use a token that does not have permission to merge.
 
 ![Same session, code mode](docs/screenshots/code.png)
 

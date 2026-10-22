@@ -72,8 +72,10 @@ struct Cli {
     #[arg(long, short = 'k')]
     ssh_key: Option<String>,
 
-    /// Which comment authors may wake --code, besides the PR author and repo owner.
-    #[arg(long, short = 't', value_enum, default_value_t = CommentTrust::Collaborators)]
+    /// Who may wake --code, besides the PR author and repo owner.
+    /// Default: all authors (humans, Copilot, other bots, outsiders).
+    /// `collaborators` or `contributors` still restricts.
+    #[arg(long, short = 't', value_enum, default_value_t = CommentTrust::All)]
     trust_comments: CommentTrust,
 }
 
@@ -324,6 +326,8 @@ mod tests {
         assert!(cli.yes);
         assert_eq!(cli.max_iterations, 4);
         assert_eq!(cli.trust_comments, CommentTrust::All);
+        let default_trust = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "-c"]).unwrap();
+        assert_eq!(default_trust.trust_comments, CommentTrust::All);
 
         let review = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "-r"]).unwrap();
         assert!(review.review);
