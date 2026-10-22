@@ -65,6 +65,29 @@ fn role_code(lang: Lang) -> &'static str {
     }
 }
 
+fn review_verdict_rules(lang: Lang, slug: &str, number: u64) -> String {
+    match lang {
+        Lang::Ja => format!(
+            "最後の行は、次のいずれか一つだけにする（同じ行に他の文字を付けない）:\n\
+             GHOST_VERDICT: approve\n\
+             GHOST_VERDICT: request_changes\n\
+             GHOST_VERDICT: comment\n\
+             あなたがこのプルリクエストの作者で、GitHub が approve を拒否する場合は `--approve` を使わない。\
+             代わりに `gh pr review {number} --repo {slug} --comment --body \"LGTM / 承認相当\"` を投稿し、\
+             最後の行は `GHOST_VERDICT: approve` のままにする。\n"
+        ),
+        Lang::En => format!(
+            "The last line must be exactly one of these, with nothing else on that line:\n\
+             GHOST_VERDICT: approve\n\
+             GHOST_VERDICT: request_changes\n\
+             GHOST_VERDICT: comment\n\
+             If you are the pull request author and GitHub rejects approve, do not use `--approve`. \
+             Post `gh pr review {number} --repo {slug} --comment --body \"LGTM / 承認相当\"` instead, \
+             and still end with `GHOST_VERDICT: approve`.\n"
+        ),
+    }
+}
+
 pub fn review_initial(
     slug: &str,
     number: u64,
@@ -93,8 +116,9 @@ pub fn review_initial(
         ),
     };
     format!(
-        "{head}\n{body}{notes}\nDiff:\n```diff\n{diff}\n```\n",
+        "{head}\n{body}{verdict}{notes}\nDiff:\n```diff\n{diff}\n```\n",
         head = header(lang, role_review(lang), slug, workdir),
+        verdict = review_verdict_rules(lang, slug, number),
         notes = notes_block(user_notes, lang),
         diff = fence_safe(diff),
     )
@@ -125,8 +149,9 @@ pub fn review_followup(
         ),
     };
     format!(
-        "{head}\n{body}{notes}\nDiff since the last reviewed SHA:\n```diff\n{diff}\n```\n",
+        "{head}\n{body}{verdict}{notes}\nDiff since the last reviewed SHA:\n```diff\n{diff}\n```\n",
         head = header(lang, role_review(lang), slug, workdir),
+        verdict = review_verdict_rules(lang, slug, number),
         notes = notes_block(user_notes, lang),
         diff = fence_safe(diff),
     )
@@ -194,6 +219,54 @@ pub fn code_followup(
     )
 }
 
+/// First `--code` turn. Reads the PR as it is now, not "what changed since last time".
+pub fn code_survey(
+    slug: &str,
+    number: u64,
+    branch: &str,
+    head_sha: &str,
+    workdir: &Path,
+    ci_failed: bool,
+    failing: &[String],
+    notes: &[Note],
+    user_notes: &[String],
+    lang: Lang,
+) -> String {
+    let intro = match lang {
+        Lang::Ja => format!(
+            "起動時の状況確認です。保存された「前回から新しいことがあるか」には頼らない。\n\
+             プルリクエスト #{number}（{slug}）、ブランチ `{branch}`、head {head_sha} を、今の状態として読む。\n\
+             `gh` で説明、diff、CI、すべてのレビュー、インラインコメント、issue コメント、未回答のスレッドを読む。要約する。\n\
+             未対応があればこのターンで扱う。落ちている CI は直す。未対応のコメントは直すか、スレッドに返信する。\n\
+             作業ディレクトリ {wd} にブランチがチェックアウトされている。直すなら commit し、同じブランチへ `git push` する。\n\
+             最後の行は次のどちらか一つだけにする:\n\
+             GHOST_STATUS: merge_ready\n\
+             GHOST_STATUS: needs_work\n\
+             ghost が `gh` でマージ可否を自分で再確認する。この行だけではマージしない。\n",
+            wd = workdir.display(),
+        ),
+        Lang::En => format!(
+            "This is the launch situation check. Do not rely on saved state about what is new since last time.\n\
+             Read pull request #{number} ({slug}), branch `{branch}`, head {head_sha}, as it is now.\n\
+             Use `gh` to read the description, diff, CI, every review, inline comment, issue comment, and unanswered thread. Summarize.\n\
+             Handle anything outstanding in this turn. Fix failing CI. Fix or reply to unaddressed comments.\n\
+             The branch is checked out in {wd}. When you change code, commit and `git push` the same branch.\n\
+             The last line must be exactly one of:\n\
+             GHOST_STATUS: merge_ready\n\
+             GHOST_STATUS: needs_work\n\
+             ghost re-checks merge-readiness itself with `gh`. That line alone does not merge.\n",
+            wd = workdir.display(),
+        ),
+    };
+    let fix = code_comment_policy(lang, slug, number);
+    format!(
+        "{head}\n{intro}{situation}\n{fix}{user}",
+        head = header(lang, role_code(lang), slug, workdir),
+        situation = code_situation(ci_failed, failing, notes, slug, number, lang),
+        user = notes_block(user_notes, lang),
+    )
+}
+
 pub fn issue_initial(
     slug: &str,
     number: u64,
@@ -236,6 +309,47 @@ pub fn issue_initial(
              The pull request body must include a GitHub closing keyword line `Closes #{number}` so merging auto-closes the issue.\n\
              Do not open a duplicate if that pull request already exists. Do not merge.\n\
              Read the issue with `gh issue view {number} --repo {slug}` if you need more detail.\n"
+        ),
+    };
+    format!(
+        "{head}\n{task}{user}",
+        head = header(lang, role_code(lang), slug, workdir),
+        user = notes_block(user_notes, lang),
+    )
+}
+
+/// Launch turn when the issue already has a pull request. Does not skip because of saved state.
+pub fn issue_situation(
+    slug: &str,
+    number: u64,
+    title: &str,
+    body: &str,
+    branch: &str,
+    base: &str,
+    workdir: &Path,
+    pr: u64,
+    user_notes: &[String],
+    lang: Lang,
+) -> String {
+    let body = truncate(body, 12_000);
+    let task = match lang {
+        Lang::Ja => format!(
+            "起動時の状況確認です。保存された「前回から新しいことがあるか」には頼らない。\n\
+             {slug} の issue #{number} には既にプルリクエスト #{pr} がある。重複して開かない。\n\
+             Title: {title}\n\n\
+             Issue body:\n{body}\n\n\
+             ブランチ `{branch}`（base `{base}`）の今の状態、PR の説明、diff、CI、レビューコメントを `gh` で読む。\
+             要約し、残作業があれば続ける。無ければその旨を報告して終わる。\n\
+             マージしない。`Closes #{number}` が PR 本文に無ければ足す。\n"
+        ),
+        Lang::En => format!(
+            "This is the launch situation check. Do not rely on saved state about what is new since last time.\n\
+             Issue #{number} in {slug} already has pull request #{pr}. Do not open a duplicate.\n\
+             Title: {title}\n\n\
+             Issue body:\n{body}\n\n\
+             Use `gh` to read branch `{branch}` (base `{base}`) as it is now, plus the pull request description, diff, CI, and review comments.\
+             Summarize. Continue any remaining work, or report that nothing remains and stop.\n\
+             Do not merge. Add `Closes #{number}` to the pull request body if it is missing.\n"
         ),
     };
     format!(
@@ -443,6 +557,23 @@ mod tests {
         assert!(review.contains("will not prompt"));
         assert!(review.contains("api.github.com"));
         assert!(review.contains("--approve"));
+        assert!(review.contains("GHOST_VERDICT: approve"));
+        assert!(review.contains("LGTM / 承認相当"));
+        let survey = code_survey(
+            "acme/app",
+            3,
+            "feature",
+            "abc",
+            dir,
+            false,
+            &[],
+            &[],
+            &[],
+            Lang::En,
+        );
+        assert!(survey.contains("GHOST_STATUS: merge_ready"));
+        assert!(survey.contains("GHOST_STATUS: needs_work"));
+        assert!(survey.contains("Never merge"));
 
         let follow = review_followup("acme/app", 3, "aaa", "bbb", dir, "d", &[], Lang::En);
         assert!(follow.contains("same review session"));
@@ -512,6 +643,8 @@ mod tests {
         let review = review_initial("acme/app", 3, "abc", dir, "diff", &[], Lang::Ja);
         assert!(review.contains("日本語"));
         assert!(review.contains("マージしない"));
+        assert!(review.contains("GHOST_VERDICT: approve"));
+        assert!(review.contains("LGTM / 承認相当"));
         let code = code_initial(
             "acme/app",
             2,

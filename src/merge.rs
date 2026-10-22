@@ -24,14 +24,39 @@ pub enum ChecksVerdict {
     Failed,
 }
 
+/// GitHub `mergeStateStatus`. Only `CLEAN` is merge-ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeState {
+    Clean,
+    Behind,
+    Blocked,
+    Unstable,
+    Dirty,
+    Draft,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeInput {
     pub life: PrLife,
     pub draft: bool,
     pub mergeable: Mergeability,
+    pub merge_state: MergeState,
     pub checks: ChecksVerdict,
     pub approvals: u32,
     pub changes_requested: bool,
+}
+
+pub fn parse_merge_state(value: &str) -> MergeState {
+    match value.to_ascii_uppercase().as_str() {
+        "CLEAN" => MergeState::Clean,
+        "BEHIND" => MergeState::Behind,
+        "BLOCKED" => MergeState::Blocked,
+        "UNSTABLE" => MergeState::Unstable,
+        "DIRTY" => MergeState::Dirty,
+        "DRAFT" => MergeState::Draft,
+        _ => MergeState::Unknown,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +64,7 @@ pub enum StopReason {
     MergeReady,
     Merged,
     Closed,
+    ReviewApproved,
 }
 
 impl StopReason {
@@ -60,14 +86,27 @@ impl StopReason {
                 &format!("PR #{number} はクローズされています。終了します。"),
                 &format!("PR #{number} is closed. Exiting."),
             ),
+            Self::ReviewApproved => lang.say(
+                "承認相当のレビューを投稿したので終了します",
+                "Posted an approve-equivalent review. Exiting.",
+            ),
         }
     }
 
     pub fn exit_code(self) -> i32 {
         match self {
-            Self::MergeReady | Self::Merged => 0,
+            Self::MergeReady | Self::Merged | Self::ReviewApproved => 0,
             Self::Closed => 2,
         }
+    }
+}
+
+/// Review mode does not stop just because the PR is merge-ready.
+pub fn review_life_stop(input: &MergeInput) -> Option<StopReason> {
+    match input.life {
+        PrLife::Merged => Some(StopReason::Merged),
+        PrLife::Closed => Some(StopReason::Closed),
+        PrLife::Open => None,
     }
 }
 
@@ -87,15 +126,60 @@ pub fn parse_mergeable(value: &str) -> Mergeability {
     }
 }
 
-/// Merge-ready: open, not draft, mergeable, every check green (or no checks),
-/// at least one approval, and no outstanding changes-requested review.
+/// Code-mode merge-ready: open, not a draft, `mergeStateStatus` CLEAN,
+/// checks registered and green, and no outstanding changes-requested review.
+/// Empty or pending checks are not green.
 pub fn is_merge_ready(input: &MergeInput) -> bool {
     input.life == PrLife::Open
         && !input.draft
-        && input.mergeable == Mergeability::Mergeable
-        && matches!(input.checks, ChecksVerdict::AllGreen | ChecksVerdict::None)
-        && input.approvals >= 1
+        && input.merge_state == MergeState::Clean
+        && input.mergeable != Mergeability::Conflicting
+        && input.checks == ChecksVerdict::AllGreen
         && !input.changes_requested
+}
+
+/// What the merge prompt decided. Enter, Esc, and Ctrl-C are exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeAnswer {
+    Merge,
+    Exit,
+    Continue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeKey {
+    Yes,
+    No,
+    Continue,
+    Enter,
+    Esc,
+    CtrlC,
+}
+
+pub fn merge_key(key: MergeKey) -> MergeAnswer {
+    match key {
+        MergeKey::Yes => MergeAnswer::Merge,
+        MergeKey::Continue => MergeAnswer::Continue,
+        MergeKey::No | MergeKey::Enter | MergeKey::Esc | MergeKey::CtrlC => MergeAnswer::Exit,
+    }
+}
+
+/// `--merge-yes` merges without asking. `-y` is ignored.
+/// A non-TTY without `--merge-yes` exits without merging.
+/// `None` means the TUI must ask.
+pub fn auto_merge_answer(merge_yes: bool, _yes: bool, tty: bool) -> Option<MergeAnswer> {
+    if merge_yes {
+        Some(MergeAnswer::Merge)
+    } else if !tty {
+        Some(MergeAnswer::Exit)
+    } else {
+        None
+    }
+}
+
+/// Re-check immediately before `gh pr merge`. A moved head does not merge.
+pub fn commit_merge(ready: bool, expected_sha: &str, current_sha: &str) -> bool {
+    ready && !expected_sha.is_empty() && expected_sha == current_sha
 }
 
 pub fn stop_reason(input: &MergeInput) -> Option<StopReason> {
@@ -284,6 +368,7 @@ mod tests {
             life: PrLife::Open,
             draft: false,
             mergeable: Mergeability::Mergeable,
+            merge_state: MergeState::Clean,
             checks: ChecksVerdict::AllGreen,
             approvals: 1,
             changes_requested: false,
@@ -296,7 +381,11 @@ mod tests {
 
         let mut no_approval = open_ready();
         no_approval.approvals = 0;
-        assert_eq!(stop_reason(&no_approval), None);
+        assert_eq!(
+            stop_reason(&no_approval),
+            Some(StopReason::MergeReady),
+            "CLEAN with registered green checks does not also require an approval count"
+        );
 
         let mut changes = open_ready();
         changes.changes_requested = true;
@@ -308,7 +397,11 @@ mod tests {
 
         let mut unknown = open_ready();
         unknown.mergeable = Mergeability::Unknown;
-        assert_eq!(stop_reason(&unknown), None);
+        assert_eq!(
+            stop_reason(&unknown),
+            Some(StopReason::MergeReady),
+            "CLEAN and not conflicting is enough when mergeable is unknown"
+        );
 
         let mut pending = open_ready();
         pending.checks = ChecksVerdict::Pending;
@@ -324,7 +417,40 @@ mod tests {
 
         let mut no_checks = open_ready();
         no_checks.checks = ChecksVerdict::None;
-        assert!(is_merge_ready(&no_checks));
+        assert!(!is_merge_ready(&no_checks), "checks must be registered");
+
+        let mut behind = open_ready();
+        behind.merge_state = MergeState::Behind;
+        assert!(!is_merge_ready(&behind));
+        let mut blocked = open_ready();
+        blocked.merge_state = MergeState::Blocked;
+        assert!(!is_merge_ready(&blocked));
+        let mut unstable = open_ready();
+        unstable.merge_state = MergeState::Unstable;
+        assert!(!is_merge_ready(&unstable));
+    }
+
+    #[test]
+    fn merge_prompt_has_three_branches_and_ignores_yes() {
+        assert_eq!(merge_key(MergeKey::Yes), MergeAnswer::Merge);
+        assert_eq!(merge_key(MergeKey::No), MergeAnswer::Exit);
+        assert_eq!(merge_key(MergeKey::Continue), MergeAnswer::Continue);
+        assert_eq!(merge_key(MergeKey::Enter), MergeAnswer::Exit);
+        assert_eq!(merge_key(MergeKey::Esc), MergeAnswer::Exit);
+        assert_eq!(merge_key(MergeKey::CtrlC), MergeAnswer::Exit);
+
+        assert_eq!(auto_merge_answer(false, true, true), None);
+        assert_eq!(
+            auto_merge_answer(true, false, false),
+            Some(MergeAnswer::Merge)
+        );
+        assert_eq!(
+            auto_merge_answer(false, true, false),
+            Some(MergeAnswer::Exit)
+        );
+        assert!(commit_merge(true, "abc", "abc"));
+        assert!(!commit_merge(true, "abc", "zzz"));
+        assert!(!commit_merge(false, "abc", "abc"));
     }
 
     #[test]

@@ -34,7 +34,9 @@ ghost github.com/OWNER/REPO/issue/N --yes    # same, accepting the continue prom
 | `-a` | `--agent` | first on `PATH` | `codex`, `claude`, or `grok`. |
 | `-k` | `--ssh-key` | ssh config, or `GHOST_SSH_KEY` | `ssh -i PATH -o IdentitiesOnly=yes`. No key means no forced identity (`~/.ssh/id_rsa` is not assumed). |
 | `-l` | `--lang` | `ja` (`GHOST_LANG` if the flag is omitted) | `ja` or `en`. |
-| `-y` | `--yes` | | Accept the continue prompt. |
+| `-y` | `--yes` | | Accept the issue→code prompt and the review exit prompt. Does not merge. |
+| | `--merge-yes` | | Merge when `--code` or issue mode is merge-ready, after a re-check. No short flag. |
+| | `--merge-method` | repo default | `merge`, `squash`, or `rebase`, passed to `gh pr merge`. |
 | `-n` | `--max-iterations` | `20` | Cap agent turns for this process. |
 | `-t` | `--trust-comments` | `all` | Who, besides the PR author and repo owner, may wake code mode. Default: every author (humans, Copilot, other bots, outsiders). `collaborators` or `contributors` still restricts. |
 | `-d` | `--demo` | | `picker`, `review`, `code`, `confirm`, or `preflight`. |
@@ -45,18 +47,22 @@ A PR URL with no flag asks review or code. `--review` / `--code` on a repo URL i
 
 ![Picker](docs/screenshots/picker.png)
 
-Ghost polls with `gh` only. Each poll logs `reviews N, inline N, comments N` from `gh api` (review submissions, inline review comments, and issue comments). Each code poll also logs `filtered 0`, or `filtered N (untrusted author)` when `-t` drops authors. Copilot review bodies (`copilot-pull-request-reviewer[bot]`) and inline comments (`Copilot`, or the same bot login) are kept under the default `all`. It starts the agent on the first real task and later updates are follow-ups in that same session. A poll with no new SHA (review) or no new feedback and no new CI failure signature (code) makes no agent call. A failed agent turn does not mark that SHA or those comments done; a failed resume is retried once as a fresh session with the same context. Repeated agent failures wait longer each time and ghost stops after five in a row. The same CI failure on the same SHA is not sent again until the SHA or the failing-check set changes.
+Ghost polls with `gh` only. Each poll logs `reviews N, inline N, comments N` from `gh api` (review submissions, inline review comments, and issue comments). Each code poll also logs `filtered 0`, or `filtered N (untrusted author)` when `-t` drops authors. Copilot review bodies (`copilot-pull-request-reviewer[bot]`) and inline comments (`Copilot`, or the same bot login) are kept under the default `all`. On launch, `--review`, `--code`, and issue mode each start the agent once for a situation check, even when saved state says nothing is new. Later polls skip the agent when nothing changed: the same head SHA in review, or no new feedback and no new CI failure signature in code. A failed agent turn does not mark that SHA or those comments done; a failed resume is retried once as a fresh session with the same context. Repeated agent failures wait longer each time and ghost stops after five in a row. The same CI failure on the same SHA is not sent again until the SHA or the failing-check set changes.
+
+Typing `i` always reaches the agent. A running turn queues the line and sends it when the turn finishes. If no session exists, or the previous one died, ghost starts or resumes one and sends the line. The log shows `→ エージェントに送信`, or a queued status that includes that phrase. The line is not dropped.
 
 After `issue/N` opens (or finds) a PR, ghost asks `Continue as --code on PR #M? [Y/n]` (Japanese by default) and keeps the session that already has the issue context. Comments posted after the PR was opened are not marked seen at that handoff. The agent's own replies are ignored later; a review from the same GitHub user is not. The PR body is given a `Closes #N` line when ghost is editing it and the line is missing. Issue branches look like `fix/12-crash-on-empty-config`, never `ghost/issue-N`.
 
-The agent stops when the PR is merge-ready, merged, or closed. Ghost never merges. The agent's `PATH` starts with a `gh` wrapper that catches accidental `gh pr merge`, `gh repo delete`, `gh api` DELETE, and merge endpoints such as `mergePullRequest`. That wrapper is not a security boundary: `git push` to the default branch, a `gh` alias, an absolute `/usr/bin/gh`, and other API shapes still get through. For real enforcement, use a token that does not have permission to merge.
+Review never merges. When the review agent ends a turn with `GHOST_VERDICT: approve` (or, with no verdict line, a self-review comment that says `LGTM / 承認相当`), ghost asks `PR #N は問題なしと判断しました。終了しますか？ [y/c]`. `y`, Enter, Esc, and Ctrl-C exit. `c` keeps watching: a new commit is reviewed again, and the next approve asks again. A non-TTY, or `-y`, answers `y`. `request_changes` and `comment` keep polling. If GitHub rejects approving your own pull request, the agent posts `gh pr review --comment` with `LGTM / 承認相当` and still ends with `GHOST_VERDICT: approve`.
+
+Code mode, when ghost's own `gh` re-check says the PR is merge-ready, asks `PR #N を merge しますか？ [y/n/c]`. `y` re-checks that the head SHA is unchanged and still merge-ready, then ghost itself runs `gh pr merge` (the agent's `gh` wrapper is not on that path). `n`, Enter, Esc, and Ctrl-C exit without merging. `c` keeps the session and asks again the next time the PR is merge-ready, after the poll interval. `--merge-yes` answers `y` and the log says it merged because of `--merge-yes`. `-y` does not merge. A non-TTY does not merge unless `--merge-yes`. `--merge-yes` is an error with `--review`, the picker, or a PR URL that does not pass `--code`. The agent's `PATH` starts with a `gh` wrapper that catches accidental `gh pr merge`, `gh repo delete`, `gh api` DELETE, and merge endpoints such as `mergePullRequest`. That wrapper is not a security boundary: `git push` to the default branch, a `gh` alias, an absolute `/usr/bin/gh`, and other API shapes still get through. For real enforcement, use a token that does not have permission to merge.
 
 ![Same session, code mode](docs/screenshots/code.png)
 
 Continuation flags:
 
 - Claude: `claude --print --dangerously-skip-permissions --input-format stream-json --output-format stream-json --verbose --session-id <uuid>` with further prompts as JSON on stdin. If that process exits: the same flags with `--resume <uuid>` (not `--session-id`).
-- Codex: `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <dir> -`, then `codex exec resume <thread_id>` with the same flags.
+- Codex: `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <dir> -`, then `codex --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check resume <thread_id>` (no `-C` and no `-s` on resume).
 - Grok: `grok --prompt-file <file> --session-id <uuid> --output-format streaming-json --yolo --cwd <dir>`, then `--resume <uuid>` without `--session-id`.
 
 Prompts tell the agent to use `gh` for every GitHub action, to reply in the selected language, and not to merge.
@@ -77,6 +83,6 @@ An `Enter passphrase for key` prompt is answered before the TUI starts. Later `g
 
 Last reviewed SHA, seen comment ids, handled CI signature, and the session id are stored under `$GHOST_STATE_DIR`, or `$XDG_STATE_HOME/ghost`, or `~/.local/state/ghost`. A panic or SIGTERM restores the terminal and signals the agent process group.
 
-Merge-ready means open (not a draft), checks green or absent, at least one approval, no outstanding changes requested, and mergeable. A later `COMMENTED` review does not clear an earlier approval from the same reviewer.
+Merge-ready means open, not a draft, `mergeStateStatus` CLEAN, checks registered and all green (no checks is not green), not conflicting, and no outstanding changes requested. A later `COMMENTED` review does not clear an earlier approval from the same reviewer.
 
 `q` quits. `i` sends a message into the same session. `ctrl-c` interrupts the turn and leaves the session id in place. `ghost --demo picker|review|code|confirm` draws the screens above with scripted data.

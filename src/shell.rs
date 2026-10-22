@@ -223,6 +223,12 @@ pub fn is_rate_limited(text: &str) -> bool {
     lower.contains("rate limit") || lower.contains("http 429") || lower.contains("secondary rate")
 }
 
+/// Retry only a failed command whose stderr says the call was rate limited.
+/// Exit 0 never retries. Stdout, including a PR body that mentions a rate limit, never retries.
+pub fn should_retry_rate_limit(code: i32, stderr: &str) -> bool {
+    code != 0 && is_rate_limited(stderr)
+}
+
 /// Read stdout and stderr while copying them to the terminal. No timeout:
 /// the first fetch may wait on an ssh passphrase.
 fn capture_tee(cmd: &mut Command) -> Result<CmdOut> {
@@ -265,7 +271,7 @@ fn capture_child(cmd: &mut Command, stdin_data: Option<&[u8]>, what: &str) -> Re
     let mut last = None;
     for attempt in 0..4 {
         let out = capture_once(cmd, stdin_data, what, cmd_timeout())?;
-        if attempt < 3 && is_rate_limited(&format!("{}\n{}", out.stdout, out.stderr)) {
+        if attempt < 3 && should_retry_rate_limit(out.code, &out.stderr) {
             thread::sleep(delay);
             delay = delay.saturating_mul(2);
             last = Some(out);
@@ -474,6 +480,9 @@ mod tests {
         assert!(is_rate_limited("API rate limit exceeded"));
         assert!(is_rate_limited("HTTP 429"));
         assert!(!is_rate_limited("pull request not found"));
+        assert!(should_retry_rate_limit(1, "secondary rate limit"));
+        assert!(!should_retry_rate_limit(0, "API rate limit exceeded"));
+        assert!(!should_retry_rate_limit(1, ""));
     }
 
     #[test]

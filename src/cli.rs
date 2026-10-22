@@ -28,7 +28,10 @@ GitHub access is only through the `gh` CLI. One agent session is started for the
 run; later updates resume it (claude --resume, codex exec resume, grok --resume).
 The default poll interval is 20s (`-i`). `-l` / `--lang` defaults to ja.
 `-k` / `--ssh-key` selects an ssh identity (or set GHOST_SSH_KEY).
-`-h` prints help and `-V` prints the version. Nothing new on a poll means no agent call."
+`-h` prints help and `-V` prints the version.
+Launch always starts the agent for a situation check, even when nothing is new.
+Later polls with nothing new do not call the agent. `i` always delivers text to the agent.
+`--merge-yes` (no short flag) merges in --code or issue mode after a re-check. `-y` does not merge."
 )]
 struct Cli {
     /// github.com/OWNER/REPO, .../pr/N, or .../issue/N
@@ -51,9 +54,19 @@ struct Cli {
     #[arg(long, short = 'a', value_enum)]
     agent: Option<AgentKind>,
 
-    /// Accept the issue-mode prompt to continue as --code.
+    /// Accept the issue-mode prompt to continue as --code, and the review exit prompt.
+    /// Does not merge.
     #[arg(long, short = 'y')]
     yes: bool,
+
+    /// Merge when --code or issue mode is merge-ready, after a fresh re-check.
+    /// No short flag. Does not apply to --review, the picker, or ask-without---code.
+    #[arg(long)]
+    merge_yes: bool,
+
+    /// `gh pr merge` method. Default is the repository setting.
+    #[arg(long, value_enum)]
+    merge_method: Option<MergeMethod>,
 
     /// Stop after this many agent turns so --review and --code cannot ping-pong forever.
     #[arg(long, short = 'n', default_value_t = 20)]
@@ -101,6 +114,10 @@ pub fn run() -> Result<i32> {
         lang,
         ssh_key,
         cli.trust_comments,
+        cli.merge_yes,
+        cli.merge_method
+            .map(MergeMethod::gh_flag)
+            .map(str::to_string),
     ) {
         Ok(Action::Demo { scene, header }) => demo::run(scene, header),
         Ok(Action::Run(spec)) => engine::run(spec),
@@ -131,6 +148,8 @@ fn resolve(
     lang: Lang,
     ssh_key: Option<String>,
     trust: CommentTrust,
+    merge_yes: bool,
+    merge_method: Option<String>,
 ) -> Result<Action, String> {
     if let Some(scene) = demo {
         if target.is_some() || review || code {
@@ -150,6 +169,11 @@ fn resolve(
     let interval = parse_interval(interval)?;
     let target = parse_target(target_raw)?;
     let mode = mode_for(&target, review, code)?;
+    if (merge_yes || merge_method.is_some()) && !matches!(mode, RunMode::Code | RunMode::Issue) {
+        return Err(
+            "--merge-yes and --merge-method are only valid with --code or an issue URL".into(),
+        );
+    }
     Ok(Action::Run(RunSpec {
         header,
         target,
@@ -157,11 +181,30 @@ fn resolve(
         interval,
         agent,
         yes,
+        merge_yes,
+        merge_method,
         max_turns: max_iterations,
         lang,
         ssh_key,
         trust,
     }))
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    fn gh_flag(self) -> &'static str {
+        match self {
+            Self::Merge => "--merge",
+            Self::Squash => "--squash",
+            Self::Rebase => "--rebase",
+        }
+    }
 }
 
 fn mode_for(target: &GhTarget, review: bool, code: bool) -> Result<RunMode, String> {
@@ -253,6 +296,16 @@ mod tests {
         let review = args.contains(&"--review");
         let code = args.contains(&"--code");
         let yes = args.contains(&"--yes") || args.contains(&"-y");
+        let merge_yes = args.contains(&"--merge-yes");
+        let merge_method = args
+            .windows(2)
+            .find(|pair| pair[0] == "--merge-method")
+            .map(|pair| match pair[1] {
+                "squash" => "--squash",
+                "rebase" => "--rebase",
+                _ => "--merge",
+            })
+            .map(str::to_string);
         let target = args
             .iter()
             .copied()
@@ -271,6 +324,8 @@ mod tests {
             Lang::Ja,
             None,
             CommentTrust::Collaborators,
+            merge_yes,
+            merge_method,
         )
     }
 
@@ -289,6 +344,8 @@ mod tests {
             "-k, --ssh-key",
             "-l, --lang",
             "-y, --yes",
+            "--merge-yes",
+            "--merge-method",
             "-n, --max-iterations",
             "-t, --trust-comments",
             "-d, --demo",
@@ -297,6 +354,11 @@ mod tests {
         ] {
             assert!(help.contains(needle), "help missing {needle}\n{help}");
         }
+        assert!(
+            !help.contains(", --merge-yes"),
+            "--merge-yes must not have a short flag\n{help}"
+        );
+        assert!(!help.contains(", --merge-method"));
 
         let cli = Cli::try_parse_from([
             "ghost",
@@ -355,6 +417,8 @@ mod tests {
             cli.lang,
             None,
             CommentTrust::Collaborators,
+            false,
+            None,
         )
         .unwrap();
         match action {
@@ -424,6 +488,8 @@ mod tests {
             Lang::Ja,
             None,
             CommentTrust::Collaborators,
+            false,
+            None,
         )
         .is_err());
         assert!(resolve(
@@ -439,8 +505,46 @@ mod tests {
             Lang::En,
             None,
             CommentTrust::Collaborators,
+            false,
+            None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn merge_yes_is_only_for_code_and_issue() {
+        assert!(go(&["github.com/a/b/pr/3", "--review", "--merge-yes"]).is_err());
+        assert!(go(&["github.com/a/b/pr/3", "--merge-yes"]).is_err());
+        assert!(go(&["github.com/a/b", "--merge-yes"]).is_err());
+        assert!(matches!(
+            go(&["github.com/a/b/pr/3", "--code", "--merge-yes"]).unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::Code,
+                merge_yes: true,
+                yes: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            go(&["github.com/a/b/issue/7", "--merge-yes", "--merge-method", "squash"]).unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::Issue,
+                merge_yes: true,
+                merge_method: Some(method),
+                ..
+            }) if method == "--squash"
+        ));
+        let cli = Cli::try_parse_from([
+            "ghost",
+            "github.com/a/b/pr/3",
+            "-c",
+            "--merge-yes",
+            "--merge-method",
+            "rebase",
+        ])
+        .unwrap();
+        assert!(cli.merge_yes);
+        assert!(matches!(cli.merge_method, Some(MergeMethod::Rebase)));
     }
 }
 

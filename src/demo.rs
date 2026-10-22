@@ -178,6 +178,7 @@ fn confirm_scene(tx: &Sender<UiEvent>) {
     let _ = tx.send(UiEvent::Confirm {
         number: 12,
         message: "Continue as --code on PR #12? [Y/n]".into(),
+        kind: tui::ConfirmKind::ContinueAsCode,
     });
 }
 
@@ -204,10 +205,13 @@ fn wait_picker(tx: &Sender<UiEvent>, rx: &Receiver<UiCmd>) {
             }
             Ok(UiCmd::Choose(Side::Code)) => code_scene(tx),
             Ok(UiCmd::Choose(Side::Review)) => review_scene(tx),
-            Ok(UiCmd::Confirm(true)) => {
+            Ok(UiCmd::Confirm(tui::ConfirmAnswer::Yes)) => {
                 code_scene(tx);
             }
-            Ok(UiCmd::Confirm(false)) => {
+            Ok(
+                UiCmd::Confirm(tui::ConfirmAnswer::No)
+                | UiCmd::Confirm(tui::ConfirmAnswer::Continue),
+            ) => {
                 let _ = tx.send(UiEvent::Exit {
                     code: 0,
                     message: "not continuing as --code".into(),
@@ -222,13 +226,16 @@ fn wait_picker(tx: &Sender<UiEvent>, rx: &Receiver<UiCmd>) {
 fn wait_confirm(tx: &Sender<UiEvent>, rx: &Receiver<UiCmd>) {
     loop {
         match rx.recv() {
-            Ok(UiCmd::Confirm(true)) => {
+            Ok(UiCmd::Confirm(tui::ConfirmAnswer::Yes)) => {
                 sys(tx, "continuing as --code on PR #12 in the same session");
                 code_scene(tx);
                 wait_quit(rx);
                 return;
             }
-            Ok(UiCmd::Confirm(false)) => {
+            Ok(
+                UiCmd::Confirm(tui::ConfirmAnswer::No)
+                | UiCmd::Confirm(tui::ConfirmAnswer::Continue),
+            ) => {
                 let _ = tx.send(UiEvent::Exit {
                     code: 0,
                     message: "PR #12 left as-is. Not continuing as --code.".into(),

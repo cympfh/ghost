@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use crate::merge::{
-    ci_badge, ci_word, judge_checks, judge_reviews, parse_life, parse_mergeable, review_badge,
-    MergeInput, ReviewRef,
+    ci_badge, ci_word, judge_checks, judge_reviews, parse_life, parse_merge_state, parse_mergeable,
+    review_badge, MergeInput, ReviewRef,
 };
 use crate::setup::{SetupFailure, SetupStep};
 use crate::shell::{self, CmdOut};
@@ -73,7 +73,10 @@ impl Gh {
         let feedback = self.load_feedback(number);
         snap.feedback = feedback.counts;
         snap.feedback_warnings = feedback.warnings;
-        if !feedback.failed_all {
+        if feedback.failed_all {
+            snap.notes.clear();
+            snap.comments_unavailable = true;
+        } else {
             snap.notes = feedback.notes;
         }
         Ok(snap)
@@ -114,6 +117,23 @@ impl Gh {
         ])?;
         let _ = std::fs::remove_file(&path);
         ensure_ok("gh pr edit", &out)
+    }
+
+    /// Real `gh pr merge`. Callers use this from ghost, not from the agent wrapper.
+    pub fn merge_pr(&self, number: u64, method: Option<&str>) -> Result<()> {
+        let mut args = vec![
+            "pr".into(),
+            "merge".into(),
+            number.to_string(),
+            "--repo".into(),
+            self.slug.clone(),
+        ];
+        if let Some(method) = method {
+            args.push(method.to_string());
+        }
+        let out = self.call(args)?;
+        ensure_ok("gh pr merge", &out)?;
+        Ok(())
     }
 
     pub fn pr_diff(&self, number: u64) -> Result<String> {
@@ -397,7 +417,7 @@ struct FeedbackLoad {
     failed_all: bool,
 }
 
-const PR_FIELDS: &str = "number,title,state,isDraft,headRefOid,headRefName,baseRefName,mergeable,reviewDecision,statusCheckRollup,reviews,comments,body,author,createdAt";
+const PR_FIELDS: &str = "number,title,state,isDraft,headRefOid,headRefName,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,reviews,comments,body,author,createdAt";
 const PR_CANDIDATE_FIELDS: &str = "number,state,headRefName,body,closingIssuesReferences,title";
 
 fn ensure_ok(what: &str, out: &CmdOut) -> Result<()> {
@@ -440,6 +460,11 @@ pub fn parse_pr_view(json: &str) -> Result<PrSnap, String> {
     let life = parse_life(v.get("state").and_then(|s| s.as_str()).unwrap_or("OPEN"));
     let draft = v.get("isDraft").and_then(|d| d.as_bool()).unwrap_or(false);
     let mergeable = parse_mergeable(v.get("mergeable").and_then(|s| s.as_str()).unwrap_or(""));
+    let merge_state = parse_merge_state(
+        v.get("mergeStateStatus")
+            .and_then(|s| s.as_str())
+            .unwrap_or(""),
+    );
     Ok(PrSnap {
         number,
         title: v
@@ -464,6 +489,7 @@ pub fn parse_pr_view(json: &str) -> Result<PrSnap, String> {
             life,
             draft,
             mergeable,
+            merge_state,
             checks,
             approvals,
             changes_requested,
@@ -486,6 +512,7 @@ pub fn parse_pr_view(json: &str) -> Result<PrSnap, String> {
             .to_string(),
         feedback: crate::watch::FeedbackCounts::default(),
         feedback_warnings: Vec::new(),
+        comments_unavailable: false,
     })
 }
 
@@ -623,16 +650,7 @@ fn note_from_issue_comment(v: &Value) -> Option<Note> {
     if body.is_empty() {
         return None;
     }
-    let id = match json_id(v) {
-        Some(id) => format!("comment:{id}"),
-        None => {
-            let author = user_login(v);
-            if author.is_empty() {
-                return None;
-            }
-            format!("comment:{}", note_id(v, "comment", &author, &body))
-        }
-    };
+    let id = format!("comment:{}", json_id(v)?);
     Some(finish_note(
         v,
         id,
@@ -671,12 +689,15 @@ fn text_field(v: &Value, keys: &[&str]) -> String {
 }
 
 fn json_id(v: &Value) -> Option<String> {
+    if let Some(n) = v.get("databaseId").and_then(|x| x.as_u64()) {
+        return Some(n.to_string());
+    }
     if let Some(n) = v.get("id").and_then(|x| x.as_u64()) {
         return Some(n.to_string());
     }
     v.get("id")
         .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
         .map(|s| s.to_string())
 }
 
@@ -695,20 +716,6 @@ fn association_of(v: &Value) -> String {
         .and_then(|s| s.as_str())
         .unwrap_or("")
         .to_string()
-}
-
-fn note_id(v: &Value, kind: &str, author: &str, body: &str) -> String {
-    let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("");
-    if !id.is_empty() {
-        return id.to_string();
-    }
-    let stamp = v
-        .get("submittedAt")
-        .or_else(|| v.get("createdAt"))
-        .and_then(|s| s.as_str())
-        .unwrap_or("");
-    let snippet: String = body.chars().take(40).collect();
-    format!("{kind}:{author}:{stamp}:{snippet}")
 }
 
 fn login(author: Option<&Value>) -> String {
@@ -905,11 +912,12 @@ mod tests {
                 {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE"}
             ],
             "reviews": [
-                {"id":"PRR_1","author":{"login":"ada"},"state":"CHANGES_REQUESTED","body":"rename this","submittedAt":"2024-01-02T00:00:00Z","viewerDidAuthor":false},
-                {"id":"PRR_2","author":{"login":"me"},"state":"COMMENTED","body":"on it","submittedAt":"2024-01-03T00:00:00Z","viewerDidAuthor":true}
+                {"id":"PRR_1","databaseId":10,"author":{"login":"ada"},"state":"CHANGES_REQUESTED","body":"rename this","submittedAt":"2024-01-02T00:00:00Z","viewerDidAuthor":false},
+                {"id":"PRR_2","databaseId":11,"author":{"login":"me"},"state":"COMMENTED","body":"on it","submittedAt":"2024-01-03T00:00:00Z","viewerDidAuthor":true}
             ],
             "comments": [
-                {"id":"IC_1","author":{"login":"bea"},"body":"also the tests","viewerDidAuthor":false}
+                {"id":"IC_1","databaseId":123,"author":{"login":"bea"},"body":"also the tests","viewerDidAuthor":false},
+                {"id":"IC_kwABC","author":{"login":"bea"},"body":"graphql only","viewerDidAuthor":false}
             ]
         }"#;
         let pr = parse_pr_view(json).unwrap();
@@ -919,9 +927,10 @@ mod tests {
         assert!(pr.merge.changes_requested);
         assert_eq!(pr.merge.mergeable, Mergeability::Mergeable);
         assert_eq!(pr.notes.len(), 3);
-        assert_eq!(pr.notes[0].id, "review:PRR_1");
+        assert_eq!(pr.notes[0].id, "review:10");
         assert!(pr.notes.iter().any(|n| n.viewer_authored));
-        assert!(pr.notes.iter().any(|n| n.id == "comment:IC_1"));
+        assert!(pr.notes.iter().any(|n| n.id == "comment:123"));
+        assert!(pr.notes.iter().all(|n| n.id != "comment:IC_kwABC"));
     }
 
     #[test]

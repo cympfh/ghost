@@ -82,6 +82,7 @@ pub enum View {
     Confirm {
         number: u64,
         message: String,
+        kind: ConfirmKind,
     },
     Fatal {
         message: String,
@@ -93,10 +94,20 @@ pub enum UiEvent {
     Log(LogLine),
     Status(Status),
     Picker(Vec<OpenItem>),
-    ChooseMode { number: u64, title: String },
-    Confirm { number: u64, message: String },
+    ChooseMode {
+        number: u64,
+        title: String,
+    },
+    Confirm {
+        number: u64,
+        message: String,
+        kind: ConfirmKind,
+    },
     Fatal(String),
-    Exit { code: i32, message: String },
+    Exit {
+        code: i32,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +121,24 @@ pub enum UiCmd {
         side: Option<Side>,
     },
     Choose(Side),
-    Confirm(bool),
+    Confirm(ConfirmAnswer),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmKind {
+    /// Issue handoff. Enter accepts yes.
+    ContinueAsCode,
+    /// Merge prompt. Enter, Esc, and Ctrl-C mean no.
+    Merge,
+    /// Approve verdict. Enter, Esc, and Ctrl-C mean exit. No merge.
+    ReviewExit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmAnswer {
+    Yes,
+    No,
+    Continue,
 }
 
 pub struct App {
@@ -244,8 +272,16 @@ fn apply(app: &mut App, event: UiEvent) {
             app.view = View::Choose { number, title };
             app.input_mode = false;
         }
-        UiEvent::Confirm { number, message } => {
-            app.view = View::Confirm { number, message };
+        UiEvent::Confirm {
+            number,
+            message,
+            kind,
+        } => {
+            app.view = View::Confirm {
+                number,
+                message,
+                kind,
+            };
             app.input_mode = false;
         }
         UiEvent::Fatal(message) => {
@@ -269,6 +305,13 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Option<UiCmd> {
         if app.input_mode {
             app.input_mode = false;
             return None;
+        }
+        if let View::Confirm { kind, .. } = app.view {
+            return Some(match kind {
+                ConfirmKind::Merge => UiCmd::Confirm(ConfirmAnswer::No),
+                ConfirmKind::ReviewExit => UiCmd::Confirm(ConfirmAnswer::Yes),
+                ConfirmKind::ContinueAsCode => UiCmd::Interrupt,
+            });
         }
         return Some(UiCmd::Interrupt);
     }
@@ -295,13 +338,27 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Option<UiCmd> {
             app.quit = true;
             Some(UiCmd::Quit)
         }
-        (ViewKind::Confirm, KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')) => {
+        (ViewKind::Confirm, KeyCode::Char('y') | KeyCode::Char('Y')) => {
             app.view = View::Log;
-            Some(UiCmd::Confirm(true))
+            Some(UiCmd::Confirm(ConfirmAnswer::Yes))
         }
+        (ViewKind::Confirm, KeyCode::Char('c') | KeyCode::Char('C')) => {
+            if matches!(
+                app.view,
+                View::Confirm {
+                    kind: ConfirmKind::Merge | ConfirmKind::ReviewExit,
+                    ..
+                }
+            ) {
+                app.view = View::Log;
+                Some(UiCmd::Confirm(ConfirmAnswer::Continue))
+            } else {
+                None
+            }
+        }
+        (ViewKind::Confirm, KeyCode::Enter) => confirm_enter(app),
         (ViewKind::Confirm, KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc) => {
-            app.view = View::Log;
-            Some(UiCmd::Confirm(false))
+            confirm_decline(app)
         }
         (ViewKind::Choose, KeyCode::Char('r')) => {
             app.view = View::Log;
@@ -715,10 +772,50 @@ fn window_str(text: &str, cursor: usize, width: usize) -> (String, usize) {
     (shown, cursor - start)
 }
 
+fn confirm_enter(app: &mut App) -> Option<UiCmd> {
+    let answer = match app.view {
+        View::Confirm {
+            kind: ConfirmKind::Merge,
+            ..
+        } => ConfirmAnswer::No,
+        View::Confirm {
+            kind: ConfirmKind::ReviewExit | ConfirmKind::ContinueAsCode,
+            ..
+        } => ConfirmAnswer::Yes,
+        _ => return None,
+    };
+    app.view = View::Log;
+    Some(UiCmd::Confirm(answer))
+}
+
+fn confirm_decline(app: &mut App) -> Option<UiCmd> {
+    let answer = match app.view {
+        View::Confirm {
+            kind: ConfirmKind::ReviewExit,
+            ..
+        } => ConfirmAnswer::Yes,
+        View::Confirm {
+            kind: ConfirmKind::Merge | ConfirmKind::ContinueAsCode,
+            ..
+        } => ConfirmAnswer::No,
+        _ => return None,
+    };
+    app.view = View::Log;
+    Some(UiCmd::Confirm(answer))
+}
+
 fn idle_hint(view: &View) -> String {
     match view {
         View::Picker { .. } => "r review · c code · enter select".into(),
         View::Choose { .. } => "r review · c code · esc back".into(),
+        View::Confirm {
+            kind: ConfirmKind::Merge,
+            ..
+        } => "y merge · n exit · c continue · enter = n".into(),
+        View::Confirm {
+            kind: ConfirmKind::ReviewExit,
+            ..
+        } => "y exit · c continue · enter = y".into(),
         View::Confirm { .. } => "Y yes · n no · enter accepts yes".into(),
         View::Fatal { .. } => "q quit".into(),
         View::Log => "i message the agent".into(),
@@ -860,18 +957,65 @@ mod tests {
         app.view = View::Confirm {
             number: 12,
             message: "Continue as --code on PR #12? [Y/n]".into(),
+            kind: ConfirmKind::ContinueAsCode,
         };
         assert_eq!(
             on_key(&mut app, key(KeyCode::Enter)),
-            Some(UiCmd::Confirm(true))
+            Some(UiCmd::Confirm(ConfirmAnswer::Yes))
         );
         app.view = View::Confirm {
             number: 12,
             message: "Continue as --code on PR #12? [Y/n]".into(),
+            kind: ConfirmKind::ContinueAsCode,
         };
         assert_eq!(
             on_key(&mut app, key(KeyCode::Char('n'))),
-            Some(UiCmd::Confirm(false))
+            Some(UiCmd::Confirm(ConfirmAnswer::No))
+        );
+        app.view = View::Confirm {
+            number: 3,
+            message: "PR #3 を merge しますか？ [y/n/c]".into(),
+            kind: ConfirmKind::Merge,
+        };
+        assert_eq!(
+            on_key(&mut app, key(KeyCode::Char('y'))),
+            Some(UiCmd::Confirm(ConfirmAnswer::Yes))
+        );
+        app.view = View::Confirm {
+            number: 3,
+            message: "PR #3 を merge しますか？ [y/n/c]".into(),
+            kind: ConfirmKind::Merge,
+        };
+        assert_eq!(
+            on_key(&mut app, key(KeyCode::Enter)),
+            Some(UiCmd::Confirm(ConfirmAnswer::No))
+        );
+        app.view = View::Confirm {
+            number: 3,
+            message: "PR #3 を merge しますか？ [y/n/c]".into(),
+            kind: ConfirmKind::Merge,
+        };
+        assert_eq!(
+            on_key(&mut app, key(KeyCode::Char('c'))),
+            Some(UiCmd::Confirm(ConfirmAnswer::Continue))
+        );
+        app.view = View::Confirm {
+            number: 3,
+            message: "PR #3 は問題なしと判断しました。終了しますか？ [y/c]".into(),
+            kind: ConfirmKind::ReviewExit,
+        };
+        assert_eq!(
+            on_key(&mut app, key(KeyCode::Enter)),
+            Some(UiCmd::Confirm(ConfirmAnswer::Yes))
+        );
+        app.view = View::Confirm {
+            number: 3,
+            message: "PR #3 は問題なしと判断しました。終了しますか？ [y/c]".into(),
+            kind: ConfirmKind::ReviewExit,
+        };
+        assert_eq!(
+            on_key(&mut app, key(KeyCode::Char('c'))),
+            Some(UiCmd::Confirm(ConfirmAnswer::Continue))
         );
     }
 

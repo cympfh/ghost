@@ -1,7 +1,11 @@
-//! Poll GitHub with `gh`. Talk to the agent only when something changed,
-//! always in the one session started for this run.
+//! Poll GitHub with `gh`. Review, code, and issue each start the agent on
+//! launch for a situation check, even when saved state says nothing is new.
+//! Later polls talk to that same session only when something changed.
+//! Text typed with `i` is queued during a turn and sent when it ends, or
+//! starts a session when none is alive.
 
 use std::collections::BTreeSet;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -14,6 +18,7 @@ use crate::agent::{
 };
 use crate::github::Gh;
 use crate::lang::Lang;
+use crate::merge::{auto_merge_answer, commit_merge, is_merge_ready, MergeAnswer, StopReason};
 use crate::preflight::{evaluate, failure_message, is_fatal, AuthProbe, RepoProbe};
 use crate::prompt::{self, truncate};
 use crate::setup::{SetupFailure, SetupStep};
@@ -21,11 +26,15 @@ use crate::shell::{self, which, PromptMode};
 use crate::state::{self, GhostState, SessionSlot};
 use crate::target::GhTarget;
 use crate::text::{format_countdown, short_sha};
-use crate::tui::{self, LogKind, LogLine, Side, Status, UiCmd, UiEvent};
+use crate::tui::{
+    self, ConfirmAnswer, ConfirmKind, LogKind, LogLine, Side, Status, UiCmd, UiEvent,
+};
 use crate::watch::{
-    baseline_agent_comments, decide_code, decide_review, ensure_closing_line, feedback_log,
-    filter_notes, mark_viewer, CiHandled, CodeAction, CommentTrust, MaxTurns, Note, PrSnap,
-    ReviewAction,
+    after_opening_survey, after_review_verdict, approve_signal, auto_review_exit,
+    baseline_agent_comments, code_step, decide_code, decide_review, ensure_closing_line,
+    feedback_log, filter_notes, mark_viewer, review_step, seen_after_survey, AfterSurvey,
+    CiHandled, CodeAction, CodeLaunch, CodeStep, CommentTrust, MaxTurns, Note, PrSnap,
+    ReviewAction, ReviewExitAnswer, ReviewLaunch, ReviewSignal, ReviewStep,
 };
 use crate::workdir::{self, Checkout};
 
@@ -45,6 +54,9 @@ pub struct RunSpec {
     pub interval: Duration,
     pub agent: Option<AgentKind>,
     pub yes: bool,
+    /// Auto-answer yes on the merge prompt. Ignored by `--review`.
+    pub merge_yes: bool,
+    pub merge_method: Option<String>,
     pub max_turns: u32,
     pub lang: Lang,
     pub ssh_key: Option<String>,
@@ -455,6 +467,8 @@ fn babysit(
         turns: 0,
         fail_streak: 0,
         queued: Vec::new(),
+        delivering_queue: false,
+        turn_signal: String::new(),
         status,
         quit: false,
         interrupted: false,
@@ -469,7 +483,7 @@ fn babysit(
         }
         RunMode::Code => {
             let n = pull_number(&ctx.spec.target)?;
-            ctx.code_loop(n)?;
+            ctx.code_loop(n, CodeLaunch::Survey)?;
         }
         RunMode::Issue => {
             let n = issue_number(&ctx.spec.target)?;
@@ -505,6 +519,11 @@ struct Ctx {
     /// Real agent failures in a row. A successful turn clears it.
     fail_streak: u32,
     queued: Vec<String>,
+    /// Set while a queued follow-up is being delivered, so that turn does not
+    /// flush the queue again or replace the situation-check signal.
+    delivering_queue: bool,
+    /// Agent output from the turn that just finished, before any queued follow-up.
+    turn_signal: String,
     status: Status,
     quit: bool,
     interrupted: bool,
@@ -521,6 +540,7 @@ impl Ctx {
         self.agent
             .seed(stored.session_for(SessionSlot::Review, self.agent.kind()));
         self.push_status();
+        let mut opened = false;
         loop {
             if self.quit {
                 return Ok(());
@@ -529,81 +549,53 @@ impl Ctx {
                 Some(snap) => snap,
                 None => return Ok(()),
             };
-            match decide_review(
+            if snap.comments_unavailable && opened {
+                self.log(self.say(
+                    "コメントの取得に失敗したので、この poll は飛ばします",
+                    "comment endpoints failed; skipping this poll",
+                ));
+                if self.wait_interval()? {
+                    return Ok(());
+                }
+                continue;
+            }
+            let action = match decide_review(
                 &snap,
                 stored.last_reviewed_sha.as_deref(),
                 self.turns,
                 self.spec.max_turns,
+                ReviewSignal::default(),
             ) {
                 Err(MaxTurns) => {
                     self.stop(3, self.max_message());
                     return Ok(());
                 }
-                Ok(ReviewAction::Stop(reason)) => {
+                Ok(action) => action,
+            };
+            let opening = !opened;
+            let launch = if opening {
+                ReviewLaunch::Opening
+            } else {
+                ReviewLaunch::Watching
+            };
+            match review_step(launch, opened, action) {
+                ReviewStep::Action(ReviewAction::Stop(reason)) => {
                     self.stop(reason.exit_code(), reason.message(self.spec.lang, number));
                     return Ok(());
                 }
-                Ok(ReviewAction::Idle) => {
+                ReviewStep::Action(ReviewAction::Idle) => {
                     if !self.delegate_setup()? {
                         self.note_idle(&snap.head_sha);
                     }
                 }
-                Ok(ReviewAction::Review { .. }) => {
-                    self.checkout(
-                        Checkout::Pr {
-                            number,
-                            branch: Some(snap.head_branch.clone()),
-                        },
-                        &pr_purpose(RunMode::Review, number),
-                    );
-                    if self.quit {
+                ReviewStep::Turn | ReviewStep::Action(ReviewAction::Review { .. }) => {
+                    let (leave, progressed) =
+                        self.run_review_turn(number, &snap, &path, &mut stored, opening)?;
+                    if leave {
                         return Ok(());
                     }
-                    let diff = self.load_diff(
-                        number,
-                        stored.last_reviewed_sha.as_deref(),
-                        &snap.head_sha,
-                    )?;
-                    let notes = std::mem::take(&mut self.queued);
-                    let task = self.decorate(match self.agent.session_id() {
-                        Some(_) => prompt::review_followup(
-                            &self.slug,
-                            number,
-                            stored.last_reviewed_sha.as_deref().unwrap_or("unreviewed"),
-                            &snap.head_sha,
-                            &self.workdir,
-                            &diff,
-                            &notes,
-                            self.spec.lang,
-                        ),
-                        None => prompt::review_initial(
-                            &self.slug,
-                            number,
-                            &snap.head_sha,
-                            &self.workdir,
-                            &diff,
-                            &notes,
-                            self.spec.lang,
-                        ),
-                    });
-                    let ok = self.dispatch_task(&task)?;
-                    self.note_setup_result(ok);
-                    if self.quit {
-                        return Ok(());
-                    }
-                    if ok {
-                        stored.last_reviewed_sha = Some(snap.head_sha.clone());
-                        self.remember(&mut stored, SessionSlot::Review);
-                        stored.save(&path)?;
-                        self.log(format!(
-                            "recorded reviewed SHA {}",
-                            short_sha(&snap.head_sha)
-                        ));
-                    } else {
-                        self.log(self.say(
-                            "エージェントのターンが失敗したので、レビュー済み SHA は記録しません",
-                            "agent turn failed; not recording the reviewed SHA",
-                        ));
+                    if progressed {
+                        opened = true;
                     }
                 }
             }
@@ -613,7 +605,132 @@ impl Ctx {
         }
     }
 
-    fn code_loop(&mut self, number: u64) -> Result<()> {
+    /// One review turn. `(leave, progressed)`: leave ends the process, progressed
+    /// means this head was reviewed so later polls may idle on the same SHA.
+    fn run_review_turn(
+        &mut self,
+        number: u64,
+        snap: &PrSnap,
+        path: &std::path::Path,
+        stored: &mut GhostState,
+        opening: bool,
+    ) -> Result<(bool, bool)> {
+        if opening {
+            self.log_situation();
+        }
+        self.checkout(
+            Checkout::Pr {
+                number,
+                branch: Some(snap.head_branch.clone()),
+            },
+            &pr_purpose(RunMode::Review, number),
+        );
+        if self.quit {
+            return Ok((true, false));
+        }
+        let previous = if opening {
+            None
+        } else {
+            stored.last_reviewed_sha.as_deref()
+        };
+        let diff = self.load_diff(number, previous, &snap.head_sha)?;
+        let notes = self.take_queued_for_prompt();
+        let task = self.decorate(if opening || self.agent.session_id().is_none() {
+            prompt::review_initial(
+                &self.slug,
+                number,
+                &snap.head_sha,
+                &self.workdir,
+                &diff,
+                &notes,
+                self.spec.lang,
+            )
+        } else {
+            prompt::review_followup(
+                &self.slug,
+                number,
+                previous.unwrap_or("unreviewed"),
+                &snap.head_sha,
+                &self.workdir,
+                &diff,
+                &notes,
+                self.spec.lang,
+            )
+        });
+        let ok = self.dispatch_task(&task)?;
+        self.note_setup_result(ok);
+        if !ok {
+            self.requeue_after_failed_send(notes);
+        }
+        if self.quit {
+            return Ok((true, false));
+        }
+        if !ok {
+            self.log(self.say(
+                "エージェントのターンが失敗したので、レビュー済み SHA は記録しません",
+                "agent turn failed; not recording the reviewed SHA",
+            ));
+            return Ok((false, false));
+        }
+        stored.last_reviewed_sha = Some(snap.head_sha.clone());
+        self.remember(stored, SessionSlot::Review);
+        stored.save(path)?;
+        self.log(format!(
+            "recorded reviewed SHA {}",
+            short_sha(&snap.head_sha)
+        ));
+        let approve = approve_signal(&self.turn_signal);
+        if after_review_verdict(approve) == crate::watch::AfterVerdict::AskExit {
+            let leave = self.review_exit_prompt(number)?;
+            return Ok((leave, true));
+        }
+        Ok((false, true))
+    }
+
+    fn review_exit_prompt(&mut self, number: u64) -> Result<bool> {
+        let message = self.say(
+            &format!("PR #{number} は問題なしと判断しました。終了しますか？ [y/c]"),
+            &format!("PR #{number} looks fine. Exit? [y/c]"),
+        );
+        let answer = match auto_review_exit(self.spec.yes, stdin_is_tty()) {
+            Some(answer) => {
+                let why = if self.spec.yes { "y (-y)" } else { "y" };
+                self.log(format!("{message} {why}"));
+                answer
+            }
+            None => {
+                let _ = self.tx.send(UiEvent::Confirm {
+                    number,
+                    message,
+                    kind: ConfirmKind::ReviewExit,
+                });
+                self.status.phase = "confirm".into();
+                self.push_status();
+                match self.wait_confirm()? {
+                    None => return Ok(true),
+                    Some(answer) => confirm_review_answer(answer),
+                }
+            }
+        };
+        match answer {
+            ReviewExitAnswer::Continue => {
+                self.log(self.say(
+                    "監視を続けます。新しいコミットで再レビューし、次の approve でまた尋ねます。",
+                    "Continuing to watch. A new commit triggers another review, and the next approve asks again.",
+                ));
+                Ok(false)
+            }
+            ReviewExitAnswer::Exit => {
+                self.stop(
+                    0,
+                    StopReason::ReviewApproved.message(self.spec.lang, number),
+                );
+                Ok(true)
+            }
+        }
+    }
+
+    fn code_loop(&mut self, number: u64, launch: CodeLaunch) -> Result<()> {
         self.status.mode = "code".into();
         self.status.target = format!("PR #{number}");
         let path = state::pr_state_path(&self.state_root, &self.owner, &self.repo, number);
@@ -623,6 +740,7 @@ impl Ctx {
             .seed(stored.session_for(SessionSlot::Code, self.agent.kind()));
         let mut seen: BTreeSet<String> = stored.seen_comment_ids.iter().cloned().collect();
         let mut agent_ids: BTreeSet<String> = stored.agent_comment_ids.iter().cloned().collect();
+        let mut surveyed = matches!(launch, CodeLaunch::Handoff);
         self.push_status();
         loop {
             if self.quit {
@@ -636,8 +754,18 @@ impl Ctx {
                 }
                 None => return Ok(()),
             };
+            if snap.comments_unavailable && surveyed {
+                self.log(self.say(
+                    "コメントの取得に失敗したので、この poll は飛ばします",
+                    "comment endpoints failed; skipping this poll",
+                ));
+                if self.wait_interval()? {
+                    return Ok(());
+                }
+                continue;
+            }
             let handled = ci_handled(&stored);
-            match decide_code(
+            let action = match decide_code(
                 &snap,
                 &seen,
                 self.turns,
@@ -648,99 +776,56 @@ impl Ctx {
                     self.stop(3, self.max_message());
                     return Ok(());
                 }
-                Ok(CodeAction::Stop(reason)) => {
-                    self.stop(reason.exit_code(), reason.message(self.spec.lang, number));
-                    return Ok(());
+                Ok(action) => action,
+            };
+            match code_step(launch, surveyed, action) {
+                CodeStep::Action(CodeAction::Stop(reason)) => {
+                    if reason == StopReason::MergeReady {
+                        if self.offer_merge(number, &snap)? {
+                            return Ok(());
+                        }
+                    } else {
+                        self.stop(reason.exit_code(), reason.message(self.spec.lang, number));
+                        return Ok(());
+                    }
                 }
-                Ok(CodeAction::Idle) => {
+                CodeStep::Action(CodeAction::Idle) => {
                     if !self.delegate_setup()? {
                         self.note_code_idle(&snap);
                     }
                 }
-                Ok(CodeAction::Fix {
+                CodeStep::Action(CodeAction::Fix {
                     ci_failed,
                     new_notes,
                 }) => {
-                    self.announce_fix(ci_failed, &snap, &new_notes);
-                    self.checkout(
-                        Checkout::Pr {
-                            number,
-                            branch: Some(snap.head_branch.clone()),
-                        },
-                        &pr_purpose(RunMode::Code, number),
-                    );
+                    self.run_code_fix(
+                        number,
+                        &snap,
+                        &path,
+                        &mut stored,
+                        &mut seen,
+                        &mut agent_ids,
+                        ci_failed,
+                        new_notes,
+                    )?;
                     if self.quit {
                         return Ok(());
                     }
-                    let user_notes = std::mem::take(&mut self.queued);
-                    let task = self.decorate(if self.agent.session_id().is_some() {
-                        prompt::code_followup(
-                            &self.slug,
-                            number,
-                            &snap.head_branch,
-                            &snap.head_sha,
-                            &self.workdir,
-                            ci_failed,
-                            &snap.failing_checks,
-                            &new_notes,
-                            &user_notes,
-                            self.spec.lang,
-                        )
-                    } else {
-                        prompt::code_initial(
-                            &self.slug,
-                            number,
-                            &snap.head_branch,
-                            &snap.head_sha,
-                            &self.workdir,
-                            ci_failed,
-                            &snap.failing_checks,
-                            &new_notes,
-                            &user_notes,
-                            self.spec.lang,
-                        )
-                    });
-                    let prompted: BTreeSet<String> =
-                        new_notes.iter().map(|n| n.id.clone()).collect();
-                    let ok = self.dispatch_task(&task)?;
-                    self.note_setup_result(ok);
-                    if self.quit {
+                }
+                CodeStep::Survey => {
+                    let (leave, progressed) = self.run_code_survey(
+                        number,
+                        &snap,
+                        &path,
+                        &mut stored,
+                        &mut seen,
+                        &mut agent_ids,
+                    )?;
+                    if leave {
                         return Ok(());
                     }
-                    if ok {
-                        for id in &prompted {
-                            seen.insert(id.clone());
-                        }
-                        if let Ok(fresh) = self.gh.pr(number) {
-                            let login = self.login();
-                            for note in fresh.notes {
-                                let arrived_during_turn = !prompted.contains(&note.id);
-                                if arrived_during_turn && crate::watch::author_is(&note, &login) {
-                                    agent_ids.insert(note.id.clone());
-                                    seen.insert(note.id);
-                                }
-                            }
-                        }
-                        if snap.merge.checks == crate::merge::ChecksVerdict::Failed {
-                            stored.handled_ci_sha = Some(snap.head_sha.clone());
-                            stored.handled_failing_checks = snap.failing_checks.clone();
-                        } else {
-                            stored.handled_ci_sha = None;
-                            stored.handled_failing_checks.clear();
-                        }
-                        stored.seen_comment_ids = seen.iter().cloned().collect();
-                        stored.agent_comment_ids = agent_ids.iter().cloned().collect();
-                        self.remember(&mut stored, SessionSlot::Code);
-                        stored.save(&path)?;
-                        self.log(self.say(
-                            "対応したコメントだけを記録しました",
-                            "recorded the comments this turn handled",
-                        ));
-                    } else {
-                        self.log(self.say(
-                            "エージェントのターンが失敗したので、コメントも CI も処理済みにしません",
-                            "agent turn failed; not marking comments or CI as handled",
-                        ));
+                    if progressed {
+                        surveyed = true;
                     }
                 }
             }
@@ -748,6 +833,311 @@ impl Ctx {
                 return Ok(());
             }
         }
+    }
+
+    fn run_code_survey(
+        &mut self,
+        number: u64,
+        snap: &PrSnap,
+        path: &std::path::Path,
+        stored: &mut GhostState,
+        seen: &mut BTreeSet<String>,
+        agent_ids: &mut BTreeSet<String>,
+    ) -> Result<(bool, bool)> {
+        self.log_situation();
+        self.checkout(
+            Checkout::Pr {
+                number,
+                branch: Some(snap.head_branch.clone()),
+            },
+            &pr_purpose(RunMode::Code, number),
+        );
+        if self.quit {
+            return Ok((true, false));
+        }
+        let startup_ids: Vec<String> = snap.notes.iter().map(|n| n.id.clone()).collect();
+        let user_notes = self.take_queued_for_prompt();
+        let ci_failed = snap.merge.checks == crate::merge::ChecksVerdict::Failed;
+        let task = self.decorate(prompt::code_survey(
+            &self.slug,
+            number,
+            &snap.head_branch,
+            &snap.head_sha,
+            &self.workdir,
+            ci_failed,
+            &snap.failing_checks,
+            &snap.notes,
+            &user_notes,
+            self.spec.lang,
+        ));
+        let ok = self.dispatch_task(&task)?;
+        self.note_setup_result(ok);
+        if !ok {
+            self.requeue_after_failed_send(user_notes);
+        }
+        if self.quit {
+            return Ok((true, false));
+        }
+        if !ok {
+            self.log(self.say(
+                "エージェントのターンが失敗したので、起動時のコメントは既読にしません",
+                "agent turn failed; not marking the startup comments as seen",
+            ));
+            return Ok((false, false));
+        }
+        for id in seen_after_survey(&startup_ids, true) {
+            seen.insert(id);
+        }
+        self.absorb_agent_replies(
+            number,
+            &startup_ids.iter().cloned().collect(),
+            seen,
+            agent_ids,
+        );
+        stored.seen_comment_ids = seen.iter().cloned().collect();
+        stored.agent_comment_ids = agent_ids.iter().cloned().collect();
+        self.remember(stored, SessionSlot::Code);
+        stored.save(path)?;
+        self.log(self.say(
+            "起動時の状況確認で扱ったコメントを記録しました",
+            "recorded the comments handled by the launch situation check",
+        ));
+        let fresh = match self.gh.pr(number) {
+            Ok(fresh) => fresh,
+            Err(err) => {
+                self.log_kind(LogKind::Error, format!("merge re-check failed: {err:#}"));
+                return Ok((false, true));
+            }
+        };
+        if after_opening_survey(is_merge_ready(&fresh.merge)) == AfterSurvey::MergePrompt {
+            let leave = self.offer_merge(number, &fresh)?;
+            return Ok((leave, true));
+        }
+        Ok((false, true))
+    }
+
+    fn run_code_fix(
+        &mut self,
+        number: u64,
+        snap: &PrSnap,
+        path: &std::path::Path,
+        stored: &mut GhostState,
+        seen: &mut BTreeSet<String>,
+        agent_ids: &mut BTreeSet<String>,
+        ci_failed: bool,
+        new_notes: Vec<Note>,
+    ) -> Result<()> {
+        self.announce_fix(ci_failed, snap, &new_notes);
+        self.checkout(
+            Checkout::Pr {
+                number,
+                branch: Some(snap.head_branch.clone()),
+            },
+            &pr_purpose(RunMode::Code, number),
+        );
+        if self.quit {
+            return Ok(());
+        }
+        let user_notes = self.take_queued_for_prompt();
+        let task = self.decorate(if self.agent.session_id().is_some() {
+            prompt::code_followup(
+                &self.slug,
+                number,
+                &snap.head_branch,
+                &snap.head_sha,
+                &self.workdir,
+                ci_failed,
+                &snap.failing_checks,
+                &new_notes,
+                &user_notes,
+                self.spec.lang,
+            )
+        } else {
+            prompt::code_initial(
+                &self.slug,
+                number,
+                &snap.head_branch,
+                &snap.head_sha,
+                &self.workdir,
+                ci_failed,
+                &snap.failing_checks,
+                &new_notes,
+                &user_notes,
+                self.spec.lang,
+            )
+        });
+        let prompted: BTreeSet<String> = new_notes.iter().map(|n| n.id.clone()).collect();
+        let ok = self.dispatch_task(&task)?;
+        self.note_setup_result(ok);
+        if !ok {
+            self.requeue_after_failed_send(user_notes);
+        }
+        if self.quit {
+            return Ok(());
+        }
+        if !ok {
+            self.log(self.say(
+                "エージェントのターンが失敗したので、コメントも CI も処理済みにしません",
+                "agent turn failed; not marking comments or CI as handled",
+            ));
+            return Ok(());
+        }
+        for id in &prompted {
+            seen.insert(id.clone());
+        }
+        self.absorb_agent_replies(number, &prompted, seen, agent_ids);
+        if snap.merge.checks == crate::merge::ChecksVerdict::Failed {
+            stored.handled_ci_sha = Some(snap.head_sha.clone());
+            stored.handled_failing_checks = snap.failing_checks.clone();
+        } else {
+            stored.handled_ci_sha = None;
+            stored.handled_failing_checks.clear();
+        }
+        stored.seen_comment_ids = seen.iter().cloned().collect();
+        stored.agent_comment_ids = agent_ids.iter().cloned().collect();
+        self.remember(stored, SessionSlot::Code);
+        stored.save(path)?;
+        self.log(self.say(
+            "対応したコメントだけを記録しました",
+            "recorded the comments this turn handled",
+        ));
+        Ok(())
+    }
+
+    fn offer_merge(&mut self, number: u64, snap: &PrSnap) -> Result<bool> {
+        let message = self.say(
+            &format!("PR #{number} を merge しますか？ [y/n/c]"),
+            &format!("Merge PR #{number}? [y/n/c]"),
+        );
+        let answer = match auto_merge_answer(self.spec.merge_yes, self.spec.yes, stdin_is_tty()) {
+            Some(answer) => {
+                let why = if self.spec.merge_yes {
+                    "y (--merge-yes)"
+                } else if stdin_is_tty() {
+                    "n"
+                } else {
+                    "n (not a TTY)"
+                };
+                self.log(format!("{message} {why}"));
+                answer
+            }
+            None => {
+                let _ = self.tx.send(UiEvent::Confirm {
+                    number,
+                    message,
+                    kind: ConfirmKind::Merge,
+                });
+                self.status.phase = "confirm".into();
+                self.push_status();
+                match self.wait_confirm()? {
+                    None => return Ok(true),
+                    Some(answer) => confirm_merge_answer(answer),
+                }
+            }
+        };
+        match answer {
+            MergeAnswer::Continue => {
+                self.log(self.say(
+                    "監視を続けます。次にマージ可能になったら再度尋ねます。",
+                    "Continuing to watch. The merge prompt will be asked again the next time this PR is merge-ready.",
+                ));
+                Ok(false)
+            }
+            MergeAnswer::Exit => {
+                self.stop(
+                    0,
+                    self.say(
+                        &format!("PR #{number} はマージせずに終了します。"),
+                        &format!("Exiting without merging PR #{number}."),
+                    ),
+                );
+                Ok(true)
+            }
+            MergeAnswer::Merge => self.merge_now(number, &snap.head_sha),
+        }
+    }
+
+    fn merge_now(&mut self, number: u64, expected_sha: &str) -> Result<bool> {
+        let fresh = match self.gh.pr(number) {
+            Ok(snap) => snap,
+            Err(err) => {
+                self.log_kind(LogKind::Error, format!("merge re-check failed: {err:#}"));
+                return Ok(false);
+            }
+        };
+        if !commit_merge(is_merge_ready(&fresh.merge), expected_sha, &fresh.head_sha) {
+            self.log(self.say(
+                "head SHA が動いたか、もうマージ可能ではないので merge しません。監視を続けます。",
+                "Head SHA moved or the PR is no longer merge-ready. Not merging; continuing to watch.",
+            ));
+            return Ok(false);
+        }
+        match self.gh.merge_pr(number, self.spec.merge_method.as_deref()) {
+            Ok(()) => {
+                let message = if self.spec.merge_yes {
+                    self.say(
+                        &format!("--merge-yes により PR #{number} を merge しました。"),
+                        &format!("Merged PR #{number} because of --merge-yes."),
+                    )
+                } else {
+                    self.say(
+                        &format!("PR #{number} を merge しました。"),
+                        &format!("Merged PR #{number}."),
+                    )
+                };
+                self.stop(0, message);
+                Ok(true)
+            }
+            Err(err) => {
+                self.log_kind(LogKind::Error, format!("gh pr merge failed: {err:#}"));
+                Ok(false)
+            }
+        }
+    }
+
+    fn absorb_agent_replies(
+        &mut self,
+        number: u64,
+        prompted: &BTreeSet<String>,
+        seen: &mut BTreeSet<String>,
+        agent_ids: &mut BTreeSet<String>,
+    ) {
+        if let Ok(fresh) = self.gh.pr(number) {
+            let login = self.login();
+            for note in fresh.notes {
+                let arrived_during_turn = !prompted.contains(&note.id);
+                if arrived_during_turn && crate::watch::author_is(&note, &login) {
+                    agent_ids.insert(note.id.clone());
+                    seen.insert(note.id);
+                }
+            }
+        }
+    }
+
+    fn log_situation(&mut self) {
+        self.log(self.say(
+            "起動時の状況確認を始めます。保存された状態では判断しません。",
+            "Starting the launch situation check. Saved state does not decide this turn.",
+        ));
+    }
+
+    /// Notes folded into the prompt that is about to be sent.
+    fn take_queued_for_prompt(&mut self) -> Vec<String> {
+        let notes = std::mem::take(&mut self.queued);
+        if !notes.is_empty() {
+            self.log(input_delivery_log(InputPlan::SendNow, self.spec.lang));
+        }
+        notes
+    }
+
+    fn requeue_after_failed_send(&mut self, notes: Vec<String>) {
+        if notes.is_empty() || self.quit {
+            return;
+        }
+        let mut restored = notes;
+        restored.append(&mut self.queued);
+        self.queued = restored;
+        self.log(input_delivery_log(InputPlan::Queue, self.spec.lang));
     }
 
     fn issue_flow(&mut self, number: u64) -> Result<()> {
@@ -794,8 +1184,6 @@ impl Ctx {
             self.log(format!(
                 "found existing PR #{pr} for issue #{number}; not opening a duplicate"
             ));
-            self.baseline_new_pr(pr, false)?;
-            return self.confirm_and_code(pr);
         }
         let base = match self.gh.default_branch() {
             Ok(base) => base,
@@ -823,18 +1211,34 @@ impl Ctx {
         if self.quit {
             return Ok(());
         }
-        let user_notes = std::mem::take(&mut self.queued);
-        let mut task = prompt::issue_initial(
-            &self.slug,
-            number,
-            &issue.title,
-            &issue.body,
-            &branch,
-            &base,
-            &self.workdir,
-            &user_notes,
-            self.spec.lang,
-        );
+        self.log_situation();
+        let user_notes = self.take_queued_for_prompt();
+        let mut task = if let Some(pr) = existing {
+            prompt::issue_situation(
+                &self.slug,
+                number,
+                &issue.title,
+                &issue.body,
+                &branch,
+                &base,
+                &self.workdir,
+                pr,
+                &user_notes,
+                self.spec.lang,
+            )
+        } else {
+            prompt::issue_initial(
+                &self.slug,
+                number,
+                &issue.title,
+                &issue.body,
+                &branch,
+                &base,
+                &self.workdir,
+                &user_notes,
+                self.spec.lang,
+            )
+        };
         if self.agent.session_id().is_some() {
             task = format!(
                 "{}{task}",
@@ -844,11 +1248,21 @@ impl Ctx {
         let task = self.decorate(task);
         let ok = self.dispatch_task(&task)?;
         self.note_setup_result(ok);
+        if !ok {
+            self.requeue_after_failed_send(user_notes);
+        }
         if self.quit {
             return Ok(());
         }
         self.remember(&mut istate, SessionSlot::Code);
         istate.save(&ipath)?;
+        if let Some(pr) = existing {
+            self.baseline_new_pr(pr, false)?;
+            if self.quit {
+                return Ok(());
+            }
+            return self.confirm_and_code(pr);
+        }
         let Some(pr) = self.find_pr_after(number, &branch)? else {
             return Ok(());
         };
@@ -918,12 +1332,14 @@ impl Ctx {
             let _ = self.tx.send(UiEvent::Confirm {
                 number: pr,
                 message: message.clone(),
+                kind: ConfirmKind::ContinueAsCode,
             });
             self.status.phase = "confirm".into();
             self.push_status();
             match self.wait_confirm()? {
                 None => return Ok(()),
-                Some(answer) => answer,
+                Some(ConfirmAnswer::Yes) => true,
+                Some(ConfirmAnswer::No | ConfirmAnswer::Continue) => false,
             }
         };
         if !yes {
@@ -935,7 +1351,7 @@ impl Ctx {
             self.agent.kind()
         ));
         // Same AgentSession. code_loop only seeds an id when this one has none.
-        self.code_loop(pr)
+        self.code_loop(pr, CodeLaunch::Handoff)
     }
 
     fn ask_mode(&mut self, number: u64) -> Result<()> {
@@ -948,7 +1364,7 @@ impl Ctx {
         loop {
             match self.rx.recv() {
                 Ok(UiCmd::Choose(Side::Review)) => return self.review_loop(number),
-                Ok(UiCmd::Choose(Side::Code)) => return self.code_loop(number),
+                Ok(UiCmd::Choose(Side::Code)) => return self.code_loop(number, CodeLaunch::Survey),
                 Ok(UiCmd::Quit) | Err(_) => {
                     self.stop(0, "quit".into());
                     return Ok(());
@@ -988,7 +1404,9 @@ impl Ctx {
         self.use_slot(&slot);
         match (kind, side) {
             (crate::github::ItemKind::Pull, Some(Side::Review)) => self.review_loop(number),
-            (crate::github::ItemKind::Pull, Some(Side::Code)) => self.code_loop(number),
+            (crate::github::ItemKind::Pull, Some(Side::Code)) => {
+                self.code_loop(number, CodeLaunch::Survey)
+            }
             (crate::github::ItemKind::Issue, _) => self.issue_flow(number),
             (crate::github::ItemKind::Pull, None) => self.ask_mode(number),
         }
@@ -1330,8 +1748,14 @@ impl Ctx {
                 }
             }
             if self.agent.turn_finished() {
-                if !self.quit && !self.interrupted {
-                    self.flush_queued()?;
+                if !self.delivering_queue {
+                    self.turn_signal = self.agent.recent_output().to_string();
+                    if !self.quit {
+                        self.delivering_queue = true;
+                        let flushed = self.flush_queued();
+                        self.delivering_queue = false;
+                        flushed?;
+                    }
                 }
                 return Ok(());
             }
@@ -1359,6 +1783,15 @@ impl Ctx {
         if self.quit {
             return Ok(true);
         }
+        if !self.queued.is_empty() && !self.delivering_queue && !self.agent.turn_open() {
+            self.delivering_queue = true;
+            let flushed = self.flush_queued();
+            self.delivering_queue = false;
+            flushed?;
+            if self.quit {
+                return Ok(true);
+            }
+        }
         let start = Instant::now();
         loop {
             if self.quit {
@@ -1381,7 +1814,7 @@ impl Ctx {
         }
     }
 
-    fn wait_confirm(&mut self) -> Result<Option<bool>> {
+    fn wait_confirm(&mut self) -> Result<Option<ConfirmAnswer>> {
         loop {
             match self.rx.recv() {
                 Ok(UiCmd::Confirm(answer)) => return Ok(Some(answer)),
@@ -1389,7 +1822,7 @@ impl Ctx {
                     self.stop(0, "quit".into());
                     return Ok(None);
                 }
-                Ok(UiCmd::Input(text)) => self.on_input(text, false)?,
+                Ok(UiCmd::Input(text)) => self.on_input(text, self.agent.turn_open())?,
                 Ok(UiCmd::Interrupt) => self.agent.interrupt(),
                 Ok(_) => {}
             }
@@ -1416,34 +1849,27 @@ impl Ctx {
             return Ok(());
         }
         self.log_kind(LogKind::User, text.clone());
-        if during_turn && self.agent.accepts_live_input() {
-            self.agent.push_live(&text)?;
-            self.log("sent into the running session");
-            return Ok(());
+        match plan_user_input(during_turn, self.agent.session_id().is_some()) {
+            InputPlan::Queue => {
+                self.queued.push(text);
+                self.log(input_delivery_log(InputPlan::Queue, self.spec.lang));
+                Ok(())
+            }
+            InputPlan::SendNow => {
+                self.queued.push(text);
+                self.flush_queued()
+            }
         }
-        if during_turn {
-            self.queued.push(text);
-            self.log("queued; it will be sent into this same session when the turn finishes");
-            return Ok(());
-        }
-        if self.agent.session_id().is_some() {
-            let prompt = self.decorate(prompt::user_nudge(self.spec.lang, &text, false));
-            let ok = self.dispatch_task(&prompt)?;
-            self.note_setup_result(ok);
-        } else {
-            self.queued.push(text);
-            self.log("queued for the first task");
-        }
-        Ok(())
     }
 
-    /// Codex and Grok cannot take stdin mid-turn. Send those lines as one
-    /// follow-up in the session that just finished, instead of dropping them.
+    /// Send queued lines into the current session, or start one when none is alive.
+    /// A failed send puts the lines back and logs that they are still queued.
     fn flush_queued(&mut self) -> Result<()> {
-        if self.queued.is_empty() || self.agent.session_id().is_none() {
+        if self.queued.is_empty() || self.quit {
             return Ok(());
         }
         let notes = std::mem::take(&mut self.queued);
+        self.log(input_delivery_log(InputPlan::SendNow, self.spec.lang));
         let prompt = self.decorate(prompt::user_nudge(
             self.spec.lang,
             &notes.join("\n\n"),
@@ -1451,6 +1877,9 @@ impl Ctx {
         ));
         let ok = self.dispatch_task(&prompt)?;
         self.note_setup_result(ok);
+        if !ok {
+            self.requeue_after_failed_send(notes);
+        }
         Ok(())
     }
 
@@ -1826,14 +2255,67 @@ fn short_id(id: &str) -> &str {
     &id[..n]
 }
 
+/// What to do with a line the user submitted with `i`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputPlan {
+    /// No turn is open. Start a session when none exists, or resume, and send now.
+    SendNow,
+    /// A turn is running. Hold the line and send it when that turn finishes.
+    Queue,
+}
+
+/// `has_session` is false when no session was started or the previous one died.
+/// Those lines are still sent now: ghost starts or resumes a session for them.
+pub fn plan_user_input(turn_open: bool, has_session: bool) -> InputPlan {
+    if turn_open {
+        InputPlan::Queue
+    } else {
+        let _ = has_session;
+        InputPlan::SendNow
+    }
+}
+
+pub fn input_delivery_log(plan: InputPlan, lang: Lang) -> String {
+    match (plan, lang) {
+        (InputPlan::SendNow, Lang::Ja) => "→ エージェントに送信".into(),
+        (InputPlan::SendNow, Lang::En) => "→ sent to the agent".into(),
+        (InputPlan::Queue, Lang::Ja) => "送信待ち。ターン終了後に → エージェントに送信".into(),
+        (InputPlan::Queue, Lang::En) => "queued; → sent to the agent when the turn finishes".into(),
+    }
+}
+
+fn stdin_is_tty() -> bool {
+    std::io::stdin().is_terminal()
+}
+
+pub fn confirm_review_answer(answer: ConfirmAnswer) -> ReviewExitAnswer {
+    match answer {
+        ConfirmAnswer::Continue => ReviewExitAnswer::Continue,
+        ConfirmAnswer::Yes | ConfirmAnswer::No => ReviewExitAnswer::Exit,
+    }
+}
+
+pub fn confirm_merge_answer(answer: ConfirmAnswer) -> MergeAnswer {
+    match answer {
+        ConfirmAnswer::Yes => MergeAnswer::Merge,
+        ConfirmAnswer::Continue => MergeAnswer::Continue,
+        ConfirmAnswer::No => MergeAnswer::Exit,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_backoff, empty_repo_notice, stop_after_failures, MAX_CONSECUTIVE_AGENT_FAILURES,
+        agent_backoff, confirm_merge_answer, confirm_review_answer, empty_repo_notice,
+        input_delivery_log, plan_user_input, stop_after_failures, InputPlan,
+        MAX_CONSECUTIVE_AGENT_FAILURES,
     };
     use crate::lang::Lang;
+    use crate::merge::MergeAnswer;
+    use crate::tui::ConfirmAnswer;
+    use crate::watch::ReviewExitAnswer;
 
     #[test]
     fn agent_failure_backoff_grows_and_then_stops() {
@@ -1857,6 +2339,43 @@ mod tests {
             Some("OWNER/REPO にオープンな issue も PR もありません。")
         );
         assert!(empty_repo_notice("OWNER/REPO", false, Lang::Ja).is_none());
+    }
+
+    #[test]
+    fn user_input_is_delivered_when_idle_during_a_turn_and_with_no_session() {
+        assert_eq!(plan_user_input(false, true), InputPlan::SendNow);
+        assert_eq!(plan_user_input(true, true), InputPlan::Queue);
+        assert_eq!(plan_user_input(false, false), InputPlan::SendNow);
+        assert_eq!(plan_user_input(true, false), InputPlan::Queue);
+
+        let sent = input_delivery_log(InputPlan::SendNow, Lang::Ja);
+        let queued = input_delivery_log(InputPlan::Queue, Lang::Ja);
+        assert_eq!(sent, "→ エージェントに送信");
+        assert!(queued.contains("送信待ち"));
+        assert!(queued.contains("→ エージェントに送信"));
+        assert!(input_delivery_log(InputPlan::Queue, Lang::En).contains("queued"));
+    }
+
+    #[test]
+    fn review_exit_y_leaves_and_c_continues_merge_is_separate() {
+        assert_eq!(
+            confirm_review_answer(ConfirmAnswer::Yes),
+            ReviewExitAnswer::Exit
+        );
+        assert_eq!(
+            confirm_review_answer(ConfirmAnswer::No),
+            ReviewExitAnswer::Exit
+        );
+        assert_eq!(
+            confirm_review_answer(ConfirmAnswer::Continue),
+            ReviewExitAnswer::Continue
+        );
+        assert_eq!(confirm_merge_answer(ConfirmAnswer::Yes), MergeAnswer::Merge);
+        assert_eq!(confirm_merge_answer(ConfirmAnswer::No), MergeAnswer::Exit);
+        assert_eq!(
+            confirm_merge_answer(ConfirmAnswer::Continue),
+            MergeAnswer::Continue
+        );
     }
 }
 

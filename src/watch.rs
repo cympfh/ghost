@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use clap::ValueEnum;
 
-use crate::merge::{stop_reason, MergeInput, StopReason};
+use crate::merge::{review_life_stop, stop_reason, MergeInput, StopReason};
 
 /// A review submission, inline review comment, or issue comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +113,8 @@ pub struct PrSnap {
     pub created_at: String,
     pub feedback: FeedbackCounts,
     pub feedback_warnings: Vec<String>,
+    /// All three REST comment calls failed. Do not use GraphQL ids this poll.
+    pub comments_unavailable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,15 +141,53 @@ pub enum CodeAction {
     },
 }
 
-/// Review mode calls the agent only when the head SHA changed.
-/// The same SHA is a no-op even if comments arrived. Merge-ready wins over a new SHA.
+/// Agent's machine-readable review line, for the head SHA it just reviewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewVerdict {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReviewSignal {
+    pub verdict: Option<ReviewVerdict>,
+    pub viewer_approved: bool,
+}
+
+/// Last `GHOST_VERDICT:` line in the agent output.
+pub fn parse_ghost_verdict(text: &str) -> Option<ReviewVerdict> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.split("GHOST_VERDICT:").nth(1) else {
+            continue;
+        };
+        let word = rest
+            .split(|c: char| c.is_whitespace() || c == '"' || c == '`' || c == ',')
+            .find(|s| !s.is_empty())
+            .unwrap_or("");
+        found = match word {
+            "approve" => Some(ReviewVerdict::Approve),
+            "request_changes" => Some(ReviewVerdict::RequestChanges),
+            "comment" => Some(ReviewVerdict::Comment),
+            _ => found,
+        };
+    }
+    found
+}
+
+/// Review stops on merged/closed, or an approve verdict for this head.
+/// Merge-ready does not end a review.
 pub fn decide_review(
     snap: &PrSnap,
     last_reviewed_sha: Option<&str>,
     turns: u32,
     max_turns: u32,
+    signal: ReviewSignal,
 ) -> Result<ReviewAction, MaxTurns> {
-    if let Some(reason) = stop_reason(&snap.merge) {
+    let _ = signal;
+    if let Some(reason) = review_life_stop(&snap.merge) {
         return Ok(ReviewAction::Stop(reason));
     }
     if !review_needed(last_reviewed_sha, &snap.head_sha) {
@@ -158,6 +198,96 @@ pub fn decide_review(
     }
     let full_diff = !matches!(last_reviewed_sha, Some(prev) if !prev.is_empty());
     Ok(ReviewAction::Review { full_diff })
+}
+
+/// Launch always starts an agent turn. Saved "nothing new" does not skip it.
+pub fn opening_runs_agent(saved_says_idle: bool) -> bool {
+    let _ = saved_says_idle;
+    true
+}
+
+/// True when this head should ask the review-exit prompt.
+/// An explicit non-approve verdict wins. With no verdict line, a self-review
+/// comment that says `LGTM / 承認相当` still counts as approve.
+pub fn approve_signal(output: &str) -> bool {
+    match parse_ghost_verdict(output) {
+        Some(ReviewVerdict::Approve) => true,
+        Some(_) => false,
+        None => output.contains("LGTM / 承認相当"),
+    }
+}
+
+/// First turn of a review process always runs, even when this SHA was reviewed before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewLaunch {
+    Opening,
+    Watching,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewStep {
+    Turn,
+    Action(ReviewAction),
+}
+
+pub fn review_step(launch: ReviewLaunch, opened: bool, action: ReviewAction) -> ReviewStep {
+    if launch == ReviewLaunch::Opening && !opened {
+        if let ReviewAction::Stop(StopReason::Merged | StopReason::Closed) = action {
+            return ReviewStep::Action(action);
+        }
+        if opening_runs_agent(matches!(action, ReviewAction::Idle)) {
+            return ReviewStep::Turn;
+        }
+    }
+    ReviewStep::Action(action)
+}
+
+/// Approve (verdict or a real APPROVE on this SHA) asks whether to exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterVerdict {
+    AskExit,
+    Poll,
+}
+
+pub fn after_review_verdict(approve: bool) -> AfterVerdict {
+    if approve {
+        AfterVerdict::AskExit
+    } else {
+        AfterVerdict::Poll
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewExitAnswer {
+    Exit,
+    Continue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewExitKey {
+    Yes,
+    Continue,
+    Enter,
+    Esc,
+    CtrlC,
+}
+
+pub fn review_exit_key(key: ReviewExitKey) -> ReviewExitAnswer {
+    match key {
+        ReviewExitKey::Continue => ReviewExitAnswer::Continue,
+        ReviewExitKey::Yes | ReviewExitKey::Enter | ReviewExitKey::Esc | ReviewExitKey::CtrlC => {
+            ReviewExitAnswer::Exit
+        }
+    }
+}
+
+/// `-y` exits without asking. A non-TTY also exits. Review never merges.
+pub fn auto_review_exit(yes: bool, tty: bool) -> Option<ReviewExitAnswer> {
+    if yes || !tty {
+        Some(ReviewExitAnswer::Exit)
+    } else {
+        None
+    }
 }
 
 pub fn review_needed(last_reviewed_sha: Option<&str>, head_sha: &str) -> bool {
@@ -193,6 +323,54 @@ pub fn decide_code(
         ci_failed,
         new_notes,
     })
+}
+
+/// Standalone `--code` surveys once before the normal loop. Issue handoff does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeLaunch {
+    Survey,
+    Handoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeStep {
+    Survey,
+    Action(CodeAction),
+}
+
+pub fn code_step(launch: CodeLaunch, surveyed: bool, action: CodeAction) -> CodeStep {
+    if launch == CodeLaunch::Survey && !surveyed {
+        if let CodeAction::Stop(StopReason::Merged | StopReason::Closed) = action {
+            return CodeStep::Action(action);
+        }
+        if opening_runs_agent(matches!(action, CodeAction::Idle)) {
+            return CodeStep::Survey;
+        }
+    }
+    CodeStep::Action(action)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterSurvey {
+    MergePrompt,
+    Poll,
+}
+
+pub fn after_opening_survey(merge_ready: bool) -> AfterSurvey {
+    if merge_ready {
+        AfterSurvey::MergePrompt
+    } else {
+        AfterSurvey::Poll
+    }
+}
+
+/// Comment ids present at startup are seen only after that turn succeeds.
+pub fn seen_after_survey(ids: &[String], turn_ok: bool) -> Vec<String> {
+    if turn_ok {
+        ids.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn wakes_agent_review(action: &ReviewAction) -> bool {
@@ -481,10 +659,12 @@ mod tests {
                 life: PrLife::Open,
                 draft: false,
                 mergeable: Mergeability::Mergeable,
+                merge_state: crate::merge::MergeState::Unknown,
                 checks,
                 approvals: 0,
                 changes_requested: false,
             },
+            comments_unavailable: false,
             failing_checks: vec![],
             notes: vec![],
             ci_label: "pending".into(),
@@ -507,35 +687,108 @@ mod tests {
         assert!(review_needed(Some(""), "abc"));
 
         let pr = snap("abc", ChecksVerdict::Pending);
+        assert_eq!(rev(&pr, Some("abc")), ReviewAction::Idle);
+        assert_eq!(rev(&pr, None), ReviewAction::Review { full_diff: true });
         assert_eq!(
-            decide_review(&pr, Some("abc"), 0, 20).unwrap(),
-            ReviewAction::Idle
+            rev(&pr, Some("old")),
+            ReviewAction::Review { full_diff: false }
         );
+    }
+
+    fn rev(pr: &PrSnap, last: Option<&str>) -> ReviewAction {
+        decide_review(pr, last, 0, 20, ReviewSignal::default()).unwrap()
+    }
+
+    #[test]
+    fn review_does_not_stop_just_because_the_pr_is_merge_ready() {
+        let mut pr = snap("new", ChecksVerdict::AllGreen);
+        pr.merge.merge_state = crate::merge::MergeState::Clean;
+        pr.merge.approvals = 1;
+        assert!(crate::merge::is_merge_ready(&pr.merge));
         assert_eq!(
-            decide_review(&pr, None, 0, 20).unwrap(),
-            ReviewAction::Review { full_diff: true }
-        );
-        assert_eq!(
-            decide_review(&pr, Some("old"), 0, 20).unwrap(),
+            rev(&pr, Some("old")),
             ReviewAction::Review { full_diff: false }
         );
     }
 
     #[test]
-    fn review_stops_when_merge_ready_even_if_sha_changed() {
-        let mut pr = snap("new", ChecksVerdict::AllGreen);
-        pr.merge.approvals = 1;
+    fn review_opening_turn_runs_even_when_the_sha_was_already_reviewed() {
+        let pr = snap("abc", ChecksVerdict::Pending);
+        let idle = rev(&pr, Some("abc"));
+        assert_eq!(idle, ReviewAction::Idle);
         assert_eq!(
-            decide_review(&pr, Some("old"), 0, 20).unwrap(),
-            ReviewAction::Stop(StopReason::MergeReady)
+            review_step(ReviewLaunch::Opening, false, idle),
+            ReviewStep::Turn
+        );
+        assert_eq!(
+            review_step(ReviewLaunch::Watching, true, rev(&pr, Some("abc"))),
+            ReviewStep::Action(ReviewAction::Idle)
+        );
+        assert_eq!(after_review_verdict(true), AfterVerdict::AskExit);
+        assert_eq!(after_review_verdict(false), AfterVerdict::Poll);
+        assert_eq!(review_exit_key(ReviewExitKey::Yes), ReviewExitAnswer::Exit);
+        assert_eq!(
+            review_exit_key(ReviewExitKey::Continue),
+            ReviewExitAnswer::Continue
+        );
+        assert_eq!(
+            review_exit_key(ReviewExitKey::Enter),
+            ReviewExitAnswer::Exit
+        );
+        assert_eq!(review_exit_key(ReviewExitKey::Esc), ReviewExitAnswer::Exit);
+        assert_eq!(
+            review_exit_key(ReviewExitKey::CtrlC),
+            ReviewExitAnswer::Exit
+        );
+        assert_eq!(auto_review_exit(true, true), Some(ReviewExitAnswer::Exit));
+        assert_eq!(auto_review_exit(false, false), Some(ReviewExitAnswer::Exit));
+        assert_eq!(auto_review_exit(false, true), None);
+        assert!(opening_runs_agent(true));
+        assert!(opening_runs_agent(false));
+        assert!(approve_signal("notes\nGHOST_VERDICT: approve\n"));
+        assert!(!approve_signal("LGTM / 承認相当\nGHOST_VERDICT: comment"));
+        assert!(approve_signal("posted LGTM / 承認相当"));
+        assert!(!approve_signal("looks fine"));
+        assert_eq!(
+            parse_ghost_verdict("notes\nGHOST_VERDICT: approve\n"),
+            Some(ReviewVerdict::Approve)
+        );
+        assert_eq!(
+            parse_ghost_verdict("GHOST_VERDICT: comment\nGHOST_VERDICT: request_changes"),
+            Some(ReviewVerdict::RequestChanges)
+        );
+    }
+
+    #[test]
+    fn standalone_code_surveys_before_the_merge_prompt() {
+        let mut ready = snap("abc", ChecksVerdict::AllGreen);
+        ready.merge.merge_state = crate::merge::MergeState::Clean;
+        let action = decide_code(&ready, &BTreeSet::new(), 0, 20, None).unwrap();
+        assert!(matches!(action, CodeAction::Stop(StopReason::MergeReady)));
+        assert_eq!(
+            code_step(CodeLaunch::Survey, false, action),
+            CodeStep::Survey
+        );
+        assert_eq!(after_opening_survey(true), AfterSurvey::MergePrompt);
+        assert_eq!(after_opening_survey(false), AfterSurvey::Poll);
+        let idle = snap("abc", ChecksVerdict::Pending);
+        let idle = decide_code(&idle, &BTreeSet::new(), 0, 20, None).unwrap();
+        assert_eq!(
+            code_step(CodeLaunch::Handoff, true, idle.clone()),
+            CodeStep::Action(idle)
+        );
+        assert!(seen_after_survey(&["comment:1".into()], false).is_empty());
+        assert_eq!(
+            seen_after_survey(&["comment:1".into()], true),
+            vec!["comment:1".to_string()]
         );
     }
 
     #[test]
     fn review_does_not_call_agent_at_max_turns() {
         let pr = snap("new", ChecksVerdict::Pending);
-        assert!(decide_review(&pr, Some("old"), 20, 20).is_err());
-        assert!(decide_review(&pr, Some("old"), 3, 3).is_err());
+        assert!(decide_review(&pr, Some("old"), 20, 20, ReviewSignal::default()).is_err());
+        assert!(decide_review(&pr, Some("old"), 3, 3, ReviewSignal::default()).is_err());
     }
 
     #[test]
@@ -619,7 +872,7 @@ mod tests {
     #[test]
     fn quiet_poll_does_not_wake_the_agent() {
         let pr = snap("abc", ChecksVerdict::None);
-        let review = decide_review(&pr, Some("abc"), 0, 20).unwrap();
+        let review = decide_review(&pr, Some("abc"), 0, 20, ReviewSignal::default()).unwrap();
         assert!(!wakes_agent_review(&review));
         let code_action = decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap();
         assert!(!wakes_agent_code(&code_action));
