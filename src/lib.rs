@@ -9,6 +9,7 @@ pub mod demo;
 pub mod engine;
 pub mod github;
 pub mod interval;
+pub mod lang;
 pub mod merge;
 pub mod preflight;
 pub mod prompt;

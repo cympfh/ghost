@@ -68,9 +68,28 @@ pub fn failure_message(
     auth: &AuthProbe,
     repo: Option<&RepoProbe>,
     slug: &str,
+    lang: crate::lang::Lang,
 ) -> String {
-    match kind {
-        PreflightFailure::GhMissing => "\
+    let detail_auth = first_line(&auth.stderr, &auth.stdout);
+    let detail_repo = repo
+        .map(|r| first_line(&r.stderr, &r.stdout))
+        .unwrap_or_else(|| {
+            lang.say(
+                "リポジトリを照会できませんでした",
+                "could not query the repository",
+            )
+        });
+    match (kind, lang) {
+        (PreflightFailure::GhMissing, crate::lang::Lang::Ja) => "\
+`gh` がインストールされていません（PATH にありません）。
+
+ghost は GitHub の操作をすべて GitHub CLI で行います。
+
+直し方:
+  GitHub CLI を入れる: https://cli.github.com/
+  その後: gh auth login"
+            .to_string(),
+        (PreflightFailure::GhMissing, crate::lang::Lang::En) => "\
 `gh` is not installed (not on PATH).
 
 ghost uses the GitHub CLI for every GitHub operation.
@@ -79,18 +98,18 @@ Fix:
   install GitHub CLI: https://cli.github.com/
   then: gh auth login"
             .to_string(),
-        PreflightFailure::NotAuthenticated => {
-            let detail = first_line(&auth.stderr, &auth.stdout);
-            format!("`gh` is installed but not authenticated.\n\n{detail}\n\nFix:\n  gh auth login")
-        }
-        PreflightFailure::RepoInaccessible => {
-            let detail = repo
-                .map(|r| first_line(&r.stderr, &r.stdout))
-                .unwrap_or_else(|| "could not query the repository".to_string());
-            format!(
-                "Could not access {slug}.\n\n{detail}\n\nFix:\n  gh auth login\n  gh repo view {slug}\n  confirm this account can read {slug}"
-            )
-        }
+        (PreflightFailure::NotAuthenticated, crate::lang::Lang::Ja) => format!(
+            "`gh` は入っていますが、認証されていません。\n\n{detail_auth}\n\n直し方:\n  gh auth login"
+        ),
+        (PreflightFailure::NotAuthenticated, crate::lang::Lang::En) => format!(
+            "`gh` is installed but not authenticated.\n\n{detail_auth}\n\nFix:\n  gh auth login"
+        ),
+        (PreflightFailure::RepoInaccessible, crate::lang::Lang::Ja) => format!(
+            "{slug} にアクセスできません。\n\n{detail_repo}\n\n直し方:\n  gh auth login\n  gh repo view {slug}\n  このアカウントが {slug} を読めるか確認する"
+        ),
+        (PreflightFailure::RepoInaccessible, crate::lang::Lang::En) => format!(
+            "Could not access {slug}.\n\n{detail_repo}\n\nFix:\n  gh auth login\n  gh repo view {slug}\n  confirm this account can read {slug}"
+        ),
     }
 }
 
@@ -130,7 +149,7 @@ mod tests {
         let probe = auth(false, None, "", "");
         let err = evaluate(&probe, None, "a/b").unwrap_err();
         assert_eq!(err, PreflightFailure::GhMissing);
-        let msg = failure_message(&err, &probe, None, "a/b");
+        let msg = failure_message(&err, &probe, None, "a/b", crate::lang::Lang::En);
         assert!(msg.contains("not installed"));
         assert!(msg.contains("gh auth login"));
         assert!(msg.contains("cli.github.com"));
@@ -146,7 +165,7 @@ mod tests {
         );
         let err = evaluate(&probe, None, "a/b").unwrap_err();
         assert_eq!(err, PreflightFailure::NotAuthenticated);
-        let msg = failure_message(&err, &probe, None, "a/b");
+        let msg = failure_message(&err, &probe, None, "a/b", crate::lang::Lang::En);
         assert!(msg.contains("gh auth login"), "{msg}");
     }
 
@@ -174,7 +193,7 @@ mod tests {
         };
         let err = evaluate(&probe, Some(&repo), "a/b").unwrap_err();
         assert_eq!(err, PreflightFailure::RepoInaccessible);
-        let msg = failure_message(&err, &probe, Some(&repo), "a/b");
+        let msg = failure_message(&err, &probe, Some(&repo), "a/b", crate::lang::Lang::En);
         assert!(msg.contains("gh auth login"));
         assert!(msg.contains("gh repo view a/b"));
         assert!(msg.contains("Could not resolve"));

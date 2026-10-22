@@ -156,7 +156,7 @@ fn code_scene(tx: &Sender<UiEvent>) {
         tx,
         "the interval test expected 300 seconds. fixing interval.rs.",
     );
-    agent(tx, "git push origin ghost/issue-3");
+    agent(tx, "git push origin fix/3-interval");
     agent(
         tx,
         "gh pr comment 3 --repo cympfh/xxx --body \"Fixed in the latest push.\"",
@@ -168,11 +168,11 @@ fn confirm_scene(tx: &Sender<UiEvent>) {
         tx, "issue", "issue #7", "confirm", "9ab31c0", "pending", "1/20", "claude", "7f3ac2e1",
     );
     sys(tx, "workdir ~/.ghost/work/cympfh__xxx (reused clone)");
-    sys(tx, "branch ghost/issue-7");
-    agent(tx, "implemented the issue and pushed ghost/issue-7.");
+    sys(tx, "branch fix/7-crash");
+    agent(tx, "implemented the issue and pushed fix/7-crash.");
     agent(
         tx,
-        "gh pr create --repo cympfh/xxx --base main --head ghost/issue-7 --body $'...\\n\\nCloses #7'",
+        "gh pr create --repo cympfh/xxx --base main --head fix/7-crash --body $'...\\n\\nCloses #7'",
     );
     sys(tx, "opened PR #12 · keeping this claude session");
     let _ = tx.send(UiEvent::Confirm {

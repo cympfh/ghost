@@ -7,7 +7,9 @@ use crate::agent::AgentKind;
 use crate::demo::{self, DemoScene};
 use crate::engine::{self, RunMode, RunSpec};
 use crate::interval::parse_interval;
+use crate::lang::Lang;
 use crate::target::{parse_target, GhTarget};
+use crate::watch::CommentTrust;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -18,12 +20,14 @@ use crate::target::{parse_target, GhTarget};
 Examples:
   ghost github.com/owner/repo
   ghost github.com/owner/repo/pr/3 --review
-  ghost github.com/owner/repo/pr/3 --code --interval 2m
-  ghost github.com/owner/repo/issue/7 --yes
+  ghost github.com/owner/repo/pr/3 --code --interval 20s
+  ghost github.com/owner/repo/issue/7 --yes --lang ja
   ghost --demo review
 
 GitHub access is only through the `gh` CLI. One agent session is started for the
-run; later updates resume it (claude --resume, codex exec resume, grok --resume)."
+run; later updates resume it (claude --resume, codex exec resume, grok --resume).
+The default poll interval is 20s. `--lang` defaults to ja. `--ssh-key` selects an
+ssh identity (or set GHOST_SSH_KEY). Nothing new on a poll means no agent call."
 )]
 struct Cli {
     /// github.com/OWNER/REPO, .../pr/N, or .../issue/N
@@ -37,8 +41,9 @@ struct Cli {
     #[arg(long, conflicts_with = "review")]
     code: bool,
 
-    /// How often to poll `gh`. First check is immediate. Bare numbers are seconds.
-    #[arg(long, default_value = "5m")]
+    /// How often to poll `gh`. Default 20s. First check is immediate.
+    /// Examples: 20s, 30s, 2m, 1h30m, or a bare number of seconds.
+    #[arg(long, default_value = "20s")]
     interval: String,
 
     /// Coding agent. Default: first of codex, claude, grok on PATH.
@@ -56,11 +61,30 @@ struct Cli {
     /// Draw a scripted screen (picker, review, code, confirm, preflight).
     #[arg(long, value_enum)]
     demo: Option<DemoScene>,
+
+    /// Language for prompts and user-facing text. Default: ja.
+    #[arg(long, value_enum, default_value_t = Lang::Ja)]
+    lang: Lang,
+
+    /// SSH private key for git and the inner agent. Default: ssh config and agent.
+    /// `GHOST_SSH_KEY` is used when this flag is omitted.
+    #[arg(long)]
+    ssh_key: Option<String>,
+
+    /// Which comment authors may wake --code, besides the PR author and repo owner.
+    #[arg(long, value_enum, default_value_t = CommentTrust::Collaborators)]
+    trust_comments: CommentTrust,
 }
 
 pub fn run() -> Result<i32> {
     let cli = Cli::parse();
     let header = invocation();
+    let lang = lang_from_env(cli.lang);
+    let ssh_key = cli
+        .ssh_key
+        .clone()
+        .or_else(|| std::env::var("GHOST_SSH_KEY").ok())
+        .filter(|s| !s.trim().is_empty());
     match resolve(
         cli.target.as_deref(),
         cli.review,
@@ -71,6 +95,9 @@ pub fn run() -> Result<i32> {
         cli.max_iterations,
         cli.demo,
         header,
+        lang,
+        ssh_key,
+        cli.trust_comments,
     ) {
         Ok(Action::Demo { scene, header }) => demo::run(scene, header),
         Ok(Action::Run(spec)) => engine::run(spec),
@@ -98,6 +125,9 @@ fn resolve(
     max_iterations: u32,
     demo: Option<DemoScene>,
     header: String,
+    lang: Lang,
+    ssh_key: Option<String>,
+    trust: CommentTrust,
 ) -> Result<Action, String> {
     if let Some(scene) = demo {
         if target.is_some() || review || code {
@@ -125,6 +155,9 @@ fn resolve(
         agent,
         yes,
         max_turns: max_iterations,
+        lang,
+        ssh_key,
+        trust,
     }))
 }
 
@@ -171,6 +204,20 @@ fn demo_header(scene: DemoScene) -> String {
     }
 }
 
+fn lang_from_env(flag: Lang) -> Lang {
+    let explicit = std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--lang" || arg.starts_with("--lang="));
+    if explicit {
+        return flag;
+    }
+    match std::env::var("GHOST_LANG").ok().as_deref() {
+        Some("en") => Lang::En,
+        Some("ja") => Lang::Ja,
+        _ => flag,
+    }
+}
+
 fn invocation() -> String {
     let mut parts = vec!["ghost".to_string()];
     for arg in std::env::args().skip(1) {
@@ -212,7 +259,39 @@ mod tests {
             20,
             None,
             "ghost".into(),
+            Lang::Ja,
+            None,
+            CommentTrust::Collaborators,
         )
+    }
+
+    #[test]
+    fn default_interval_is_20_seconds() {
+        let cli = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "--review"]).unwrap();
+        assert_eq!(cli.interval, "20s");
+        assert_eq!(cli.lang, Lang::Ja);
+        let action = resolve(
+            Some("github.com/a/b/pr/1"),
+            true,
+            false,
+            &cli.interval,
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            cli.lang,
+            None,
+            CommentTrust::Collaborators,
+        )
+        .unwrap();
+        match action {
+            Action::Run(spec) => {
+                assert_eq!(spec.interval, Duration::from_secs(20));
+                assert_eq!(spec.lang, Lang::Ja);
+            }
+            Action::Demo { .. } => panic!("expected a run"),
+        }
     }
 
     #[test]
@@ -269,7 +348,10 @@ mod tests {
             false,
             0,
             None,
-            "ghost".into()
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            CommentTrust::Collaborators,
         )
         .is_err());
         assert!(resolve(
@@ -281,7 +363,10 @@ mod tests {
             false,
             20,
             None,
-            "ghost".into()
+            "ghost".into(),
+            Lang::En,
+            None,
+            CommentTrust::Collaborators,
         )
         .is_err());
     }

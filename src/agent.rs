@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde_json::Value;
 
-use crate::shell::which;
+use crate::shell::{self, which, PromptMode};
 use crate::text::strip_ansi;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -265,6 +265,33 @@ pub fn extract_session_id(line: &str) -> Option<String> {
     None
 }
 
+pub fn event_is_error(kind: AgentKind, line: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match kind {
+        AgentKind::Claude => v.get("is_error").and_then(|b| b.as_bool()) == Some(true),
+        AgentKind::Codex => ty == "turn.failed",
+        AgentKind::Grok => {
+            ty == "error" || v.get("is_error").and_then(|b| b.as_bool()) == Some(true)
+        }
+    }
+}
+
+/// Record a review SHA or seen comments only after a finished successful turn.
+pub fn record_progress(
+    interrupted: bool,
+    exit_code: Option<i32>,
+    clean_live: bool,
+    saw_error: bool,
+) -> bool {
+    if interrupted || saw_error {
+        return false;
+    }
+    exit_code == Some(0) || (exit_code.is_none() && clean_live)
+}
+
 pub fn is_turn_end(kind: AgentKind, line: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
         return false;
@@ -438,6 +465,10 @@ pub struct AgentSession {
     pending: VecDeque<String>,
     turn_open: bool,
     exited: bool,
+    last_exit: Option<i32>,
+    clean_end: bool,
+    saw_error: bool,
+    stub: Option<PathBuf>,
 }
 
 impl AgentSession {
@@ -454,7 +485,39 @@ impl AgentSession {
             pending: VecDeque::new(),
             turn_open: false,
             exited: false,
+            last_exit: None,
+            clean_end: false,
+            saw_error: false,
+            stub: None,
         }
+    }
+
+    pub fn set_workdir(&mut self, dir: PathBuf) {
+        self.workdir = dir;
+    }
+
+    /// Test hook: run this program instead of codex/claude/grok.
+    pub fn set_stub(&mut self, program: PathBuf) {
+        self.stub = Some(program);
+    }
+
+    pub fn last_exit_code(&self) -> Option<i32> {
+        self.last_exit
+    }
+
+    pub fn clean_live(&self) -> bool {
+        self.clean_end && !self.saw_error && self.last_exit.is_none()
+    }
+
+    pub fn saw_error(&self) -> bool {
+        self.saw_error
+    }
+
+    /// Drop the saved id so the next task starts a new session.
+    pub fn forget_session(&mut self) {
+        self.kill_child(9);
+        self.session_id = None;
+        self.turn_open = false;
     }
 
     pub fn kind(&self) -> AgentKind {
@@ -485,6 +548,9 @@ impl AgentSession {
     }
 
     pub fn dispatch(&mut self, prompt: &str) -> Result<Launch> {
+        self.last_exit = None;
+        self.clean_end = false;
+        self.saw_error = false;
         let launch = plan_launch(self.kind, self.session_id.as_deref(), &new_session_id());
         if self.kind == AgentKind::Claude && self.alive() && matches!(launch, Launch::Resume { .. })
         {
@@ -524,6 +590,10 @@ impl AgentSession {
             }
             if is_turn_end(self.kind, &raw) {
                 self.turn_open = false;
+                self.clean_end = true;
+                if event_is_error(self.kind, &raw) {
+                    self.saw_error = true;
+                }
             }
             shown.extend(present_line(&raw));
         }
@@ -532,12 +602,15 @@ impl AgentSession {
 
     pub fn turn_finished(&mut self) -> bool {
         let _ = self.poll_lines();
-        if !self.turn_open {
-            return true;
-        }
         self.reap();
         if self.exited && self.readers.load(Ordering::SeqCst) == 0 && self.rx_empty() {
             self.turn_open = false;
+            return true;
+        }
+        // Claude stays up after a result event. Codex and Grok exit; their
+        // status is recorded above once the pipes drain.
+        if self.kind == AgentKind::Claude && !self.turn_open && !self.exited && self.child.is_some()
+        {
             return true;
         }
         false
@@ -577,15 +650,39 @@ impl AgentSession {
 
         let spec = command_for(self.kind, launch, &self.workdir, &prompt_file)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let mut cmd = Command::new(spec.program);
-        cmd.args(&spec.args)
-            .current_dir(&self.workdir)
+        let program = self
+            .stub
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(spec.program));
+        let mut cmd = Command::new(&program);
+        if self.stub.is_none() {
+            cmd.args(&spec.args);
+        }
+        cmd.current_dir(&self.workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GH_NO_UPDATE_NOTIFIER", "1");
+            .stderr(Stdio::piped());
+        let existing_ssh = std::env::var("GIT_SSH_COMMAND").ok();
+        for (key, value) in shell::prompt_env(
+            PromptMode::Batch,
+            shell::ssh_key().as_deref(),
+            existing_ssh.as_deref(),
+        ) {
+            cmd.env(key, value);
+        }
+        if let Some(real) = which("gh", &std::env::var("PATH").unwrap_or_default()) {
+            let bin = self.prompt_dir.join("bin");
+            if let Ok(dir) = install_gh_guard(&bin) {
+                let parent = std::env::var("PATH").unwrap_or_default();
+                let mut path = dir.display().to_string();
+                if !parent.is_empty() {
+                    path.push(':');
+                    path.push_str(&parent);
+                }
+                cmd.env("PATH", path);
+                cmd.env("GHOST_REAL_GH", real);
+            }
+        }
         unsafe {
             cmd.pre_exec(|| {
                 if setpgid(0, 0) != 0 {
@@ -600,26 +697,32 @@ impl AgentSession {
         let stdout = child.stdout.take().context("stdout")?;
         let stderr = child.stderr.take().context("stderr")?;
         let (rx, readers) = spawn_readers(stdout, stderr);
+        track_agent_pgid(child.id());
         let mut stdin = child.stdin.take().context("stdin")?;
-        match spec.delivery {
-            Delivery::StreamJson => {
-                stdin
-                    .write_all(claude_user_line(prompt).as_bytes())
-                    .context("write claude prompt")?;
-                stdin.flush().ok();
-                self.stdin = Some(stdin);
-            }
-            Delivery::StdinClose => {
-                stdin.write_all(prompt.as_bytes()).context("write prompt")?;
-                if !prompt.ends_with('\n') {
-                    stdin.write_all(b"\n").ok();
+        if self.stub.is_some() {
+            drop(stdin);
+            self.stdin = None;
+        } else {
+            match spec.delivery {
+                Delivery::StreamJson => {
+                    stdin
+                        .write_all(claude_user_line(prompt).as_bytes())
+                        .context("write claude prompt")?;
+                    stdin.flush().ok();
+                    self.stdin = Some(stdin);
                 }
-                drop(stdin);
-                self.stdin = None;
-            }
-            Delivery::PromptFile => {
-                drop(stdin);
-                self.stdin = None;
+                Delivery::StdinClose => {
+                    stdin.write_all(prompt.as_bytes()).context("write prompt")?;
+                    if !prompt.ends_with('\n') {
+                        stdin.write_all(b"\n").ok();
+                    }
+                    drop(stdin);
+                    self.stdin = None;
+                }
+                Delivery::PromptFile => {
+                    drop(stdin);
+                    self.stdin = None;
+                }
             }
         }
         self.child = Some(child);
@@ -642,14 +745,19 @@ impl AgentSession {
     }
 
     fn reap(&mut self) {
-        let done = match self.child.as_mut() {
-            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
-            None => false,
+        let code = match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => Some(status.code().unwrap_or(1)),
+                _ => None,
+            },
+            None => None,
         };
-        if done {
+        if let Some(code) = code {
+            self.last_exit = Some(code);
             self.child = None;
             self.stdin = None;
             self.exited = true;
+            clear_agent_pgid();
         }
     }
 
@@ -669,6 +777,7 @@ impl AgentSession {
         self.stdin = None;
         self.exited = true;
         self.rx = None;
+        clear_agent_pgid();
     }
 }
 
@@ -715,9 +824,108 @@ fn signal_group(pid: u32, sig: i32) {
     }
 }
 
+static AGENT_PGID: AtomicI32 = AtomicI32::new(0);
+
+pub fn track_agent_pgid(pid: u32) {
+    AGENT_PGID.store(pid as i32, Ordering::SeqCst);
+}
+
+pub fn clear_agent_pgid() {
+    AGENT_PGID.store(0, Ordering::SeqCst);
+}
+
+pub fn kill_tracked_agent() {
+    let pgid = AGENT_PGID.load(Ordering::SeqCst);
+    if pgid > 0 {
+        signal_group(pgid as u32, 15);
+    }
+}
+
+static FATAL_GUARDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn install_fatal_signals() {
+    if FATAL_GUARDS.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        signal(1, on_fatal as usize);
+        signal(15, on_fatal as usize);
+    }
+}
+
+extern "C" fn on_fatal(sig: i32) {
+    let pgid = AGENT_PGID.load(Ordering::SeqCst);
+    if pgid > 0 {
+        unsafe { kill(-pgid, 15) };
+    }
+    const SEQ: &[u8] = b"\x1b[?1049l\x1b[0m\x1b[?25h\n";
+    unsafe {
+        write(1, SEQ.as_ptr(), SEQ.len());
+        _exit(128 + sig);
+    }
+}
+
+const GH_GUARD: &str = r#"#!/bin/sh
+real="${GHOST_REAL_GH:-}"
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+  echo "ghost: real gh is not available" >&2
+  exit 127
+fi
+words=""
+expect=""
+for arg in "$@"; do
+  if [ -n "$expect" ]; then
+    if [ "$expect" = "method" ]; then
+      up=$(printf '%s' "$arg" | tr '[:lower:]' '[:upper:]')
+      if [ "$up" = "DELETE" ]; then
+        echo "ghost: refusing gh api DELETE" >&2
+        exit 99
+      fi
+    fi
+    expect=""
+    continue
+  fi
+  case "$arg" in
+    -X|--method) expect=method ;;
+    --method=DELETE|--method=delete) echo "ghost: refusing gh api DELETE" >&2; exit 99 ;;
+    -R|--repo|--hostname|--jq|--template|--cache) expect=skip ;;
+    --repo=*|--hostname=*) ;;
+    -*) ;;
+    *) words="$words $arg" ;;
+  esac
+done
+set -- $words
+a1="${1:-}"
+a2="${2:-}"
+case "$a1 $a2" in
+  "pr merge"|"repo delete"|"repo archive"|"issue delete"|"release delete")
+    echo "ghost: refusing gh $a1 $a2" >&2
+    exit 99
+    ;;
+esac
+exec "$real" "$@"
+"#;
+
+pub fn install_gh_guard(dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("gh");
+    fs::write(&path, GH_GUARD)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+    }
+    Ok(dir.to_path_buf())
+}
+
 extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
+    fn signal(sig: i32, handler: usize) -> usize;
+    fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+    fn _exit(code: i32) -> !;
 }
 
 #[cfg(test)]
@@ -835,6 +1043,13 @@ mod tests {
         assert!(grok.args.windows(2).any(|w| w == ["--resume", id]));
         assert!(!grok.args.iter().any(|a| a == "--session-id"));
         assert!(grok.args.iter().any(|a| a == "--yolo"));
+        let batch = shell::prompt_env(PromptMode::Batch, None, None);
+        assert!(batch
+            .iter()
+            .any(|(k, v)| *k == "GIT_TERMINAL_PROMPT" && v == "0"));
+        assert!(batch
+            .iter()
+            .any(|(k, v)| { *k == "GIT_SSH_COMMAND" && v.contains("BatchMode=yes") }));
 
         let grok_new = command_for(
             AgentKind::Grok,
@@ -875,5 +1090,112 @@ mod tests {
             present_line("plain agent line"),
             vec!["plain agent line".to_string()]
         );
+    }
+
+    #[test]
+    fn stub_agent_exit_1_does_not_record_and_resume_can_start_fresh() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-stub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("stub-agent");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho '{\"type\":\"turn.failed\"}'\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).unwrap();
+        }
+        let home = dir.join("home");
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut session = AgentSession::new(AgentKind::Codex, work, &home);
+        session.set_stub(stub);
+        session.seed(Some("dead-session".into()));
+        let launch = session
+            .dispatch("same context as the failed review")
+            .unwrap();
+        assert!(matches!(launch, Launch::Resume { .. }));
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "stub hung"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(session.last_exit_code(), Some(1));
+        assert!(!record_progress(
+            false,
+            session.last_exit_code(),
+            session.clean_live(),
+            session.saw_error()
+        ));
+        session.forget_session();
+        let again = session
+            .dispatch("same context as the failed review")
+            .unwrap();
+        assert!(
+            matches!(again, Launch::Start { .. }),
+            "resume failure starts a fresh session"
+        );
+        session.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gh_wrapper_refuses_merge_and_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-gh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = install_gh_guard(&dir).unwrap();
+        let real = dir.join("real-gh");
+        std::fs::write(&real, "#!/bin/sh\necho ok \"$@\"\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&real).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&real, perms).unwrap();
+        }
+        let guard = bin.join("gh");
+        let run = |args: &[&str]| {
+            std::process::Command::new(&guard)
+                .args(args)
+                .env("GHOST_REAL_GH", &real)
+                .output()
+                .unwrap()
+        };
+        let merge = run(&["pr", "merge", "2", "--squash"]);
+        assert_eq!(merge.status.code(), Some(99));
+        assert!(String::from_utf8_lossy(&merge.stderr).contains("refusing"));
+        let delete = run(&["repo", "delete", "acme/app", "--yes"]);
+        assert_eq!(delete.status.code(), Some(99));
+        let api = run(&["api", "-X", "DELETE", "repos/acme/app"]);
+        assert_eq!(api.status.code(), Some(99));
+        let view = run(&["pr", "view", "2"]);
+        assert_eq!(
+            view.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&view.stderr)
+        );
+        assert!(String::from_utf8_lossy(&view.stdout).contains("ok"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -8,16 +8,23 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
-use crate::agent::{agent_on_path, describe_launch, pick_agent, AgentKind, AgentSession};
+use crate::agent::{
+    agent_on_path, describe_launch, pick_agent, record_progress, AgentKind, AgentSession, Launch,
+};
 use crate::github::Gh;
+use crate::lang::Lang;
 use crate::preflight::{evaluate, failure_message, AuthProbe, RepoProbe};
 use crate::prompt::{self, truncate};
-use crate::shell::which;
+use crate::shell::{self, which, PromptMode};
 use crate::state::{self, GhostState, SessionSlot};
 use crate::target::GhTarget;
 use crate::text::{format_countdown, short_sha};
 use crate::tui::{self, LogKind, LogLine, Side, Status, UiCmd, UiEvent};
-use crate::watch::{decide_code, decide_review, CodeAction, MaxTurns, Note, PrSnap, ReviewAction};
+use crate::watch::{
+    actionable_notes, baseline_agent_comments, decide_code, decide_review, ensure_closing_line,
+    feedback_log, mark_viewer, CiHandled, CodeAction, CommentTrust, MaxTurns, Note, PrSnap,
+    ReviewAction,
+};
 use crate::workdir::{self, Checkout};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,9 +44,14 @@ pub struct RunSpec {
     pub agent: Option<AgentKind>,
     pub yes: bool,
     pub max_turns: u32,
+    pub lang: Lang,
+    pub ssh_key: Option<String>,
+    pub trust: CommentTrust,
 }
 
 pub fn run(spec: RunSpec) -> Result<i32> {
+    shell::set_ssh_key(spec.ssh_key.clone());
+    crate::agent::install_fatal_signals();
     if spec.mode == RunMode::Picker {
         if let Some(message) = skip_empty_picker(&spec)? {
             println!("{message}");
@@ -47,8 +59,40 @@ pub fn run(spec: RunSpec) -> Result<i32> {
         }
     }
     let header = spec.header.clone();
+    let login = match run_preflight(&spec.target.slug(), spec.lang) {
+        Ok(login) => login,
+        Err(message) => return show_fatal(header, message),
+    };
+    // Clone, fetch, and checkout on the normal terminal so ssh can ask for a
+    // key passphrase before raw mode / the alternate screen take the tty.
+    let home = workdir::ghost_home()?;
+    let path = workdir::work_path(&home, spec.target.owner(), spec.target.repo());
+    eprintln!(
+        "ghost: preparing {} (ssh may ask for a key passphrase)",
+        path.display()
+    );
+    let (main_clone, how) = workdir::prepare(&home, spec.target.owner(), spec.target.repo())?;
+    let (workdir, slot_lock) = activate_slot(&spec, &home, &main_clone)?;
+    let primed = prime_checkout(&spec, &workdir)?;
+    if !primed.is_empty() {
+        eprintln!("ghost: {primed}");
+    }
+    eprintln!("ghost: {how}");
+    let workdir_for_ui = workdir.clone();
+    let main_for_ui = main_clone.clone();
+    let home_for_ui = home.clone();
     tui::run(header, move |tx, rx| {
-        if let Err(err) = babysit(spec, tx.clone(), rx) {
+        if let Err(err) = babysit(
+            spec,
+            login,
+            home_for_ui,
+            main_for_ui,
+            workdir_for_ui,
+            slot_lock,
+            how,
+            tx.clone(),
+            rx,
+        ) {
             let message = format!("{err:#}");
             let _ = tx.send(UiEvent::Fatal(message.clone()));
             let _ = tx.send(UiEvent::Exit { code: 1, message });
@@ -56,7 +100,71 @@ pub fn run(spec: RunSpec) -> Result<i32> {
     })
 }
 
-fn babysit(spec: RunSpec, tx: Sender<UiEvent>, rx: Receiver<UiCmd>) -> Result<()> {
+fn show_fatal(header: String, message: String) -> Result<i32> {
+    tui::run(header, move |tx, rx| {
+        let _ = tx.send(UiEvent::Fatal(message.clone()));
+        wait_quit(&rx);
+        let _ = tx.send(UiEvent::Exit { code: 1, message });
+    })
+}
+
+fn prime_checkout(spec: &RunSpec, workdir: &PathBuf) -> Result<String> {
+    let slug = spec.target.slug();
+    let gh = Gh::new(slug.clone());
+    match spec.mode {
+        RunMode::Review | RunMode::Code | RunMode::Ask => {
+            let number = pull_number(&spec.target)?;
+            workdir::sync_and_checkout(workdir, &slug, Checkout::Pr(number), PromptMode::Tty)
+        }
+        RunMode::Issue => {
+            let number = issue_number(&spec.target)?;
+            let issue = gh.issue(number)?;
+            let branch = workdir::issue_branch(number, &issue.title, &issue.body);
+            if let Some(pr) = gh.find_issue_pr(number, &branch)? {
+                workdir::sync_and_checkout(workdir, &slug, Checkout::Pr(pr), PromptMode::Tty)
+            } else {
+                let base = gh.default_branch()?;
+                workdir::sync_and_checkout(
+                    workdir,
+                    &slug,
+                    Checkout::Issue { branch, base },
+                    PromptMode::Tty,
+                )
+            }
+        }
+        RunMode::Picker => Ok(String::new()),
+    }
+}
+
+fn activate_slot(
+    spec: &RunSpec,
+    home: &std::path::Path,
+    main: &std::path::Path,
+) -> Result<(PathBuf, Option<workdir::SlotLock>)> {
+    if spec.mode == RunMode::Picker {
+        return Ok((main.to_path_buf(), None));
+    }
+    let slot = match spec.mode {
+        RunMode::Issue => format!("issue-{}", issue_number(&spec.target)?),
+        _ => format!("pr-{}", pull_number(&spec.target)?),
+    };
+    let dest = workdir::slot_path(home, spec.target.owner(), spec.target.repo(), &slot);
+    let lock = workdir::lock_slot(&dest)?;
+    workdir::ensure_worktree(main, &dest)?;
+    Ok((dest, Some(lock)))
+}
+
+fn babysit(
+    spec: RunSpec,
+    login: Option<String>,
+    home: PathBuf,
+    main_clone: PathBuf,
+    workdir: PathBuf,
+    slot_lock: Option<workdir::SlotLock>,
+    how: String,
+    tx: Sender<UiEvent>,
+    rx: Receiver<UiCmd>,
+) -> Result<()> {
     let mut status = Status {
         mode: mode_name(spec.mode).into(),
         target: spec.target.display_url(),
@@ -64,16 +172,6 @@ fn babysit(spec: RunSpec, tx: Sender<UiEvent>, rx: Receiver<UiCmd>) -> Result<()
         ..Status::default()
     };
     let _ = tx.send(UiEvent::Status(status.clone()));
-
-    let login = match run_preflight(&spec.target.slug()) {
-        Ok(login) => login,
-        Err(message) => {
-            let _ = tx.send(UiEvent::Fatal(message.clone()));
-            wait_quit(&rx);
-            let _ = tx.send(UiEvent::Exit { code: 1, message });
-            return Ok(());
-        }
-    };
     log(
         &tx,
         LogKind::System,
@@ -82,9 +180,6 @@ fn babysit(spec: RunSpec, tx: Sender<UiEvent>, rx: Receiver<UiCmd>) -> Result<()
             None => "gh ok".into(),
         },
     );
-
-    let home = workdir::ghost_home()?;
-    let (workdir, how) = workdir::prepare(&home, spec.target.owner(), spec.target.repo())?;
     log(
         &tx,
         LogKind::System,
@@ -106,6 +201,9 @@ fn babysit(spec: RunSpec, tx: Sender<UiEvent>, rx: Receiver<UiCmd>) -> Result<()
         repo,
         agent: AgentSession::new(kind, workdir.clone(), &home),
         workdir,
+        main_clone,
+        slot_lock,
+        login,
         spec,
         tx,
         rx,
@@ -149,6 +247,10 @@ struct Ctx {
     owner: String,
     repo: String,
     workdir: PathBuf,
+    main_clone: PathBuf,
+    #[allow(dead_code)]
+    slot_lock: Option<workdir::SlotLock>,
+    login: Option<String>,
     agent: AgentSession,
     turns: u32,
     queued: Vec<String>,
@@ -187,7 +289,7 @@ impl Ctx {
                     return Ok(());
                 }
                 Ok(ReviewAction::Stop(reason)) => {
-                    self.stop(reason.exit_code(), reason.message(number));
+                    self.stop(reason.exit_code(), reason.message(self.spec.lang, number));
                     return Ok(());
                 }
                 Ok(ReviewAction::Idle) => self.note_idle(&snap.head_sha),
@@ -211,6 +313,7 @@ impl Ctx {
                             &self.workdir,
                             &diff,
                             &notes,
+                            self.spec.lang,
                         ),
                         None => prompt::review_initial(
                             &self.slug,
@@ -219,19 +322,25 @@ impl Ctx {
                             &self.workdir,
                             &diff,
                             &notes,
+                            self.spec.lang,
                         ),
                     };
-                    self.dispatch_task(&task)?;
+                    let ok = self.dispatch_task(&task)?;
                     if self.quit {
                         return Ok(());
                     }
-                    if !self.interrupted {
+                    if ok {
                         stored.last_reviewed_sha = Some(snap.head_sha.clone());
                         self.remember(&mut stored, SessionSlot::Review);
                         stored.save(&path)?;
                         self.log(format!(
                             "recorded reviewed SHA {}",
                             short_sha(&snap.head_sha)
+                        ));
+                    } else {
+                        self.log(self.say(
+                            "エージェントのターンが失敗したので、レビュー済み SHA は記録しません",
+                            "agent turn failed; not recording the reviewed SHA",
                         ));
                     }
                 }
@@ -251,22 +360,33 @@ impl Ctx {
         self.agent
             .seed(stored.session_for(SessionSlot::Code, self.agent.kind()));
         let mut seen: BTreeSet<String> = stored.seen_comment_ids.iter().cloned().collect();
+        let mut agent_ids: BTreeSet<String> = stored.agent_comment_ids.iter().cloned().collect();
         self.push_status();
         loop {
             if self.quit {
                 return Ok(());
             }
             let snap = match self.poll_pr(number)? {
-                Some(snap) => snap,
+                Some(mut snap) => {
+                    self.prepare_notes(&mut snap, &agent_ids);
+                    snap
+                }
                 None => return Ok(()),
             };
-            match decide_code(&snap, &seen, self.turns, self.spec.max_turns) {
+            let handled = ci_handled(&stored);
+            match decide_code(
+                &snap,
+                &seen,
+                self.turns,
+                self.spec.max_turns,
+                handled.as_ref(),
+            ) {
                 Err(MaxTurns) => {
                     self.stop(3, self.max_message());
                     return Ok(());
                 }
                 Ok(CodeAction::Stop(reason)) => {
-                    self.stop(reason.exit_code(), reason.message(number));
+                    self.stop(reason.exit_code(), reason.message(self.spec.lang, number));
                     return Ok(());
                 }
                 Ok(CodeAction::Idle) => self.note_code_idle(&snap),
@@ -291,6 +411,7 @@ impl Ctx {
                             &snap.failing_checks,
                             &new_notes,
                             &user_notes,
+                            self.spec.lang,
                         )
                     } else {
                         prompt::code_initial(
@@ -303,25 +424,49 @@ impl Ctx {
                             &snap.failing_checks,
                             &new_notes,
                             &user_notes,
+                            self.spec.lang,
                         )
                     };
-                    self.dispatch_task(&task)?;
+                    let prompted: BTreeSet<String> =
+                        new_notes.iter().map(|n| n.id.clone()).collect();
+                    let ok = self.dispatch_task(&task)?;
                     if self.quit {
                         return Ok(());
                     }
-                    if !self.interrupted {
+                    if ok {
+                        for id in &prompted {
+                            seen.insert(id.clone());
+                        }
                         if let Ok(fresh) = self.gh.pr(number) {
+                            let login = self.login();
                             for note in fresh.notes {
-                                seen.insert(note.id);
+                                let arrived_during_turn = !prompted.contains(&note.id);
+                                if arrived_during_turn && crate::watch::author_is(&note, &login) {
+                                    agent_ids.insert(note.id.clone());
+                                    seen.insert(note.id);
+                                }
                             }
                         }
-                        for note in &new_notes {
-                            seen.insert(note.id.clone());
+                        if snap.merge.checks == crate::merge::ChecksVerdict::Failed {
+                            stored.handled_ci_sha = Some(snap.head_sha.clone());
+                            stored.handled_failing_checks = snap.failing_checks.clone();
+                        } else {
+                            stored.handled_ci_sha = None;
+                            stored.handled_failing_checks.clear();
                         }
                         stored.seen_comment_ids = seen.iter().cloned().collect();
+                        stored.agent_comment_ids = agent_ids.iter().cloned().collect();
                         self.remember(&mut stored, SessionSlot::Code);
                         stored.save(&path)?;
-                        self.log("recorded the comments this session has seen");
+                        self.log(self.say(
+                            "対応したコメントだけを記録しました",
+                            "recorded the comments this turn handled",
+                        ));
+                    } else {
+                        self.log(self.say(
+                            "エージェントのターンが失敗したので、コメントも CI も処理済みにしません",
+                            "agent turn failed; not marking comments or CI as handled",
+                        ));
                     }
                 }
             }
@@ -335,21 +480,22 @@ impl Ctx {
         self.status.mode = "issue".into();
         self.status.target = format!("issue #{number}");
         self.push_status();
-        let branch = workdir::issue_branch(number);
+        let issue = self.gh.issue(number)?;
+        let branch = workdir::issue_branch(number, &issue.title, &issue.body);
         if let Some(pr) = self.gh.find_issue_pr(number, &branch)? {
             self.log(format!(
                 "found existing PR #{pr} for issue #{number}; not opening a duplicate"
             ));
+            self.baseline_new_pr(pr, false)?;
             return self.confirm_and_code(pr);
         }
-        let issue = self.gh.issue(number)?;
         let base = self.gh.default_branch()?;
         let ipath = state::issue_state_path(&self.state_root, &self.owner, &self.repo, number);
         let mut istate = GhostState::load(&ipath)?;
         self.agent
             .seed(istate.session_for(SessionSlot::Code, self.agent.kind()));
         self.checkout(Checkout::Issue {
-            number,
+            branch: branch.clone(),
             base: base.clone(),
         })?;
         if self.quit {
@@ -365,13 +511,15 @@ impl Ctx {
             &base,
             &self.workdir,
             &user_notes,
+            self.spec.lang,
         );
         if self.agent.session_id().is_some() {
             task = format!(
-                "Follow-up in this same session. Continue implementing issue #{number} on `{branch}` and make sure a pull request with `Closes #{number}` exists. Do not open a duplicate. Do not merge.\n\n{task}"
+                "{}{task}",
+                prompt::issue_resume_prefix(self.spec.lang, number, &branch)
             );
         }
-        self.dispatch_task(&task)?;
+        let _ok = self.dispatch_task(&task)?;
         if self.quit {
             return Ok(());
         }
@@ -383,10 +531,8 @@ impl Ctx {
         if self.quit {
             return Ok(());
         }
-        let ppath = state::pr_state_path(&self.state_root, &self.owner, &self.repo, pr);
-        let mut pstate = GhostState::load(&ppath)?;
-        self.remember(&mut pstate, SessionSlot::Code);
-        pstate.save(&ppath)?;
+        self.ensure_pr_closes(pr, number);
+        self.baseline_new_pr(pr, true)?;
         self.log(format!(
             "opened PR #{pr} · keeping this {} session",
             self.agent.kind()
@@ -394,8 +540,53 @@ impl Ctx {
         self.confirm_and_code(pr)
     }
 
+    /// Seen-set stays empty. Only viewer comments that predate the PR are agent ids.
+    fn baseline_new_pr(&mut self, pr: u64, created_here: bool) -> Result<()> {
+        let ppath = state::pr_state_path(&self.state_root, &self.owner, &self.repo, pr);
+        let mut pstate = GhostState::load(&ppath)?;
+        if created_here || pstate.seen_comment_ids.is_empty() {
+            let snap = self.gh.pr(pr)?;
+            self.log(feedback_log(snap.feedback));
+            let login = self.login();
+            let baseline =
+                baseline_agent_comments(&snap.notes, &login, Some(snap.created_at.as_str()));
+            pstate.seen_comment_ids.clear();
+            pstate.agent_comment_ids = baseline.into_iter().collect();
+        }
+        self.remember(&mut pstate, SessionSlot::Code);
+        pstate.save(&ppath)?;
+        Ok(())
+    }
+
+    fn ensure_pr_closes(&mut self, pr: u64, issue: u64) {
+        let body = match self.gh.pr_body(pr) {
+            Ok(body) => body,
+            Err(err) => {
+                self.log_kind(
+                    LogKind::Error,
+                    format!("could not read PR #{pr} body: {err:#}"),
+                );
+                return;
+            }
+        };
+        let next = ensure_closing_line(&body, issue);
+        if next == body {
+            return;
+        }
+        match self.gh.set_pr_body(pr, &next) {
+            Ok(()) => self.log(format!("appended `Closes #{issue}` to PR #{pr}")),
+            Err(err) => self.log_kind(
+                LogKind::Error,
+                format!("could not append `Closes #{issue}` to PR #{pr}: {err:#}"),
+            ),
+        }
+    }
+
     fn confirm_and_code(&mut self, pr: u64) -> Result<()> {
-        let message = format!("Continue as --code on PR #{pr}? [Y/n]");
+        let message = self.say(
+            &format!("PR #{pr} を --code として続けますか？ [Y/n]"),
+            &format!("Continue as --code on PR #{pr}? [Y/n]"),
+        );
         let yes = if self.spec.yes {
             self.log(format!("{message} yes (--yes)"));
             true
@@ -466,6 +657,11 @@ impl Ctx {
         let Some((kind, number, side)) = choice else {
             return Ok(());
         };
+        let slot = match kind {
+            crate::github::ItemKind::Pull => format!("pr-{number}"),
+            crate::github::ItemKind::Issue => format!("issue-{number}"),
+        };
+        self.use_slot(&slot)?;
         match (kind, side) {
             (crate::github::ItemKind::Pull, Some(Side::Review)) => self.review_loop(number),
             (crate::github::ItemKind::Pull, Some(Side::Code)) => self.code_loop(number),
@@ -487,6 +683,10 @@ impl Ctx {
                     self.status.ci = snap.ci_label.clone();
                     self.status.target = format!("PR #{number}");
                     self.push_status();
+                    self.log(feedback_log(snap.feedback));
+                    for warning in &snap.feedback_warnings {
+                        self.log_kind(LogKind::Error, warning.clone());
+                    }
                     return Ok(Some(snap));
                 }
                 Err(err) => {
@@ -506,9 +706,12 @@ impl Ctx {
 
     fn note_idle(&mut self, sha: &str) {
         if self.last_idle_sha.as_deref() != Some(sha) {
-            self.log(format!(
-                "head {} unchanged since the last review; not calling the agent",
-                short_sha(sha)
+            let short = short_sha(sha);
+            self.log(self.say(
+                &format!(
+                    "head {short} は前回レビューから変わっていません。エージェントは呼びません"
+                ),
+                &format!("head {short} unchanged since the last review; not calling the agent"),
             ));
             self.last_idle_sha = Some(sha.to_string());
         }
@@ -517,9 +720,15 @@ impl Ctx {
     fn note_code_idle(&mut self, snap: &PrSnap) {
         let key = format!("{}:{}", snap.head_sha, snap.ci_label);
         if self.last_idle_sha.as_deref() != Some(&key) {
-            self.log(format!(
-                "nothing new on PR #{} (CI {}); not calling the agent",
-                snap.number, snap.ci_label
+            self.log(self.say(
+                &format!(
+                    "PR #{} に新しい更新はありません（CI {}）。エージェントは呼びません",
+                    snap.number, snap.ci_label
+                ),
+                &format!(
+                    "nothing new on PR #{} (CI {}); not calling the agent",
+                    snap.number, snap.ci_label
+                ),
             ));
             self.last_idle_sha = Some(key);
         }
@@ -540,9 +749,11 @@ impl Ctx {
     }
 
     fn checkout(&mut self, checkout: Checkout) -> Result<()> {
-        let note = workdir::sync_and_checkout(&self.workdir, &self.slug, checkout)?;
+        // Batch mode: a later fetch must not block on a passphrase the TUI cannot show.
+        let note =
+            workdir::sync_and_checkout(&self.workdir, &self.slug, checkout, PromptMode::Batch)?;
         if !note.is_empty() {
-            self.log(note);
+            self.log(shell::with_credential_hint(&note));
         }
         Ok(())
     }
@@ -563,26 +774,64 @@ impl Ctx {
         self.gh.pr_diff(number)
     }
 
-    fn dispatch_task(&mut self, prompt: &str) -> Result<()> {
+    /// `Ok(true)` only after a completed turn with exit 0 (or a live clean end).
+    /// A failed resume is retried once as a fresh session with the same prompt.
+    fn dispatch_task(&mut self, prompt: &str) -> Result<bool> {
         if self.quit {
-            return Ok(());
+            return Ok(false);
         }
-        if self.turns >= self.spec.max_turns {
-            self.stop(3, self.max_message());
-            return Ok(());
+        let mut allow_fresh = true;
+        loop {
+            if self.turns >= self.spec.max_turns {
+                self.stop(3, self.max_message());
+                return Ok(false);
+            }
+            let launch = self.agent.dispatch(prompt)?;
+            self.turns += 1;
+            self.interrupted = false;
+            self.log(describe_launch(self.agent.kind(), &launch));
+            self.refresh_session_status();
+            self.status.phase = "running".into();
+            self.status.turns = format!("{}/{}", self.turns, self.spec.max_turns);
+            self.push_status();
+            self.wait_turn()?;
+            self.refresh_session_status();
+            self.push_status();
+            if self.quit {
+                return Ok(false);
+            }
+            let ok = record_progress(
+                self.interrupted,
+                self.agent.last_exit_code(),
+                self.agent.clean_live(),
+                self.agent.saw_error(),
+            );
+            if ok {
+                return Ok(true);
+            }
+            if self.interrupted {
+                return Ok(false);
+            }
+            if allow_fresh && matches!(launch, Launch::Resume { .. }) {
+                self.log(self.say(
+                    "resume に失敗したので、同じ文脈で新しいセッションを開始します",
+                    "resume failed; starting a fresh session with the same context",
+                ));
+                self.agent.forget_session();
+                allow_fresh = false;
+                continue;
+            }
+            let code = self
+                .agent
+                .last_exit_code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".into());
+            self.log(self.say(
+                &format!("エージェントのターンが失敗しました（exit {code}）"),
+                &format!("agent turn failed (exit {code})"),
+            ));
+            return Ok(false);
         }
-        let launch = self.agent.dispatch(prompt)?;
-        self.turns += 1;
-        self.interrupted = false;
-        self.log(describe_launch(self.agent.kind(), &launch));
-        self.refresh_session_status();
-        self.status.phase = "running".into();
-        self.status.turns = format!("{}/{}", self.turns, self.spec.max_turns);
-        self.push_status();
-        self.wait_turn()?;
-        self.refresh_session_status();
-        self.push_status();
-        Ok(())
     }
 
     fn wait_turn(&mut self) -> Result<()> {
@@ -594,6 +843,9 @@ impl Ctx {
                 for part in line.lines() {
                     if !part.trim().is_empty() {
                         self.log_kind(LogKind::Agent, truncate(part, 2_000));
+                        if let Some(hint) = shell::credential_hint(part) {
+                            self.log_kind(LogKind::Error, hint);
+                        }
                     }
                 }
             }
@@ -699,9 +951,7 @@ impl Ctx {
             return Ok(());
         }
         if self.agent.session_id().is_some() {
-            let prompt = format!(
-                "The user typed this into ghost. Stay in this same session. Use the `gh` CLI for any GitHub action. Do not merge.\n\n{text}"
-            );
+            let prompt = prompt::user_nudge(self.spec.lang, &text, false);
             self.dispatch_task(&prompt)?;
         } else {
             self.queued.push(text);
@@ -717,11 +967,8 @@ impl Ctx {
             return Ok(());
         }
         let notes = std::mem::take(&mut self.queued);
-        let prompt = format!(
-            "The user typed this into ghost while the previous turn was running. Stay in this same session. Use the `gh` CLI for any GitHub action. Do not merge.\n\n{}",
-            notes.join("\n\n")
-        );
-        self.dispatch_task(&prompt)
+        let prompt = prompt::user_nudge(self.spec.lang, &notes.join("\n\n"), true);
+        self.dispatch_task(&prompt).map(|_| ())
     }
 
     fn find_pr_after(&mut self, issue: u64, branch: &str) -> Result<Option<u64>> {
@@ -783,10 +1030,53 @@ impl Ctx {
     }
 
     fn max_message(&self) -> String {
-        format!(
-            "Hit the max of {} AI turns without the PR becoming merge-ready. Stopping so --review and --code cannot ping-pong forever. State was saved; re-run ghost to continue.",
-            self.spec.max_turns
+        let n = self.spec.max_turns;
+        self.say(
+            &format!(
+                "AI ターンが上限の {n} に達しました。PR はまだマージ可能ではありません。--review と --code が永久に往復しないよう停止します。状態は保存済みです。続けるには ghost を再実行してください。"
+            ),
+            &format!(
+                "Hit the max of {n} AI turns without the PR becoming merge-ready. Stopping so --review and --code cannot ping-pong forever. State was saved; re-run ghost to continue."
+            ),
         )
+    }
+
+    fn say(&self, ja: &str, en: &str) -> String {
+        self.spec.lang.say(ja, en)
+    }
+
+    fn login(&self) -> String {
+        self.login.clone().unwrap_or_default()
+    }
+
+    fn use_slot(&mut self, slot: &str) -> Result<()> {
+        // main_clone is ~/.ghost/work/OWNER__REPO.
+        let ghost_home = self
+            .main_clone
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow!("work directory has no home"))?;
+        let dest = workdir::slot_path(&ghost_home, &self.owner, &self.repo, slot);
+        let lock = workdir::lock_slot(&dest)?;
+        workdir::ensure_worktree(&self.main_clone, &dest)?;
+        self.workdir = dest.clone();
+        self.agent.set_workdir(dest);
+        self.slot_lock = Some(lock);
+        Ok(())
+    }
+
+    fn prepare_notes(&self, snap: &mut PrSnap, agent_ids: &BTreeSet<String>) {
+        let login = self.login();
+        mark_viewer(&mut snap.notes, &login);
+        snap.notes = actionable_notes(
+            &snap.notes,
+            self.spec.trust,
+            &login,
+            &snap.author,
+            &self.owner,
+            agent_ids,
+        );
     }
 
     fn push_status(&mut self) {
@@ -810,9 +1100,12 @@ fn log(tx: &Sender<UiEvent>, kind: LogKind, text: impl Into<String>) {
 }
 
 /// Repo-only mode with nothing open prints this and exits 0 instead of the picker.
-fn empty_repo_notice(slug: &str, empty: bool) -> Option<String> {
+fn empty_repo_notice(slug: &str, empty: bool, lang: Lang) -> Option<String> {
     if empty {
-        Some(format!("No open issues or PRs in {slug}."))
+        Some(lang.say(
+            &format!("{slug} にオープンな issue も PR もありません。"),
+            &format!("No open issues or PRs in {slug}."),
+        ))
     } else {
         None
     }
@@ -821,17 +1114,21 @@ fn empty_repo_notice(slug: &str, empty: bool) -> Option<String> {
 /// List open PRs and issues before the TUI. An empty repo skips the picker.
 /// Preflight or `gh` failures fall through so the TUI can show them.
 fn skip_empty_picker(spec: &RunSpec) -> Result<Option<String>> {
-    if run_preflight(&spec.target.slug()).is_err() {
+    if run_preflight(&spec.target.slug(), spec.lang).is_err() {
         return Ok(None);
     }
     let items = match Gh::new(spec.target.slug()).open_items() {
         Ok(items) => items,
         Err(_) => return Ok(None),
     };
-    Ok(empty_repo_notice(&spec.target.slug(), items.is_empty()))
+    Ok(empty_repo_notice(
+        &spec.target.slug(),
+        items.is_empty(),
+        spec.lang,
+    ))
 }
 
-fn run_preflight(slug: &str) -> Result<Option<String>, String> {
+fn run_preflight(slug: &str, lang: Lang) -> Result<Option<String>, String> {
     let path = std::env::var("PATH").unwrap_or_default();
     let found = which("gh", &path).is_some();
     let auth_out = if found { Gh::auth_probe().ok() } else { None };
@@ -869,7 +1166,7 @@ fn run_preflight(slug: &str) -> Result<Option<String>, String> {
     };
     match evaluate(&auth, repo.as_ref(), slug) {
         Ok(ok) => Ok(ok.login),
-        Err(kind) => Err(failure_message(&kind, &auth, repo.as_ref(), slug)),
+        Err(kind) => Err(failure_message(&kind, &auth, repo.as_ref(), slug, lang)),
     }
 }
 
@@ -914,13 +1211,23 @@ fn short_id(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::empty_repo_notice;
+    use crate::lang::Lang;
 
     #[test]
     fn empty_repo_skips_the_picker() {
         assert_eq!(
-            empty_repo_notice("OWNER/REPO", true).as_deref(),
+            empty_repo_notice("OWNER/REPO", true, Lang::En).as_deref(),
             Some("No open issues or PRs in OWNER/REPO.")
         );
-        assert!(empty_repo_notice("OWNER/REPO", false).is_none());
+        assert_eq!(
+            empty_repo_notice("OWNER/REPO", true, Lang::Ja).as_deref(),
+            Some("OWNER/REPO にオープンな issue も PR もありません。")
+        );
+        assert!(empty_repo_notice("OWNER/REPO", false, Lang::Ja).is_none());
     }
+}
+
+fn ci_handled(stored: &GhostState) -> Option<CiHandled> {
+    let sha = stored.handled_ci_sha.clone()?;
+    Some(CiHandled::new(sha, stored.handled_failing_checks.clone()))
 }

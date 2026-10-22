@@ -184,8 +184,10 @@ where
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let mut app = App::new(header);
 
+    crate::agent::install_fatal_signals();
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        crate::agent::kill_tracked_agent();
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         hook(info);

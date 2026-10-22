@@ -42,13 +42,24 @@ pub enum StopReason {
 }
 
 impl StopReason {
-    pub fn message(self, number: u64) -> String {
+    pub fn message(self, lang: crate::lang::Lang, number: u64) -> String {
         match self {
-            Self::MergeReady => format!(
-                "PR #{number} is merge-ready (CI green, approved, no outstanding changes requested, mergeable). Exiting."
+            Self::MergeReady => lang.say(
+                &format!(
+                    "PR #{number} はマージ可能です（CI 成功、approve 済み、未解決の changes requested なし、コンフリクトなし）。終了します。"
+                ),
+                &format!(
+                    "PR #{number} is merge-ready (CI green, approved, no outstanding changes requested, mergeable). Exiting."
+                ),
             ),
-            Self::Merged => format!("PR #{number} is merged. Exiting."),
-            Self::Closed => format!("PR #{number} is closed. Exiting."),
+            Self::Merged => lang.say(
+                &format!("PR #{number} はマージ済みです。終了します。"),
+                &format!("PR #{number} is merged. Exiting."),
+            ),
+            Self::Closed => lang.say(
+                &format!("PR #{number} はクローズされています。終了します。"),
+                &format!("PR #{number} is closed. Exiting."),
+            ),
         }
     }
 
@@ -229,7 +240,13 @@ fn derive_reviews(reviews: &[ReviewRef]) -> (u32, bool) {
             continue;
         }
         if let Some(slot) = latest.iter_mut().find(|r| r.author == review.author) {
-            *slot = review;
+            // A later COMMENTED review does not erase APPROVED or CHANGES_REQUESTED.
+            let comment = review.state.eq_ignore_ascii_case("COMMENTED");
+            let substantive = slot.state.eq_ignore_ascii_case("APPROVED")
+                || slot.state.eq_ignore_ascii_case("CHANGES_REQUESTED");
+            if !(comment && substantive) {
+                *slot = review;
+            }
         } else {
             latest.push(review);
         }
@@ -378,5 +395,19 @@ mod tests {
         assert_eq!(judge_reviews("APPROVED", &reviews), (1, false));
         assert_eq!(judge_reviews("CHANGES_REQUESTED", &reviews), (0, true));
         assert_eq!(judge_reviews("REVIEW_REQUIRED", &[]), (0, false));
+
+        let commented_after = vec![
+            ReviewRef {
+                author: "ada".into(),
+                state: "APPROVED".into(),
+                submitted_at: "2024-01-01T00:00:00Z".into(),
+            },
+            ReviewRef {
+                author: "ada".into(),
+                state: "COMMENTED".into(),
+                submitted_at: "2024-03-01T00:00:00Z".into(),
+            },
+        ];
+        assert_eq!(judge_reviews("", &commented_after), (1, false));
     }
 }
