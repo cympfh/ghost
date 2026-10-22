@@ -26,7 +26,20 @@ ghost github.com/OWNER/REPO/issue/N          # implement, open a PR, then contin
 ghost github.com/OWNER/REPO/issue/N --yes    # same, accepting the continue prompt
 ```
 
-`--interval` defaults to `20s` for review, code, and issue → code (`30s`, `2m`, `1h30m`, or a bare number of seconds). `--agent codex|claude|grok` overrides the default, which is the first of those on `PATH`. `--lang ja|en` defaults to `ja` (`GHOST_LANG`). `--ssh-key PATH` (`GHOST_SSH_KEY`) sets `ssh -i PATH -o IdentitiesOnly=yes` for ghost's git and the inner agent. With no key, ghost does not force an identity (it does not default to `~/.ssh/id_rsa`). `-y` / `--yes` accepts the continue prompt. `--max-iterations` (default 20) caps agent turns for this process. `--trust-comments collaborators|contributors|all` (default `collaborators`) chooses who, besides the PR author and the repo owner, may wake code mode.
+| Short | Long | Default | |
+| --- | --- | --- | --- |
+| `-r` | `--review` | | Review when the head SHA changes. Conflicts with `-c`. |
+| `-c` | `--code` | | Fix red CI and new trusted review comments. Conflicts with `-r`. |
+| `-i` | `--interval` | `20s` | Poll interval (`30s`, `2m`, `1h30m`, or a bare number of seconds). |
+| `-a` | `--agent` | first on `PATH` | `codex`, `claude`, or `grok`. |
+| `-k` | `--ssh-key` | ssh config, or `GHOST_SSH_KEY` | `ssh -i PATH -o IdentitiesOnly=yes`. No key means no forced identity (`~/.ssh/id_rsa` is not assumed). |
+| `-l` | `--lang` | `ja` (`GHOST_LANG` if the flag is omitted) | `ja` or `en`. |
+| `-y` | `--yes` | | Accept the continue prompt. |
+| `-n` | `--max-iterations` | `20` | Cap agent turns for this process. |
+| `-t` | `--trust-comments` | `collaborators` | Who, besides the PR author and repo owner, may wake code mode: `collaborators`, `contributors`, or `all`. |
+| `-d` | `--demo` | | `picker`, `review`, `code`, `confirm`, or `preflight`. |
+| `-h` | `--help` | | Help. |
+| `-V` | `--version` | | Version. |
 
 A PR URL with no flag asks review or code. `--review` / `--code` on a repo URL is an error. `--review` on an issue URL is an error. A repository with no open issues and no open PRs prints a one-line notice and exits 0 without the picker.
 
@@ -52,7 +65,9 @@ Prompts tell the agent to use `gh` for every GitHub action, to reply in the sele
 
 ## Work directory
 
-Clones live at `~/.ghost/work/OWNER__REPO` (`GHOST_HOME` overrides `~/.ghost`). ghost clones with `gh repo clone` and keeps the checkout after exit. Each PR or issue gets its own git worktree under `~/.ghost/work/OWNER__REPO.wt/` so two ghost processes on the same repo do not share a checkout, and a lock file stops a second process from using the same slot. Clone, fetch, and the first checkout happen before the TUI, on the normal terminal. If `origin` already matches, it fetches and stashes a dirty tree (`autostash`). A broken checkout is moved aside and cloned again. The agent's cwd is that worktree, not your shell's cwd.
+Clones live at `~/.ghost/work/OWNER__REPO` (`GHOST_HOME` overrides `~/.ghost`). ghost clones with `gh repo clone` and keeps the checkout after exit. The main clone stays on the default branch or detached HEAD. Pull-request branches, including an older `ghost/issue-1` left checked out there, are not checked out in the main clone: a dirty tree is stashed (`ghost: detach main clone off <branch>`), then the branch moves to a per-PR worktree under `~/.ghost/work/OWNER__REPO.wt/`. ghost fetches `origin pull/N/head` and adds that worktree with the head branch checked out. A lock file stops a second process from using the same slot. Clone, fetch, and the first checkout happen before the TUI, on the normal terminal. If `origin` already matches, it fetches and stashes a dirty tree (`autostash`). A broken checkout is moved aside and cloned again.
+
+If clone, fetch, or worktree checkout fails, ghost does not exit. The TUI logs the step in Japanese (why it ran, the command, the exit code, trimmed stderr, and the desired state) and the agent is asked to reach that state its own way with `gh` and git. The working directory is the best path that still exists: the slot worktree, the clone, or `~/.ghost/work`. ghost still stops only when `gh` is missing, `gh` is not logged in, or no coding agent is on `PATH`.
 
 ## Troubleshooting
 

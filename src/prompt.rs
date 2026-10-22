@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::lang::Lang;
+use crate::setup::SetupFailure;
 use crate::watch::Note;
 
 fn rules(lang: Lang) -> &'static str {
@@ -258,6 +259,59 @@ pub fn issue_initial(
     )
 }
 
+/// Japanese handoff. Each failed step is `{intent, command, desired_state}`
+/// plus the exit code and trimmed stderr. The agent is asked to reach the
+/// desired state its own way, then do `task`.
+pub fn render_setup_handoff(failures: &[SetupFailure], task: &str) -> String {
+    if failures.is_empty() {
+        return task.to_string();
+    }
+    let mut out = String::from(
+        "\
+作業ディレクトリの準備に失敗した。ghost はここで中断しない。
+同じコマンドを再実行しなくてよい。gh と git を使い、自分の方法で目指す状態に到達してから、下の作業に進む。
+",
+    );
+    for failure in failures {
+        out.push_str("\n目的: ");
+        out.push_str(&failure.intent);
+        out.push_str("\nコマンド: ");
+        out.push_str(&failure.command);
+        out.push_str("\n終了コード: ");
+        out.push_str(&failure.exit_code.to_string());
+        out.push_str("\n標準エラー:\n");
+        out.push_str(&failure.stderr);
+        if !failure.stderr.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("目指す状態: ");
+        out.push_str(&failure.desired_state);
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(task);
+    out
+}
+
+/// Same facts as the handoff, for the TUI log before the agent runs.
+pub fn setup_warning(failure: &SetupFailure) -> String {
+    format!(
+        "\
+準備に失敗しました。中断しません。
+目的: {intent}
+コマンド: {command}
+終了コード: {code}
+標準エラー: {stderr}
+目指す状態: {desired}
+エージェントに、自分の方法でその状態へ到達してもらいます。",
+        code = failure.exit_code,
+        intent = failure.intent,
+        command = failure.command,
+        stderr = failure.stderr,
+        desired = failure.desired_state,
+    )
+}
+
 pub fn user_nudge(lang: Lang, text: &str, during_turn: bool) -> String {
     let lead = match (lang, during_turn) {
         (Lang::Ja, false) => {
@@ -439,5 +493,45 @@ mod tests {
         let review = review_initial("acme/app", 3, "abc", dir, "diff", &[], Lang::Ja);
         assert!(review.contains("日本語"));
         assert!(review.contains("マージしない"));
+    }
+
+    #[test]
+    fn setup_handoff_states_intent_command_exit_stderr_and_desired_state() {
+        use crate::setup::{SetupFailure, SetupStep};
+
+        let failure = SetupFailure::from_step(
+            SetupStep {
+                intent: "レビュー対象の PR #2 のブランチを作業用 worktree に用意するため".into(),
+                command: "git -C /tmp/main worktree add --track -b ghost/issue-1 /tmp/wt origin/ghost/issue-1".into(),
+                desired_state:
+                    "レビュー対象の PR #2 のブランチ ghost/issue-1 を /tmp/wt で作業できる状態にしてから作業して"
+                        .into(),
+            },
+            128,
+            "fatal: 'ghost/issue-1' is already used by worktree at '/tmp/main'\n",
+        );
+        let text = render_setup_handoff(&[failure.clone()], "プルリクエストをレビューする。");
+        assert!(text.contains("レビュー対象の PR #2 のブランチを作業用 worktree に用意するため"));
+        assert!(text.contains(
+            "git -C /tmp/main worktree add --track -b ghost/issue-1 /tmp/wt origin/ghost/issue-1"
+        ));
+        assert!(text.contains("終了コード: 128"));
+        assert!(text.contains("fatal: 'ghost/issue-1' is already used by worktree at '/tmp/main'"));
+        assert!(text.contains(
+            "レビュー対象の PR #2 のブランチ ghost/issue-1 を /tmp/wt で作業できる状態にしてから作業して"
+        ));
+        assert!(text.contains("自分の方法"));
+        assert!(text.contains("目指す状態"));
+        assert!(text.contains("プルリクエストをレビューする。"));
+        assert!(text.contains("中断しない"));
+
+        let warning = setup_warning(&failure);
+        assert!(warning.contains("レビュー対象の PR #2 のブランチを作業用 worktree に用意するため"));
+        assert!(warning.contains("終了コード: 128"));
+        assert!(warning.contains("git -C /tmp/main worktree add"));
+        assert!(warning.contains("already used by worktree"));
+        assert!(warning.contains("目指す状態:"));
+        assert!(warning.contains("自分の方法"));
+        assert!(warning.contains("中断しません"));
     }
 }

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::setup::{SetupFailure, SetupStep};
 use crate::shell::{self, CmdOut, PromptMode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,37 +152,106 @@ pub fn plan_worktree(
     }
 }
 
-pub fn prepare(home: &Path, owner: &str, repo: &str) -> Result<(PathBuf, String)> {
+#[derive(Debug, Clone)]
+pub struct PrepareOutcome {
+    pub path: PathBuf,
+    pub note: String,
+    pub failures: Vec<SetupFailure>,
+}
+
+/// Clone or reuse the main checkout. Command failures are recorded and the
+/// best directory still on disk is returned. The process does not stop here.
+pub fn prepare(home: &Path, owner: &str, repo: &str) -> PrepareOutcome {
     let path = work_path(home, owner, repo);
     let exists = path.exists();
     let checkout_ok = exists && git_ok(&path);
     let origin = if checkout_ok { git_origin(&path) } else { None };
     let plan = plan_worktree(exists, checkout_ok, origin.as_deref(), owner, repo);
     let slug = format!("{owner}/{repo}");
-    match plan {
+    let mut outcome = match plan {
         WorktreePlan::Reuse => {
-            match git_net(
+            let fetch = git_step(
                 &path,
                 &["fetch".into(), "origin".into(), "--prune".into()],
                 PromptMode::Tty,
-            ) {
-                Ok(out) if out.code == 0 => Ok((path, "reused clone".into())),
-                Ok(out) if git_ok(&path) => Ok((
+                SetupStep {
+                    intent: format!("{slug} の既存クローンを origin の最新に揃えるため"),
+                    command: String::new(),
+                    desired_state: format!(
+                        "{slug} のクローン {} が origin を fetch 済みである状態にしてから作業して",
+                        path.display()
+                    ),
+                },
+            );
+            match fetch {
+                Ok(_) => PrepareOutcome {
                     path,
-                    format!("reused clone (fetch failed: {})", explain(&out)),
-                )),
-                Ok(_) | Err(_) => {
-                    let reason = "fetch failed and the checkout is unusable";
-                    reclone(&path, &slug, reason)
+                    note: "reused clone".into(),
+                    failures: Vec::new(),
+                },
+                Err(failure) if git_ok(&path) => PrepareOutcome {
+                    path,
+                    note: "reused clone (fetch failed)".into(),
+                    failures: vec![failure],
+                },
+                Err(failure) => {
+                    match reclone(&path, &slug, "fetch failed and the checkout is unusable") {
+                        Ok(ok) => ok,
+                        Err(again) => PrepareOutcome {
+                            path: best_workdir(&path, &path, home),
+                            note: "clone failed".into(),
+                            failures: vec![failure, again],
+                        },
+                    }
                 }
             }
         }
-        WorktreePlan::Clone => clone_into(&path, &slug, "cloned"),
-        WorktreePlan::Reclone { reason } => reclone(&path, &slug, &reason),
+        WorktreePlan::Clone => match clone_into(&path, &slug, "cloned") {
+            Ok(ok) => ok,
+            Err(failure) => PrepareOutcome {
+                path: best_workdir(&path, &path, home),
+                note: "clone failed".into(),
+                failures: vec![failure],
+            },
+        },
+        WorktreePlan::Reclone { reason } => match reclone(&path, &slug, &reason) {
+            Ok(ok) => ok,
+            Err(failure) => PrepareOutcome {
+                path: best_workdir(&path, &path, home),
+                note: "reclone failed".into(),
+                failures: vec![failure],
+            },
+        },
+    };
+    if git_ok(&outcome.path) {
+        if let Err(failure) = park_main_clone(&outcome.path) {
+            outcome.failures.push(failure);
+        }
     }
+    outcome
 }
 
-fn reclone(path: &Path, slug: &str, reason: &str) -> Result<(PathBuf, String)> {
+/// The main clone stays on the default branch, or detached HEAD. It does not
+/// keep a pull-request branch checked out.
+pub fn park_main_clone(path: &Path) -> Result<(), SetupFailure> {
+    let Some(branch) = current_branch(path) else {
+        return Ok(());
+    };
+    if default_branch_name(path).as_deref() == Some(branch.as_str()) {
+        return Ok(());
+    }
+    release_branch(
+        path,
+        &branch,
+        "メインのクローン",
+        &format!(
+            "メインのクローン {} をデフォルトブランチまたは detached HEAD にしてから作業して",
+            path.display()
+        ),
+    )
+}
+
+fn reclone(path: &Path, slug: &str, reason: &str) -> Result<PrepareOutcome, SetupFailure> {
     if path.exists() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -192,137 +262,262 @@ fn reclone(path: &Path, slug: &str, reason: &str) -> Result<(PathBuf, String)> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".into());
         let aside = path.with_file_name(format!("{name}.broken-{stamp}"));
-        fs::rename(path, &aside)
-            .with_context(|| format!("move broken checkout {}", path.display()))?;
+        if let Err(err) = fs::rename(path, &aside) {
+            return Err(step_failure(
+                format!("{slug} の壊れたチェックアウトを脇へ退けるため"),
+                format!("mv {} {}", path.display(), aside.display()),
+                format!(
+                    "{slug} を {} にクローンし直してから作業して",
+                    path.display()
+                ),
+                1,
+                format!("{err}"),
+            ));
+        }
     }
-    let (path, _) = clone_into(path, slug, "recloned")?;
-    Ok((path, format!("recloned ({reason})")))
+    let mut outcome = clone_into(path, slug, "recloned")?;
+    outcome.note = format!("recloned ({reason})");
+    Ok(outcome)
 }
 
-fn clone_into(path: &Path, slug: &str, verb: &str) -> Result<(PathBuf, String)> {
+fn clone_into(path: &Path, slug: &str, verb: &str) -> Result<PrepareOutcome, SetupFailure> {
+    let desired = format!(
+        "{slug} のクローンが {} にある状態にしてから作業して",
+        path.display()
+    );
+    let intent = format!("{slug} をローカルの作業ディレクトリにクローンするため");
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        if let Err(err) = fs::create_dir_all(parent) {
+            return Err(step_failure(
+                intent,
+                format!("mkdir -p {}", parent.display()),
+                desired,
+                1,
+                format!("{err}"),
+            ));
+        }
     }
     if path.exists() {
-        fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
+        if let Err(err) = fs::remove_dir_all(path) {
+            return Err(step_failure(
+                intent,
+                format!("rm -rf {}", path.display()),
+                desired,
+                1,
+                format!("{err}"),
+            ));
+        }
     }
-    let out = shell::gh_tty(
-        &[
-            "repo".into(),
-            "clone".into(),
-            slug.to_string(),
-            path.display().to_string(),
-        ],
-        None,
-        Some(slug),
-    )?;
+    let args = [
+        "repo".into(),
+        "clone".into(),
+        slug.to_string(),
+        path.display().to_string(),
+    ];
+    let command = format!(
+        "gh repo clone {slug} {}",
+        quote(&path.display().to_string())
+    );
+    let out = match shell::gh_tty(&args, None, Some(slug)) {
+        Ok(out) => out,
+        Err(err) => {
+            return Err(step_failure(
+                intent,
+                command,
+                desired,
+                1,
+                format!("{err:#}"),
+            ))
+        }
+    };
     if out.code != 0 {
-        anyhow::bail!("gh repo clone {slug} failed: {}", explain(&out));
+        let detail = if out.stderr.trim().is_empty() {
+            out.stdout
+        } else {
+            out.stderr
+        };
+        return Err(step_failure(
+            intent,
+            command,
+            desired,
+            out.code,
+            shell::with_credential_hint(&detail),
+        ));
     }
-    Ok((path.to_path_buf(), verb.to_string()))
+    Ok(PrepareOutcome {
+        path: path.to_path_buf(),
+        note: verb.into(),
+        failures: Vec::new(),
+    })
 }
 
 #[derive(Debug, Clone)]
 pub enum Checkout {
-    Pr(u64),
+    Pr { number: u64, branch: Option<String> },
     Issue { branch: String, base: String },
 }
 
-pub fn sync_and_checkout(
-    path: &Path,
-    slug: &str,
-    checkout: Checkout,
-    mode: PromptMode,
-) -> Result<String> {
-    let fetch = git_net(
-        path,
-        &["fetch".into(), "origin".into(), "--prune".into()],
-        mode,
-    )?;
-    let mut note = String::new();
-    if fetch.code != 0 {
-        let msg = format!("git fetch failed: {}", explain(&fetch));
-        if !git_ok(path) {
-            anyhow::bail!(msg);
-        }
-        // The repo is still usable. Do not sit on a hidden passphrase prompt.
-        note = msg;
-    }
-    let status = git(path, &["status".into(), "--porcelain".into()])?;
-    if status.code == 0 && !status.stdout.trim().is_empty() {
-        let stash = git(
-            path,
-            &[
-                "stash".into(),
-                "push".into(),
-                "--include-untracked".into(),
-                "-m".into(),
-                "autostash".into(),
-            ],
-        )?;
-        if stash.code != 0 {
-            anyhow::bail!(
-                "working tree is dirty and stash failed: {}",
-                one_line(&stash.stderr, &stash.stdout)
-            );
-        }
-        note = "stashed local changes".into();
-    }
-    match checkout {
-        Checkout::Pr(number) => {
-            let out = gh_net(
-                &[
-                    "pr".into(),
-                    "checkout".into(),
-                    number.to_string(),
-                    "--repo".into(),
-                    slug.to_string(),
-                ],
-                Some(path),
-                Some(slug),
-                mode,
-            )?;
-            if out.code != 0 {
-                let msg = format!("gh pr checkout {number} failed: {}", explain(&out));
-                if shell::credential_hint(&msg).is_some() && git_ok(path) {
-                    note = join_note(note, msg);
-                } else {
-                    anyhow::bail!(msg);
-                }
-            }
-        }
-        Checkout::Issue { branch, base } => {
-            let remote_ref = format!("refs/remotes/origin/{branch}");
-            let has_remote = git(
-                path,
-                &[
-                    "show-ref".into(),
-                    "--verify".into(),
-                    "--quiet".into(),
-                    remote_ref,
-                ],
-            )
-            .map(|o| o.code == 0)
-            .unwrap_or(false);
-            let start = if has_remote {
-                format!("origin/{branch}")
-            } else {
-                format!("origin/{base}")
-            };
-            let out = git(path, &["checkout".into(), "-B".into(), branch, start])?;
-            if out.code != 0 {
-                anyhow::bail!("git checkout failed: {}", explain(&out));
-            }
-        }
-    }
-    Ok(note)
+#[derive(Debug, Clone)]
+pub struct CheckoutOutcome {
+    pub workdir: PathBuf,
+    pub note: String,
+    pub failures: Vec<SetupFailure>,
 }
 
-fn join_note(note: String, extra: String) -> String {
-    if note.is_empty() {
-        extra
+/// Fetch the PR head and check that branch out in `dest`, never in `main`.
+/// A failed command becomes a [`SetupFailure`] and this returns the best
+/// directory that still exists.
+pub fn sync_and_checkout(
+    main: &Path,
+    dest: &Path,
+    _slug: &str,
+    checkout: Checkout,
+    mode: PromptMode,
+    purpose: &str,
+) -> CheckoutOutcome {
+    match checkout {
+        Checkout::Pr { number, branch } => {
+            checkout_pr(main, dest, number, branch.as_deref(), mode, purpose)
+        }
+        Checkout::Issue { branch, base } => {
+            checkout_issue(main, dest, &branch, &base, mode, purpose)
+        }
+    }
+}
+
+fn checkout_pr(
+    main: &Path,
+    dest: &Path,
+    number: u64,
+    branch: Option<&str>,
+    mode: PromptMode,
+    purpose: &str,
+) -> CheckoutOutcome {
+    let desired = end_state(purpose, branch, dest);
+    let _ = git_step(
+        main,
+        &["worktree".into(), "prune".into()],
+        PromptMode::Batch,
+        SetupStep {
+            intent: format!(
+                "{purpose} の worktree を追加する前に、壊れた worktree 登録を捨てるため"
+            ),
+            command: String::new(),
+            desired_state: desired.clone(),
+        },
+    );
+    let fetch_args = [
+        "fetch".into(),
+        "origin".into(),
+        format!("pull/{number}/head"),
+    ];
+    if let Err(failure) = git_step(
+        main,
+        &fetch_args,
+        mode,
+        SetupStep {
+            intent: format!("{purpose} の head を取得するため"),
+            command: String::new(),
+            desired_state: desired.clone(),
+        },
+    ) {
+        return finish(main, dest, Vec::new(), vec![failure]);
+    }
+    let pr_ref = format!("refs/remotes/origin/pr/{number}");
+    if let Err(failure) = git_step(
+        main,
+        &["update-ref".into(), pr_ref.clone(), "FETCH_HEAD".into()],
+        PromptMode::Batch,
+        SetupStep {
+            intent: format!("{purpose} の head を共有 ref に残すため"),
+            command: String::new(),
+            desired_state: desired.clone(),
+        },
+    ) {
+        return finish(main, dest, Vec::new(), vec![failure]);
+    }
+    if let Some(branch) = branch.filter(|b| !b.is_empty()) {
+        let spec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+        let _ = git_step(
+            main,
+            &["fetch".into(), "origin".into(), spec],
+            mode,
+            SetupStep {
+                intent: format!("{purpose} のブランチ {branch} を追跡できるようにするため"),
+                command: String::new(),
+                desired_state: desired.clone(),
+            },
+        );
+        if let Err(failure) = release_if_held(main, branch, purpose, &desired) {
+            return finish(main, dest, Vec::new(), vec![failure]);
+        }
+    }
+    match place_pr(main, dest, branch, &pr_ref, purpose, &desired) {
+        Ok(note) => finish(main, dest, note, Vec::new()),
+        Err(failure) => finish(main, dest, Vec::new(), vec![failure]),
+    }
+}
+
+fn checkout_issue(
+    main: &Path,
+    dest: &Path,
+    branch: &str,
+    base: &str,
+    mode: PromptMode,
+    purpose: &str,
+) -> CheckoutOutcome {
+    let desired = end_state(purpose, Some(branch), dest);
+    let _ = git_step(
+        main,
+        &["worktree".into(), "prune".into()],
+        PromptMode::Batch,
+        SetupStep {
+            intent: format!(
+                "{purpose} の worktree を追加する前に、壊れた worktree 登録を捨てるため"
+            ),
+            command: String::new(),
+            desired_state: desired.clone(),
+        },
+    );
+    if let Err(failure) = git_step(
+        main,
+        &["fetch".into(), "origin".into(), base.to_string()],
+        mode,
+        SetupStep {
+            intent: format!("{purpose} の base {base} を取得するため"),
+            command: String::new(),
+            desired_state: desired.clone(),
+        },
+    ) {
+        if !ref_exists(main, &format!("refs/remotes/origin/{base}")) {
+            return finish(main, dest, Vec::new(), vec![failure]);
+        }
+    }
+    let _ = git_step(
+        main,
+        &[
+            "fetch".into(),
+            "origin".into(),
+            format!("refs/heads/{branch}:refs/remotes/origin/{branch}"),
+        ],
+        mode,
+        SetupStep {
+            intent: format!("{purpose} のブランチ {branch} を追跡できるようにするため"),
+            command: String::new(),
+            desired_state: desired.clone(),
+        },
+    );
+    if let Err(failure) = release_if_held(main, branch, purpose, &desired) {
+        return finish(main, dest, Vec::new(), vec![failure]);
+    }
+    let start = if ref_exists(main, &format!("refs/remotes/origin/{branch}")) {
+        format!("origin/{branch}")
     } else {
-        format!("{note} · {extra}")
+        format!("origin/{base}")
+    };
+    match place_issue(main, dest, branch, &start, purpose, &desired) {
+        Ok(note) => finish(main, dest, note, Vec::new()),
+        Err(failure) => finish(main, dest, Vec::new(), vec![failure]),
     }
 }
 
@@ -365,22 +560,681 @@ fn git(path: &Path, args: &[String]) -> Result<CmdOut> {
     shell::git(path, args).map_err(|e| anyhow!(e))
 }
 
-fn git_net(path: &Path, args: &[String], mode: PromptMode) -> Result<CmdOut> {
-    match mode {
-        PromptMode::Tty => shell::git_tty(path, args),
-        PromptMode::Batch => shell::git(path, args),
+fn git_step(
+    dir: &Path,
+    args: &[String],
+    mode: PromptMode,
+    mut step: SetupStep,
+) -> Result<CmdOut, SetupFailure> {
+    if step.command.is_empty() {
+        step.command = git_command(dir, args);
+    }
+    let result = match mode {
+        PromptMode::Tty => shell::git_tty(dir, args),
+        PromptMode::Batch => shell::git(dir, args),
+    };
+    match result {
+        Err(err) => Err(SetupFailure::from_step(step, 1, format!("{err:#}"))),
+        Ok(out) if out.code != 0 => {
+            let detail = if out.stderr.trim().is_empty() {
+                out.stdout.clone()
+            } else {
+                out.stderr.clone()
+            };
+            Err(SetupFailure::from_step(
+                step,
+                out.code,
+                shell::with_credential_hint(&detail),
+            ))
+        }
+        Ok(out) => Ok(out),
     }
 }
 
-fn gh_net(
-    args: &[String],
-    dir: Option<&Path>,
-    repo: Option<&str>,
-    mode: PromptMode,
-) -> Result<CmdOut> {
-    match mode {
-        PromptMode::Tty => shell::gh_tty(args, dir, repo),
-        PromptMode::Batch => shell::gh(args, dir, repo),
+pub fn best_workdir(dest: &Path, main: &Path, home: &Path) -> PathBuf {
+    if git_ok(dest) {
+        return dest.to_path_buf();
+    }
+    if git_ok(main) {
+        return main.to_path_buf();
+    }
+    let work = home.join("work");
+    if work.is_dir() {
+        work
+    } else if home.is_dir() {
+        home.to_path_buf()
+    } else {
+        main.to_path_buf()
+    }
+}
+
+fn finish(
+    main: &Path,
+    dest: &Path,
+    notes: Vec<String>,
+    failures: Vec<SetupFailure>,
+) -> CheckoutOutcome {
+    let home = main
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| main.to_path_buf());
+    let workdir = if failures.is_empty() && git_ok(dest) {
+        dest.to_path_buf()
+    } else {
+        best_workdir(dest, main, &home)
+    };
+    CheckoutOutcome {
+        workdir,
+        note: notes
+            .into_iter()
+            .filter(|n| !n.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · "),
+        failures,
+    }
+}
+
+fn end_state(purpose: &str, branch: Option<&str>, dest: &Path) -> String {
+    match branch.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(branch) => format!(
+            "{purpose} のブランチ {branch} を {} で作業できる状態にしてから作業して",
+            dest.display()
+        ),
+        None => format!(
+            "{purpose} を {} で作業できる状態にしてから作業して",
+            dest.display()
+        ),
+    }
+}
+
+fn step_failure(
+    intent: impl Into<String>,
+    command: impl Into<String>,
+    desired_state: impl Into<String>,
+    exit_code: i32,
+    stderr: impl Into<String>,
+) -> SetupFailure {
+    SetupFailure::from_step(
+        SetupStep {
+            intent: intent.into(),
+            command: command.into(),
+            desired_state: desired_state.into(),
+        },
+        exit_code,
+        stderr,
+    )
+}
+
+fn release_if_held(
+    main: &Path,
+    branch: &str,
+    purpose: &str,
+    desired: &str,
+) -> Result<(), SetupFailure> {
+    let Some(holder) = holder_of(main, branch, purpose, desired)? else {
+        return Ok(());
+    };
+    if same_path(&holder, main) {
+        release_branch(main, branch, purpose, desired)?;
+    }
+    Ok(())
+}
+
+fn release_branch(
+    path: &Path,
+    branch: &str,
+    purpose: &str,
+    desired: &str,
+) -> Result<(), SetupFailure> {
+    if current_branch(path).as_deref() != Some(branch) {
+        return Ok(());
+    }
+    if dirty(path, purpose)? {
+        let msg = format!("ghost: detach main clone off {branch}");
+        git_step(
+            path,
+            &[
+                "stash".into(),
+                "push".into(),
+                "--include-untracked".into(),
+                "-m".into(),
+                msg,
+            ],
+            PromptMode::Batch,
+            SetupStep {
+                intent: format!(
+                    "{purpose} のブランチ {branch} を外す前に、未コミットの変更を退避するため"
+                ),
+                command: String::new(),
+                desired_state: desired.to_string(),
+            },
+        )?;
+    }
+    if let Some(def) = default_branch_name(path) {
+        if def != branch {
+            let switched = git_step(
+                path,
+                &["checkout".into(), def],
+                PromptMode::Batch,
+                SetupStep {
+                    intent: format!("{purpose} のブランチ {branch} をメインクローンから外すため"),
+                    command: String::new(),
+                    desired_state: desired.to_string(),
+                },
+            );
+            if switched.is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    git_step(
+        path,
+        &["checkout".into(), "--detach".into()],
+        PromptMode::Batch,
+        SetupStep {
+            intent: format!("{purpose} のブランチ {branch} をメインクローンから外すため"),
+            command: String::new(),
+            desired_state: desired.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+fn place_pr(
+    main: &Path,
+    dest: &Path,
+    branch: Option<&str>,
+    pr_ref: &str,
+    purpose: &str,
+    desired: &str,
+) -> Result<Vec<String>, SetupFailure> {
+    let Some(branch) = branch.map(str::trim).filter(|b| !b.is_empty()) else {
+        add_or_checkout(main, dest, None, pr_ref, true, purpose, desired)?;
+        return Ok(Vec::new());
+    };
+    if let Some(holder) = holder_of(main, branch, purpose, desired)? {
+        if same_path(&holder, dest) || same_slot(&holder, dest) {
+            let note = update_existing(&holder, branch, pr_ref, purpose, desired)?;
+            return Ok(note);
+        }
+        if same_path(&holder, main) {
+            release_branch(main, branch, purpose, desired)?;
+        } else {
+            return Err(step_failure(
+                format!("{purpose} のブランチを作業用 worktree に用意するため"),
+                git_command(
+                    main,
+                    &["worktree".into(), "list".into(), "--porcelain".into()],
+                ),
+                desired,
+                128,
+                format!(
+                    "fatal: '{branch}' is already used by worktree at '{}'",
+                    holder.display()
+                ),
+            ));
+        }
+    }
+    if dest.join(".git").exists() {
+        return update_existing(dest, branch, pr_ref, purpose, desired);
+    }
+    let track = ref_exists(main, &format!("refs/remotes/origin/{branch}"));
+    let start = if track {
+        format!("origin/{branch}")
+    } else {
+        pr_ref.to_string()
+    };
+    add_or_checkout(main, dest, Some(branch), &start, track, purpose, desired)?;
+    let notes = Vec::new();
+    if ref_exists(main, &format!("refs/heads/{branch}")) {
+        git_step(
+            dest,
+            &["merge".into(), "--ff-only".into(), pr_ref.to_string()],
+            PromptMode::Batch,
+            SetupStep {
+                intent: format!("{purpose} のブランチ {branch} を PR head まで進めるため"),
+                command: String::new(),
+                desired_state: desired.to_string(),
+            },
+        )?;
+    }
+    let upstream = if track {
+        format!("origin/{branch}")
+    } else {
+        let short = pr_ref.strip_prefix("refs/remotes/").unwrap_or(pr_ref);
+        short.to_string()
+    };
+    let _ = git(
+        dest,
+        &[
+            "branch".into(),
+            format!("--set-upstream-to={upstream}"),
+            branch.to_string(),
+        ],
+    );
+    Ok(notes)
+}
+
+fn place_issue(
+    main: &Path,
+    dest: &Path,
+    branch: &str,
+    start: &str,
+    purpose: &str,
+    desired: &str,
+) -> Result<Vec<String>, SetupFailure> {
+    if let Some(holder) = holder_of(main, branch, purpose, desired)? {
+        if !same_path(&holder, dest) && !same_slot(&holder, dest) {
+            if same_path(&holder, main) {
+                release_branch(main, branch, purpose, desired)?;
+            } else {
+                return Err(step_failure(
+                    format!("{purpose} の作業ブランチを worktree に用意するため"),
+                    git_command(
+                        main,
+                        &["worktree".into(), "list".into(), "--porcelain".into()],
+                    ),
+                    desired,
+                    128,
+                    format!(
+                        "fatal: '{branch}' is already used by worktree at '{}'",
+                        holder.display()
+                    ),
+                ));
+            }
+        }
+    }
+    let track = start.starts_with("origin/");
+    if dest.join(".git").exists() {
+        let mut notes = stash_dirty(dest, "autostash", purpose, desired)?;
+        git_step(
+            dest,
+            &[
+                "checkout".into(),
+                "-B".into(),
+                branch.to_string(),
+                start.to_string(),
+            ],
+            PromptMode::Batch,
+            SetupStep {
+                intent: format!("{purpose} の作業ブランチを worktree に用意するため"),
+                command: String::new(),
+                desired_state: desired.to_string(),
+            },
+        )?;
+        if !notes.is_empty() {
+            notes = vec!["stashed local changes".into()];
+        }
+        return Ok(notes);
+    }
+    add_or_checkout(main, dest, Some(branch), start, track, purpose, desired)?;
+    Ok(Vec::new())
+}
+
+fn add_or_checkout(
+    main: &Path,
+    dest: &Path,
+    branch: Option<&str>,
+    start: &str,
+    track: bool,
+    purpose: &str,
+    desired: &str,
+) -> Result<(), SetupFailure> {
+    let intent = match branch {
+        Some(_) => format!("{purpose} のブランチを作業用 worktree に用意するため"),
+        None => format!("{purpose} の head を作業用 worktree に用意するため"),
+    };
+    if dest.join(".git").exists() {
+        let args = match branch {
+            Some(branch) if ref_exists(dest, &format!("refs/heads/{branch}")) => {
+                vec!["checkout".into(), branch.to_string()]
+            }
+            Some(branch) if track => vec![
+                "checkout".into(),
+                "-b".into(),
+                branch.to_string(),
+                "--track".into(),
+                start.to_string(),
+            ],
+            Some(branch) => vec![
+                "checkout".into(),
+                "-b".into(),
+                branch.to_string(),
+                start.to_string(),
+            ],
+            None => vec!["checkout".into(), "--detach".into(), start.to_string()],
+        };
+        git_step(
+            dest,
+            &args,
+            PromptMode::Batch,
+            SetupStep {
+                intent,
+                command: String::new(),
+                desired_state: desired.to_string(),
+            },
+        )?;
+        return Ok(());
+    }
+    move_aside(dest, &intent, desired)?;
+    if let Some(parent) = dest.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            return Err(step_failure(
+                intent,
+                format!("mkdir -p {}", parent.display()),
+                desired,
+                1,
+                format!("{err}"),
+            ));
+        }
+    }
+    let dest_s = dest.display().to_string();
+    let args = match branch {
+        Some(branch) if ref_exists(main, &format!("refs/heads/{branch}")) => {
+            vec!["worktree".into(), "add".into(), dest_s, branch.to_string()]
+        }
+        Some(branch) if track => vec![
+            "worktree".into(),
+            "add".into(),
+            "--track".into(),
+            "-b".into(),
+            branch.to_string(),
+            dest_s,
+            start.to_string(),
+        ],
+        Some(branch) => vec![
+            "worktree".into(),
+            "add".into(),
+            "-b".into(),
+            branch.to_string(),
+            dest_s,
+            start.to_string(),
+        ],
+        None => vec![
+            "worktree".into(),
+            "add".into(),
+            "--detach".into(),
+            dest_s,
+            start.to_string(),
+        ],
+    };
+    git_step(
+        main,
+        &args,
+        PromptMode::Batch,
+        SetupStep {
+            intent,
+            command: String::new(),
+            desired_state: desired.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+fn update_existing(
+    dest: &Path,
+    branch: &str,
+    pr_ref: &str,
+    purpose: &str,
+    desired: &str,
+) -> Result<Vec<String>, SetupFailure> {
+    let stashed = stash_dirty(dest, "autostash", purpose, desired)?;
+    if current_branch(dest).as_deref() != Some(branch) {
+        let args = if ref_exists(dest, &format!("refs/heads/{branch}")) {
+            vec!["checkout".into(), branch.to_string()]
+        } else {
+            vec![
+                "checkout".into(),
+                "-b".into(),
+                branch.to_string(),
+                pr_ref.to_string(),
+            ]
+        };
+        git_step(
+            dest,
+            &args,
+            PromptMode::Batch,
+            SetupStep {
+                intent: format!("{purpose} のブランチを作業用 worktree に用意するため"),
+                command: String::new(),
+                desired_state: desired.to_string(),
+            },
+        )?;
+    }
+    git_step(
+        dest,
+        &["merge".into(), "--ff-only".into(), pr_ref.to_string()],
+        PromptMode::Batch,
+        SetupStep {
+            intent: format!("{purpose} のブランチ {branch} を PR head まで進めるため"),
+            command: String::new(),
+            desired_state: desired.to_string(),
+        },
+    )?;
+    Ok(stashed)
+}
+
+fn stash_dirty(
+    path: &Path,
+    message: &str,
+    purpose: &str,
+    desired: &str,
+) -> Result<Vec<String>, SetupFailure> {
+    if !dirty(path, purpose)? {
+        return Ok(Vec::new());
+    }
+    git_step(
+        path,
+        &[
+            "stash".into(),
+            "push".into(),
+            "--include-untracked".into(),
+            "-m".into(),
+            message.to_string(),
+        ],
+        PromptMode::Batch,
+        SetupStep {
+            intent: format!("{purpose} の作業ツリーに残った変更を退避するため"),
+            command: String::new(),
+            desired_state: desired.to_string(),
+        },
+    )?;
+    Ok(vec!["stashed local changes".into()])
+}
+
+fn dirty(path: &Path, purpose: &str) -> Result<bool, SetupFailure> {
+    let out = git_step(
+        path,
+        &["status".into(), "--porcelain".into()],
+        PromptMode::Batch,
+        SetupStep {
+            intent: format!("{purpose} の作業ツリーがクリーンか確認するため"),
+            command: String::new(),
+            desired_state: format!(
+                "{} の未コミット変更の有無が分かっている状態にする",
+                path.display()
+            ),
+        },
+    )?;
+    Ok(!out.stdout.trim().is_empty())
+}
+
+fn move_aside(dest: &Path, intent: &str, desired: &str) -> Result<(), SetupFailure> {
+    if !dest.exists() {
+        return Ok(());
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "wt".into());
+    let aside = dest.with_file_name(format!("{name}.broken-{stamp}"));
+    fs::rename(dest, &aside).map_err(|err| {
+        step_failure(
+            intent,
+            format!("mv {} {}", dest.display(), aside.display()),
+            desired,
+            1,
+            format!("{err}"),
+        )
+    })
+}
+
+fn holder_of(
+    main: &Path,
+    branch: &str,
+    purpose: &str,
+    desired: &str,
+) -> Result<Option<PathBuf>, SetupFailure> {
+    let out = git_step(
+        main,
+        &["worktree".into(), "list".into(), "--porcelain".into()],
+        PromptMode::Batch,
+        SetupStep {
+            intent: format!(
+                "{purpose} のブランチ {branch} がどこでチェックアウトされているか知るため"
+            ),
+            command: String::new(),
+            desired_state: desired.to_string(),
+        },
+    )?;
+    Ok(parse_worktree_porcelain(&out.stdout)
+        .into_iter()
+        .find(|entry| entry.branch.as_deref() == Some(branch))
+        .map(|entry| entry.path))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+}
+
+pub fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeEntry> {
+    let mut out = Vec::new();
+    let mut path = None;
+    let mut branch = None;
+    let mut saw = false;
+    let flush = |out: &mut Vec<WorktreeEntry>,
+                 path: &mut Option<PathBuf>,
+                 branch: &mut Option<String>,
+                 saw: &mut bool| {
+        if *saw {
+            if let Some(path) = path.take() {
+                out.push(WorktreeEntry {
+                    path,
+                    branch: branch.take(),
+                });
+            }
+        }
+        *path = None;
+        *branch = None;
+        *saw = false;
+    };
+    for line in text.lines() {
+        if line.is_empty() {
+            flush(&mut out, &mut path, &mut branch, &mut saw);
+            continue;
+        }
+        saw = true;
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(rest.trim()));
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            let rest = rest.trim();
+            branch = Some(rest.strip_prefix("refs/heads/").unwrap_or(rest).to_string());
+        } else if line == "detached" {
+            branch = None;
+        }
+    }
+    flush(&mut out, &mut path, &mut branch, &mut saw);
+    out
+}
+
+fn current_branch(path: &Path) -> Option<String> {
+    let out = git(
+        path,
+        &["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()],
+    )
+    .ok()?;
+    if out.code != 0 {
+        return None;
+    }
+    let name = out.stdout.trim();
+    if name.is_empty() || name == "HEAD" {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn default_branch_name(path: &Path) -> Option<String> {
+    let out = git(
+        path,
+        &[
+            "symbolic-ref".into(),
+            "--short".into(),
+            "refs/remotes/origin/HEAD".into(),
+        ],
+    )
+    .ok()?;
+    if out.code != 0 {
+        return None;
+    }
+    let name = out.stdout.trim();
+    let short = name.strip_prefix("origin/").unwrap_or(name);
+    if short.is_empty() {
+        None
+    } else {
+        Some(short.to_string())
+    }
+}
+
+fn ref_exists(path: &Path, refname: &str) -> bool {
+    git(
+        path,
+        &[
+            "show-ref".into(),
+            "--verify".into(),
+            "--quiet".into(),
+            refname.to_string(),
+        ],
+    )
+    .map(|out| out.code == 0)
+    .unwrap_or(false)
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    let ca = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
+    let cb = b.canonicalize().unwrap_or_else(|_| b.to_path_buf());
+    ca == cb
+}
+
+fn same_slot(holder: &Path, dest: &Path) -> bool {
+    holder.file_name() == dest.file_name()
+        && holder.parent().and_then(|p| p.file_name()) == dest.parent().and_then(|p| p.file_name())
+}
+
+fn git_command(dir: &Path, args: &[String]) -> String {
+    let mut parts = vec![
+        "git".to_string(),
+        "-C".into(),
+        quote(&dir.display().to_string()),
+    ];
+    parts.extend(args.iter().map(|arg| quote(arg)));
+    parts.join(" ")
+}
+
+fn quote(text: &str) -> String {
+    if text.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '@' | ':' | ',')
+    }) {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
     }
 }
 
@@ -594,5 +1448,201 @@ mod tests {
         drop(held);
         assert!(lock_slot(&a).is_ok());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn porcelain_keeps_slashed_branch_names() {
+        let text = "\
+worktree /tmp/main
+HEAD abc
+branch refs/heads/ghost/issue-1
+
+worktree /tmp/wt/pr-2
+HEAD def
+detached
+";
+        let entries = parse_worktree_porcelain(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].branch.as_deref(), Some("ghost/issue-1"));
+        assert_eq!(entries[0].path, PathBuf::from("/tmp/main"));
+        assert!(entries[1].branch.is_none());
+    }
+
+    #[test]
+    fn best_workdir_falls_back_to_ghost_work() {
+        let root = std::env::temp_dir().join(format!(
+            "ghost-best-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = root.join("ghost");
+        let work = home.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let dest = root.join("missing-slot");
+        let main = root.join("missing-main");
+        assert_eq!(best_workdir(&dest, &main, &home), work);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn setup_failure_is_structured_and_does_not_abort() {
+        let root = std::env::temp_dir().join(format!(
+            "ghost-setup-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let main = root.join("nope");
+        fs::create_dir_all(&main).unwrap();
+        let dest = root.join("wt").join("pr-2");
+        let outcome = sync_and_checkout(
+            &main,
+            &dest,
+            "acme/app",
+            Checkout::Pr {
+                number: 2,
+                branch: Some("ghost/issue-1".into()),
+            },
+            PromptMode::Batch,
+            "レビュー対象の PR #2",
+        );
+        assert!(
+            !outcome.failures.is_empty(),
+            "a broken setup returns failures instead of stopping"
+        );
+        let failure = &outcome.failures[0];
+        assert!(
+            failure.intent.contains("レビュー対象の PR #2"),
+            "{}",
+            failure.intent
+        );
+        assert!(failure.intent.contains("ため"), "{}", failure.intent);
+        assert!(failure.command.starts_with("git "), "{}", failure.command);
+        assert_ne!(failure.exit_code, 0);
+        assert!(!failure.stderr.trim().is_empty(), "{}", failure.stderr);
+        assert!(
+            failure.desired_state.contains("ghost/issue-1"),
+            "{}",
+            failure.desired_state
+        );
+        assert!(
+            failure.desired_state.contains("作業できる状態"),
+            "{}",
+            failure.desired_state
+        );
+        assert!(outcome.workdir.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn old_main_checkout_of_ghost_issue_branch_moves_into_the_pr_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "ghost-oldbr-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let origin = root.join("origin.git");
+        let main = root.join("main");
+        let git_at = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?} in {}", dir.display());
+        };
+        fs::create_dir_all(&origin).unwrap();
+        git_at(&origin, &["init", "--bare", "-b", "main"]);
+        git_at(&root, &["clone", origin.to_str().unwrap(), "main"]);
+        git_at(&main, &["config", "user.email", "t@example.com"]);
+        git_at(&main, &["config", "user.name", "t"]);
+        fs::write(main.join("f"), "base\n").unwrap();
+        git_at(&main, &["add", "f"]);
+        git_at(&main, &["commit", "-m", "init"]);
+        git_at(&main, &["push", "-u", "origin", "main"]);
+        git_at(&main, &["checkout", "-b", "ghost/issue-1"]);
+        fs::write(main.join("f"), "pr\n").unwrap();
+        git_at(&main, &["commit", "-am", "pr"]);
+        git_at(&main, &["push", "-u", "origin", "ghost/issue-1"]);
+        git_at(
+            &origin,
+            &["update-ref", "refs/pull/2/head", "refs/heads/ghost/issue-1"],
+        );
+        git_at(&main, &["remote", "set-head", "origin", "main"]);
+        fs::write(main.join("dirty.txt"), "local\n").unwrap();
+
+        let dest = root.join("wt").join("pr-2");
+        let outcome = sync_and_checkout(
+            &main,
+            &dest,
+            "acme/app",
+            Checkout::Pr {
+                number: 2,
+                branch: Some("ghost/issue-1".into()),
+            },
+            PromptMode::Batch,
+            "レビュー対象の PR #2",
+        );
+        assert!(
+            outcome.failures.is_empty(),
+            "{:?}",
+            outcome
+                .failures
+                .iter()
+                .map(|f| format!("{} :: {} :: {}", f.command, f.exit_code, f.stderr))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(outcome.workdir, dest);
+        assert_eq!(abbrev(&dest), "ghost/issue-1");
+        let parked = abbrev(&main);
+        assert_ne!(parked, "ghost/issue-1", "main still holds the PR branch");
+        assert!(parked == "main" || parked == "HEAD", "{parked}");
+        let stash = std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&main)
+            .output()
+            .unwrap();
+        let stash = String::from_utf8_lossy(&stash.stdout);
+        assert!(
+            stash.contains("ghost: detach main clone off ghost/issue-1"),
+            "{stash}"
+        );
+
+        let again = sync_and_checkout(
+            &main,
+            &dest,
+            "acme/app",
+            Checkout::Pr {
+                number: 2,
+                branch: Some("ghost/issue-1".into()),
+            },
+            PromptMode::Batch,
+            "レビュー対象の PR #2",
+        );
+        assert!(again.failures.is_empty(), "{:?}", again.failures);
+        assert_eq!(again.workdir, dest);
+        assert_eq!(abbrev(&dest), "ghost/issue-1");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn abbrev(path: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 }

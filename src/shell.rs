@@ -200,15 +200,10 @@ fn run_mode(
     apply_prompt_env(&mut cmd, mode);
     match mode {
         PromptMode::Tty => {
-            cmd.stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-            let status = cmd.status().with_context(|| format!("spawn {program}"))?;
-            Ok(CmdOut {
-                code: status.code().unwrap_or(1),
-                stdout: String::new(),
-                stderr: String::new(),
-            })
+            // Mirror the pipes so a passphrase prompt is still visible, and keep
+            // a copy so a failed setup step can quote stderr in the handoff.
+            cmd.stdin(Stdio::inherit());
+            capture_tee(&mut cmd).with_context(|| format!("spawn {program}"))
         }
         PromptMode::Batch => capture_child(&mut cmd, stdin_data, &format!("spawn {program}")),
     }
@@ -226,6 +221,43 @@ pub fn cmd_timeout() -> Duration {
 pub fn is_rate_limited(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("rate limit") || lower.contains("http 429") || lower.contains("secondary rate")
+}
+
+/// Read stdout and stderr while copying them to the terminal. No timeout:
+/// the first fetch may wait on an ssh passphrase.
+fn capture_tee(cmd: &mut Command) -> Result<CmdOut> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("spawn")?;
+    let stdout = child.stdout.take().context("stdout pipe")?;
+    let stderr = child.stderr.take().context("stderr pipe")?;
+    let out_handle = thread::spawn(move || tee_to(stdout, std::io::stdout()));
+    let err_handle = thread::spawn(move || tee_to(stderr, std::io::stderr()));
+    let status = child.wait().context("wait for command")?;
+    let stdout = String::from_utf8_lossy(&out_handle.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&err_handle.join().unwrap_or_default()).into_owned();
+    Ok(CmdOut {
+        code: status.code().unwrap_or(1),
+        stdout,
+        stderr,
+    })
+}
+
+fn tee_to(mut pipe: impl Read, mut mirror: impl Write) -> Vec<u8> {
+    let mut buf = [0u8; 4096];
+    let mut all = Vec::new();
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                all.extend_from_slice(&buf[..n]);
+                let _ = mirror.write_all(&buf[..n]);
+                let _ = mirror.flush();
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    all
 }
 
 fn capture_child(cmd: &mut Command, stdin_data: Option<&[u8]>, what: &str) -> Result<CmdOut> {
@@ -350,15 +382,8 @@ fn gh_mode(
     }
     match mode {
         PromptMode::Tty => {
-            cmd.stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-            let status = cmd.status().context("run gh")?;
-            Ok(CmdOut {
-                code: status.code().unwrap_or(1),
-                stdout: String::new(),
-                stderr: String::new(),
-            })
+            cmd.stdin(Stdio::inherit());
+            capture_tee(&mut cmd).context("run gh")
         }
         PromptMode::Batch => capture_child(&mut cmd, None, "run gh"),
     }

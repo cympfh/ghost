@@ -26,7 +26,20 @@ ghost github.com/OWNER/REPO/issue/N          # 実装して PR を開き、--cod
 ghost github.com/OWNER/REPO/issue/N --yes    # 続行の確認を自動で受け入れる
 ```
 
-`--interval` のデフォルトは review、code、issue → code のすべてで `20s` です（`30s`、`2m`、`1h30m`、または単位なしの秒数）。`--agent codex|claude|grok` は、デフォルト（`PATH` 上で codex → claude → grok の順で最初に見つかったもの）を上書きします。`--lang ja|en` のデフォルトは `ja`（`GHOST_LANG`）です。`--ssh-key PATH`（`GHOST_SSH_KEY`）は ghost の git と内側のエージェントに `ssh -i PATH -o IdentitiesOnly=yes` を設定します。鍵を指定しない場合、ghost は identity を強制しません（`~/.ssh/id_rsa` をデフォルトにしません）。`-y` / `--yes` は続行プロンプトを受け入れます。`--max-iterations`（デフォルト 20）はこのプロセスのエージェントターンの上限です。`--trust-comments collaborators|contributors|all`（デフォルト `collaborators`）は、PR 作者とリポジトリオーナー以外に、だれのコメントが code モードを起こすかを選びます。
+| 短縮 | 長い形 | デフォルト | |
+| --- | --- | --- | --- |
+| `-r` | `--review` | | head SHA が変わったらレビュー。`-c` と同時には付けられない。 |
+| `-c` | `--code` | | 赤い CI と、信頼できる新しいレビューコメントを直す。`-r` と同時には付けられない。 |
+| `-i` | `--interval` | `20s` | poll 間隔（`30s`、`2m`、`1h30m`、または単位なしの秒数）。 |
+| `-a` | `--agent` | `PATH` 上の最初 | `codex`、`claude`、`grok`。 |
+| `-k` | `--ssh-key` | ssh の設定、または `GHOST_SSH_KEY` | `ssh -i PATH -o IdentitiesOnly=yes`。鍵を省略すると identity を強制しない（`~/.ssh/id_rsa` は仮定しない）。 |
+| `-l` | `--lang` | `ja`（フラグが無いとき `GHOST_LANG`） | `ja` または `en`。 |
+| `-y` | `--yes` | | 続行の確認を受け入れる。 |
+| `-n` | `--max-iterations` | `20` | このプロセスのエージェントターンの上限。 |
+| `-t` | `--trust-comments` | `collaborators` | PR 作者とリポジトリオーナー以外に、だれが code モードを起こすか。`collaborators`、`contributors`、`all`。 |
+| `-d` | `--demo` | | `picker`、`review`、`code`、`confirm`、`preflight`。 |
+| `-h` | `--help` | | ヘルプ。 |
+| `-V` | `--version` | | バージョン。 |
 
 フラグなしの PR URL は review か code かを尋ねます。リポジトリ URL に `--review` / `--code` を付けるのはエラーです。issue URL に `--review` を付けるのもエラーです。オープンな issue も PR も無いリポジトリは一行だけ出して終了コード 0 で終わり、ピッカーには入りません。
 
@@ -52,7 +65,9 @@ PR がマージ可能、マージ済み、またはクローズになるとエ�
 
 ## 作業ディレクトリ
 
-クローンは `~/.ghost/work/OWNER__REPO` です（`GHOST_HOME` が `~/.ghost` を上書きします）。ghost は `gh repo clone` でクローンし、終了後も残します。PR または issue ごとに `~/.ghost/work/OWNER__REPO.wt/` 配下の git worktree を使うので、同じリポジトリに対する二つの ghost プロセスがチェックアウトを共有しません。ロックファイルが、同じスロットの二重使用を止めます。クローン、fetch、最初のチェックアウトは TUI の前に、通常の端末で行います。`origin` が一致する既存のクローンは fetch し、汚れたツリーは `autostash` で stash します。壊れたチェックアウトは脇へ退けてクローンし直します。エージェントの cwd はその worktree であり、シェルの cwd ではありません。
+クローンは `~/.ghost/work/OWNER__REPO` です（`GHOST_HOME` が `~/.ghost` を上書きします）。ghost は `gh repo clone` でクローンし、終了後も残します。メインのクローンはデフォルトブランチか detached HEAD のままです。PR のブランチはそこではチェックアウトしません。古い版が残した `ghost/issue-1` のようなブランチも、汚れていれば stash して（`ghost: detach main clone off <branch>`）から外します。ブランチは `~/.ghost/work/OWNER__REPO.wt/` 配下の PR ごとの worktree に移します。`git fetch origin pull/N/head` のあと、その head ブランチを worktree に追加します。ロックファイルが、同じスロットの二重使用を止めます。クローン、fetch、最初のチェックアウトは TUI の前に、通常の端末で行います。`origin` が一致する既存のクローンは fetch し、汚れたツリーは `autostash` で stash します。壊れたチェックアウトは脇へ退けてクローンし直します。
+
+クローン、fetch、worktree のチェックアウトが失敗しても ghost は終了しません。TUI に、その手順の目的、実行したコマンド、終了コード、切り詰めた標準エラー、目指す状態を日本語で出し、エージェントに gh と git で自分の方法でその状態へ到達するよう頼みます。作業ディレクトリは、まだ使えるいちばん近いパスです（スロットの worktree、クローン、または `~/.ghost/work`）。終了するのは、`gh` が無い、`gh` が未ログイン、またはコーディングエージェントが `PATH` に無いときだけです。
 
 ## トラブルシューティング
 

@@ -13,8 +13,9 @@ use crate::agent::{
 };
 use crate::github::Gh;
 use crate::lang::Lang;
-use crate::preflight::{evaluate, failure_message, AuthProbe, RepoProbe};
+use crate::preflight::{evaluate, failure_message, is_fatal, AuthProbe, RepoProbe};
 use crate::prompt::{self, truncate};
+use crate::setup::{SetupFailure, SetupStep};
 use crate::shell::{self, which, PromptMode};
 use crate::state::{self, GhostState, SessionSlot};
 use crate::target::GhTarget;
@@ -59,9 +60,15 @@ pub fn run(spec: RunSpec) -> Result<i32> {
         }
     }
     let header = spec.header.clone();
-    let login = match run_preflight(&spec.target.slug(), spec.lang) {
-        Ok(login) => login,
-        Err(message) => return show_fatal(header, message),
+    let mut failures = Vec::new();
+    let login = match classify_startup(&spec.target.slug(), spec.lang) {
+        Startup::Fatal(message) => return show_fatal(header, message),
+        Startup::Continue { login, failure } => {
+            if let Some(failure) = failure {
+                failures.push(failure);
+            }
+            login
+        }
     };
     // Clone, fetch, and checkout on the normal terminal so ssh can ask for a
     // key passphrase before raw mode / the alternate screen take the tty.
@@ -71,16 +78,40 @@ pub fn run(spec: RunSpec) -> Result<i32> {
         "ghost: preparing {} (ssh may ask for a key passphrase)",
         path.display()
     );
-    let (main_clone, how) = workdir::prepare(&home, spec.target.owner(), spec.target.repo())?;
-    let (workdir, slot_lock) = activate_slot(&spec, &home, &main_clone)?;
-    let primed = prime_checkout(&spec, &workdir)?;
-    if !primed.is_empty() {
-        eprintln!("ghost: {primed}");
+    let prepared = workdir::prepare(&home, spec.target.owner(), spec.target.repo());
+    if !prepared.note.is_empty() {
+        eprintln!("ghost: {}", prepared.note);
     }
-    eprintln!("ghost: {how}");
+    for failure in &prepared.failures {
+        eprintln!("ghost: {}", prompt::setup_warning(failure));
+    }
+    failures.extend(prepared.failures);
+    let main_clone = prepared.path;
+    let slot = activate_slot(&spec, &home, &main_clone);
+    for failure in &slot.failures {
+        eprintln!("ghost: {}", prompt::setup_warning(failure));
+    }
+    failures.extend(slot.failures);
+    let mut workdir = slot.workdir;
+    let slot_dir = slot.intended;
+    if spec.mode != RunMode::Picker && slot.lock.is_some() {
+        let primed = prime_checkout(&spec, &main_clone, &slot_dir);
+        if !primed.note.is_empty() {
+            eprintln!("ghost: {}", primed.note);
+        }
+        for failure in &primed.failures {
+            eprintln!("ghost: {}", prompt::setup_warning(failure));
+        }
+        failures.extend(primed.failures);
+        workdir = primed.workdir;
+    }
+    let how = prepared.note;
     let workdir_for_ui = workdir.clone();
     let main_for_ui = main_clone.clone();
     let home_for_ui = home.clone();
+    let slot_for_ui = slot_dir.clone();
+    let failures_for_ui = failures;
+    let slot_lock = slot.lock;
     tui::run(header, move |tx, rx| {
         if let Err(err) = babysit(
             spec,
@@ -88,8 +119,10 @@ pub fn run(spec: RunSpec) -> Result<i32> {
             home_for_ui,
             main_for_ui,
             workdir_for_ui,
+            slot_for_ui,
             slot_lock,
             how,
+            failures_for_ui,
             tx.clone(),
             rx,
         ) {
@@ -108,50 +141,253 @@ fn show_fatal(header: String, message: String) -> Result<i32> {
     })
 }
 
-fn prime_checkout(spec: &RunSpec, workdir: &PathBuf) -> Result<String> {
+fn prime_checkout(
+    spec: &RunSpec,
+    main: &std::path::Path,
+    dest: &std::path::Path,
+) -> workdir::CheckoutOutcome {
     let slug = spec.target.slug();
     let gh = Gh::new(slug.clone());
     match spec.mode {
         RunMode::Review | RunMode::Code | RunMode::Ask => {
-            let number = pull_number(&spec.target)?;
-            workdir::sync_and_checkout(workdir, &slug, Checkout::Pr(number), PromptMode::Tty)
-        }
-        RunMode::Issue => {
-            let number = issue_number(&spec.target)?;
-            let issue = gh.issue(number)?;
-            let branch = workdir::issue_branch(number, &issue.title, &issue.body);
-            if let Some(pr) = gh.find_issue_pr(number, &branch)? {
-                workdir::sync_and_checkout(workdir, &slug, Checkout::Pr(pr), PromptMode::Tty)
-            } else {
-                let base = gh.default_branch()?;
-                workdir::sync_and_checkout(
-                    workdir,
+            let number = match pull_number(&spec.target) {
+                Ok(number) => number,
+                Err(err) => {
+                    return failed_checkout(
+                        main,
+                        dest,
+                        plain_failure(
+                            "対象がプルリクエストか確認するため",
+                            "parse pull request url",
+                            "PR 番号が分かっている状態にしてから作業して",
+                            &err,
+                        ),
+                    )
+                }
+            };
+            let purpose = pr_purpose(spec.mode, number);
+            match gh.head_branch(number, &purpose) {
+                Ok(branch) => workdir::sync_and_checkout(
+                    main,
+                    dest,
                     &slug,
-                    Checkout::Issue { branch, base },
+                    Checkout::Pr {
+                        number,
+                        branch: Some(branch),
+                    },
                     PromptMode::Tty,
-                )
+                    &purpose,
+                ),
+                Err(failure) => {
+                    let mut outcome = workdir::sync_and_checkout(
+                        main,
+                        dest,
+                        &slug,
+                        Checkout::Pr {
+                            number,
+                            branch: None,
+                        },
+                        PromptMode::Tty,
+                        &purpose,
+                    );
+                    outcome.failures.insert(0, failure);
+                    outcome
+                }
             }
         }
-        RunMode::Picker => Ok(String::new()),
+        RunMode::Issue => prime_issue(&gh, &slug, spec, main, dest),
+        RunMode::Picker => workdir::CheckoutOutcome {
+            workdir: dest.to_path_buf(),
+            note: String::new(),
+            failures: Vec::new(),
+        },
     }
 }
 
-fn activate_slot(
+fn prime_issue(
+    gh: &Gh,
+    slug: &str,
     spec: &RunSpec,
-    home: &std::path::Path,
     main: &std::path::Path,
-) -> Result<(PathBuf, Option<workdir::SlotLock>)> {
+    dest: &std::path::Path,
+) -> workdir::CheckoutOutcome {
+    let number = match issue_number(&spec.target) {
+        Ok(number) => number,
+        Err(err) => {
+            return failed_checkout(
+                main,
+                dest,
+                plain_failure(
+                    "対象が issue か確認するため",
+                    "parse issue url",
+                    "issue 番号が分かっている状態にしてから作業して",
+                    &err,
+                ),
+            )
+        }
+    };
+    let purpose = format!("issue #{number}");
+    let issue = match gh.issue(number) {
+        Ok(issue) => issue,
+        Err(err) => {
+            return failed_checkout(
+                main,
+                dest,
+                gh_failure(
+                    format!("{purpose} の内容を読むため"),
+                    format!("gh issue view {number} --repo {slug} --json number,title,body,state"),
+                    format!("{purpose} のタイトルと本文が分かっている状態にしてから作業して"),
+                    &err,
+                ),
+            );
+        }
+    };
+    let branch = workdir::issue_branch(number, &issue.title, &issue.body);
+    match gh.find_issue_pr(number, &branch) {
+        Ok(Some(pr)) => {
+            let purpose = pr_purpose(RunMode::Issue, pr);
+            match gh.head_branch(pr, &purpose) {
+                Ok(head) => workdir::sync_and_checkout(
+                    main,
+                    dest,
+                    slug,
+                    Checkout::Pr {
+                        number: pr,
+                        branch: Some(head),
+                    },
+                    PromptMode::Tty,
+                    &purpose,
+                ),
+                Err(failure) => {
+                    let mut outcome = workdir::sync_and_checkout(
+                        main,
+                        dest,
+                        slug,
+                        Checkout::Pr {
+                            number: pr,
+                            branch: None,
+                        },
+                        PromptMode::Tty,
+                        &purpose,
+                    );
+                    outcome.failures.insert(0, failure);
+                    outcome
+                }
+            }
+        }
+        Ok(None) => {
+            let mut extra = Vec::new();
+            let base = match gh.default_branch() {
+                Ok(base) => base,
+                Err(err) => {
+                    extra.push(gh_failure(
+                        format!("{purpose} のデフォルトブランチを知るため"),
+                        format!("gh repo view {slug} --json defaultBranchRef"),
+                        format!("{purpose} の base ブランチが分かっている状態にしてから作業して"),
+                        &err,
+                    ));
+                    "main".into()
+                }
+            };
+            let mut outcome = workdir::sync_and_checkout(
+                main,
+                dest,
+                slug,
+                Checkout::Issue { branch, base },
+                PromptMode::Tty,
+                &purpose,
+            );
+            for failure in extra.into_iter().rev() {
+                outcome.failures.insert(0, failure);
+            }
+            outcome
+        }
+        Err(err) => failed_checkout(
+            main,
+            dest,
+            gh_failure(
+                format!("{purpose} の既存プルリクエストを探すため"),
+                format!("gh pr list --repo {slug} --head {branch}"),
+                format!("{purpose} の既存 PR があるかどうか分かっている状態にしてから作業して"),
+                &err,
+            ),
+        ),
+    }
+}
+
+struct SlotPrep {
+    intended: PathBuf,
+    workdir: PathBuf,
+    lock: Option<workdir::SlotLock>,
+    failures: Vec<SetupFailure>,
+}
+
+fn activate_slot(spec: &RunSpec, home: &std::path::Path, main: &std::path::Path) -> SlotPrep {
     if spec.mode == RunMode::Picker {
-        return Ok((main.to_path_buf(), None));
+        return SlotPrep {
+            intended: main.to_path_buf(),
+            workdir: main.to_path_buf(),
+            lock: None,
+            failures: Vec::new(),
+        };
     }
     let slot = match spec.mode {
-        RunMode::Issue => format!("issue-{}", issue_number(&spec.target)?),
-        _ => format!("pr-{}", pull_number(&spec.target)?),
+        RunMode::Issue => match issue_number(&spec.target) {
+            Ok(number) => format!("issue-{number}"),
+            Err(err) => {
+                return SlotPrep {
+                    intended: main.to_path_buf(),
+                    workdir: main.to_path_buf(),
+                    lock: None,
+                    failures: vec![plain_failure(
+                        "対象の番号を読むため",
+                        "parse issue url",
+                        "issue 番号が分かっている状態にしてから作業して",
+                        &err,
+                    )],
+                };
+            }
+        },
+        _ => match pull_number(&spec.target) {
+            Ok(number) => format!("pr-{number}"),
+            Err(err) => {
+                return SlotPrep {
+                    intended: main.to_path_buf(),
+                    workdir: main.to_path_buf(),
+                    lock: None,
+                    failures: vec![plain_failure(
+                        "対象の番号を読むため",
+                        "parse pull request url",
+                        "PR 番号が分かっている状態にしてから作業して",
+                        &err,
+                    )],
+                };
+            }
+        },
     };
     let dest = workdir::slot_path(home, spec.target.owner(), spec.target.repo(), &slot);
-    let lock = workdir::lock_slot(&dest)?;
-    workdir::ensure_worktree(main, &dest)?;
-    Ok((dest, Some(lock)))
+    match workdir::lock_slot(&dest) {
+        Ok(lock) => SlotPrep {
+            workdir: workdir::best_workdir(&dest, main, home),
+            intended: dest,
+            lock: Some(lock),
+            failures: Vec::new(),
+        },
+        Err(err) => SlotPrep {
+            intended: main.to_path_buf(),
+            workdir: main.to_path_buf(),
+            lock: None,
+            failures: vec![plain_failure(
+                format!("{slot} の作業ディレクトリを排他で使うため"),
+                format!("flock {}", dest.display()),
+                format!(
+                    "{} をこのプロセスだけで使える状態にしてから作業して",
+                    dest.display()
+                ),
+                &err,
+            )],
+        },
+    }
 }
 
 fn babysit(
@@ -160,8 +396,10 @@ fn babysit(
     home: PathBuf,
     main_clone: PathBuf,
     workdir: PathBuf,
+    slot_dir: PathBuf,
     slot_lock: Option<workdir::SlotLock>,
     how: String,
+    setup_failures: Vec<SetupFailure>,
     tx: Sender<UiEvent>,
     rx: Receiver<UiCmd>,
 ) -> Result<()> {
@@ -185,6 +423,9 @@ fn babysit(
         LogKind::System,
         format!("workdir {} ({how})", workdir.display()),
     );
+    for failure in &setup_failures {
+        log(&tx, LogKind::Error, prompt::setup_warning(failure));
+    }
 
     let kind = pick_agent(spec.agent, agent_on_path).map_err(|e| anyhow!(e))?;
     status.agent = kind.to_string();
@@ -201,8 +442,11 @@ fn babysit(
         repo,
         agent: AgentSession::new(kind, workdir.clone(), &home),
         workdir,
+        slot_dir,
         main_clone,
         slot_lock,
+        setup_failures,
+        setup_handed: false,
         login,
         spec,
         tx,
@@ -247,7 +491,10 @@ struct Ctx {
     owner: String,
     repo: String,
     workdir: PathBuf,
+    slot_dir: PathBuf,
     main_clone: PathBuf,
+    setup_failures: Vec<SetupFailure>,
+    setup_handed: bool,
     #[allow(dead_code)]
     slot_lock: Option<workdir::SlotLock>,
     login: Option<String>,
@@ -292,9 +539,19 @@ impl Ctx {
                     self.stop(reason.exit_code(), reason.message(self.spec.lang, number));
                     return Ok(());
                 }
-                Ok(ReviewAction::Idle) => self.note_idle(&snap.head_sha),
+                Ok(ReviewAction::Idle) => {
+                    if !self.delegate_setup()? {
+                        self.note_idle(&snap.head_sha);
+                    }
+                }
                 Ok(ReviewAction::Review { .. }) => {
-                    self.checkout(Checkout::Pr(number))?;
+                    self.checkout(
+                        Checkout::Pr {
+                            number,
+                            branch: Some(snap.head_branch.clone()),
+                        },
+                        &pr_purpose(RunMode::Review, number),
+                    );
                     if self.quit {
                         return Ok(());
                     }
@@ -304,7 +561,7 @@ impl Ctx {
                         &snap.head_sha,
                     )?;
                     let notes = std::mem::take(&mut self.queued);
-                    let task = match self.agent.session_id() {
+                    let task = self.decorate(match self.agent.session_id() {
                         Some(_) => prompt::review_followup(
                             &self.slug,
                             number,
@@ -324,8 +581,9 @@ impl Ctx {
                             &notes,
                             self.spec.lang,
                         ),
-                    };
+                    });
                     let ok = self.dispatch_task(&task)?;
+                    self.note_setup_result(ok);
                     if self.quit {
                         return Ok(());
                     }
@@ -389,18 +647,28 @@ impl Ctx {
                     self.stop(reason.exit_code(), reason.message(self.spec.lang, number));
                     return Ok(());
                 }
-                Ok(CodeAction::Idle) => self.note_code_idle(&snap),
+                Ok(CodeAction::Idle) => {
+                    if !self.delegate_setup()? {
+                        self.note_code_idle(&snap);
+                    }
+                }
                 Ok(CodeAction::Fix {
                     ci_failed,
                     new_notes,
                 }) => {
                     self.announce_fix(ci_failed, &snap, &new_notes);
-                    self.checkout(Checkout::Pr(number))?;
+                    self.checkout(
+                        Checkout::Pr {
+                            number,
+                            branch: Some(snap.head_branch.clone()),
+                        },
+                        &pr_purpose(RunMode::Code, number),
+                    );
                     if self.quit {
                         return Ok(());
                     }
                     let user_notes = std::mem::take(&mut self.queued);
-                    let task = if self.agent.session_id().is_some() {
+                    let task = self.decorate(if self.agent.session_id().is_some() {
                         prompt::code_followup(
                             &self.slug,
                             number,
@@ -426,10 +694,11 @@ impl Ctx {
                             &user_notes,
                             self.spec.lang,
                         )
-                    };
+                    });
                     let prompted: BTreeSet<String> =
                         new_notes.iter().map(|n| n.id.clone()).collect();
                     let ok = self.dispatch_task(&task)?;
+                    self.note_setup_result(ok);
                     if self.quit {
                         return Ok(());
                     }
@@ -480,24 +749,71 @@ impl Ctx {
         self.status.mode = "issue".into();
         self.status.target = format!("issue #{number}");
         self.push_status();
-        let issue = self.gh.issue(number)?;
+        let issue = match self.gh.issue(number) {
+            Ok(issue) => issue,
+            Err(err) => {
+                self.push_setup_failure(gh_failure(
+                    format!("issue #{number} の内容を読むため"),
+                    format!(
+                        "gh issue view {number} --repo {} --json number,title,body,state",
+                        self.slug
+                    ),
+                    format!("issue #{number} のタイトルと本文が分かっている状態にしてから作業して"),
+                    &err,
+                ));
+                crate::github::IssueDetails {
+                    number,
+                    title: String::new(),
+                    body: String::new(),
+                    state: String::new(),
+                }
+            }
+        };
         let branch = workdir::issue_branch(number, &issue.title, &issue.body);
-        if let Some(pr) = self.gh.find_issue_pr(number, &branch)? {
+        let existing = match self.gh.find_issue_pr(number, &branch) {
+            Ok(pr) => pr,
+            Err(err) => {
+                self.push_setup_failure(gh_failure(
+                    format!("issue #{number} の既存プルリクエストを探すため"),
+                    format!("gh pr list --repo {} --head {branch}", self.slug),
+                    format!(
+                        "issue #{number} の既存 PR があるかどうか分かっている状態にしてから作業して"
+                    ),
+                    &err,
+                ));
+                None
+            }
+        };
+        if let Some(pr) = existing {
             self.log(format!(
                 "found existing PR #{pr} for issue #{number}; not opening a duplicate"
             ));
             self.baseline_new_pr(pr, false)?;
             return self.confirm_and_code(pr);
         }
-        let base = self.gh.default_branch()?;
+        let base = match self.gh.default_branch() {
+            Ok(base) => base,
+            Err(err) => {
+                self.push_setup_failure(gh_failure(
+                    format!("issue #{number} のデフォルトブランチを知るため"),
+                    format!("gh repo view {} --json defaultBranchRef", self.slug),
+                    format!("issue #{number} の base ブランチが分かっている状態にしてから作業して"),
+                    &err,
+                ));
+                "main".into()
+            }
+        };
         let ipath = state::issue_state_path(&self.state_root, &self.owner, &self.repo, number);
         let mut istate = GhostState::load(&ipath)?;
         self.agent
             .seed(istate.session_for(SessionSlot::Code, self.agent.kind()));
-        self.checkout(Checkout::Issue {
-            branch: branch.clone(),
-            base: base.clone(),
-        })?;
+        self.checkout(
+            Checkout::Issue {
+                branch: branch.clone(),
+                base: base.clone(),
+            },
+            &format!("issue #{number}"),
+        );
         if self.quit {
             return Ok(());
         }
@@ -519,7 +835,9 @@ impl Ctx {
                 prompt::issue_resume_prefix(self.spec.lang, number, &branch)
             );
         }
-        let _ok = self.dispatch_task(&task)?;
+        let task = self.decorate(task);
+        let ok = self.dispatch_task(&task)?;
+        self.note_setup_result(ok);
         if self.quit {
             return Ok(());
         }
@@ -661,7 +979,7 @@ impl Ctx {
             crate::github::ItemKind::Pull => format!("pr-{number}"),
             crate::github::ItemKind::Issue => format!("issue-{number}"),
         };
-        self.use_slot(&slot)?;
+        self.use_slot(&slot);
         match (kind, side) {
             (crate::github::ItemKind::Pull, Some(Side::Review)) => self.review_loop(number),
             (crate::github::ItemKind::Pull, Some(Side::Code)) => self.code_loop(number),
@@ -748,14 +1066,82 @@ impl Ctx {
         }
     }
 
-    fn checkout(&mut self, checkout: Checkout) -> Result<()> {
-        // Batch mode: a later fetch must not block on a passphrase the TUI cannot show.
-        let note =
-            workdir::sync_and_checkout(&self.workdir, &self.slug, checkout, PromptMode::Batch)?;
-        if !note.is_empty() {
-            self.log(shell::with_credential_hint(&note));
+    fn checkout(&mut self, checkout: Checkout, purpose: &str) {
+        if self.slot_dir == self.main_clone {
+            self.push_setup_failure(plain_failure(
+                format!("{purpose} のブランチを作業用 worktree に用意するため"),
+                format!("flock {}", self.slot_dir.display()),
+                format!(
+                    "{purpose} を {} で作業できる状態にしてから作業して",
+                    self.slot_dir.display()
+                ),
+                &anyhow!("the per-PR worktree lock is not held, so ghost will not check the branch out in the main clone"),
+            ));
+            return;
         }
-        Ok(())
+        let outcome = workdir::sync_and_checkout(
+            &self.main_clone,
+            &self.slot_dir,
+            &self.slug,
+            checkout,
+            PromptMode::Batch,
+            purpose,
+        );
+        self.apply_checkout(outcome);
+    }
+
+    fn apply_checkout(&mut self, outcome: workdir::CheckoutOutcome) {
+        if !outcome.note.is_empty() {
+            self.log(outcome.note);
+        }
+        self.workdir = outcome.workdir.clone();
+        self.agent.set_workdir(outcome.workdir);
+        for failure in outcome.failures {
+            self.push_setup_failure(failure);
+        }
+    }
+
+    fn decorate(&mut self, task: String) -> String {
+        if self.setup_failures.is_empty() {
+            return task;
+        }
+        self.setup_handed = true;
+        prompt::render_setup_handoff(&self.setup_failures, &task)
+    }
+
+    /// One agent turn for a setup failure when the poll itself has nothing to do.
+    /// Returns true when that turn was started.
+    fn delegate_setup(&mut self) -> Result<bool> {
+        if self.setup_failures.is_empty() || self.setup_handed {
+            return Ok(false);
+        }
+        let task = self.decorate(
+            "目指す状態に到達したら、このターンはそこで終えてよい。到達できない理由があれば報告する。"
+                .into(),
+        );
+        let ok = self.dispatch_task(&task)?;
+        self.note_setup_result(ok);
+        Ok(true)
+    }
+
+    fn note_setup_result(&mut self, ok: bool) {
+        if ok {
+            self.setup_failures.clear();
+            self.setup_handed = false;
+        }
+    }
+
+    fn push_setup_failure(&mut self, failure: SetupFailure) {
+        if self.setup_failures.iter().any(|have| {
+            have.command == failure.command
+                && have.exit_code == failure.exit_code
+                && have.stderr == failure.stderr
+        }) {
+            return;
+        }
+        self.log_kind(LogKind::Error, prompt::setup_warning(&failure));
+        self.setup_failures.push(failure);
+        self.setup_handed = false;
     }
 
     fn load_diff(&mut self, number: u64, last: Option<&str>, head: &str) -> Result<String> {
@@ -951,8 +1337,9 @@ impl Ctx {
             return Ok(());
         }
         if self.agent.session_id().is_some() {
-            let prompt = prompt::user_nudge(self.spec.lang, &text, false);
-            self.dispatch_task(&prompt)?;
+            let prompt = self.decorate(prompt::user_nudge(self.spec.lang, &text, false));
+            let ok = self.dispatch_task(&prompt)?;
+            self.note_setup_result(ok);
         } else {
             self.queued.push(text);
             self.log("queued for the first task");
@@ -967,8 +1354,14 @@ impl Ctx {
             return Ok(());
         }
         let notes = std::mem::take(&mut self.queued);
-        let prompt = prompt::user_nudge(self.spec.lang, &notes.join("\n\n"), true);
-        self.dispatch_task(&prompt).map(|_| ())
+        let prompt = self.decorate(prompt::user_nudge(
+            self.spec.lang,
+            &notes.join("\n\n"),
+            true,
+        ));
+        let ok = self.dispatch_task(&prompt)?;
+        self.note_setup_result(ok);
+        Ok(())
     }
 
     fn find_pr_after(&mut self, issue: u64, branch: &str) -> Result<Option<u64>> {
@@ -1049,21 +1442,42 @@ impl Ctx {
         self.login.clone().unwrap_or_default()
     }
 
-    fn use_slot(&mut self, slot: &str) -> Result<()> {
-        // main_clone is ~/.ghost/work/OWNER__REPO.
-        let ghost_home = self
+    fn use_slot(&mut self, slot: &str) {
+        let Some(ghost_home) = self
             .main_clone
             .parent()
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf())
-            .ok_or_else(|| anyhow!("work directory has no home"))?;
+        else {
+            self.push_setup_failure(plain_failure(
+                format!("{slot} の作業ディレクトリを決めるため"),
+                "resolve ghost home",
+                format!("{slot} の worktree パスが分かっている状態にしてから作業して"),
+                &anyhow!("work directory has no home"),
+            ));
+            return;
+        };
         let dest = workdir::slot_path(&ghost_home, &self.owner, &self.repo, slot);
-        let lock = workdir::lock_slot(&dest)?;
-        workdir::ensure_worktree(&self.main_clone, &dest)?;
-        self.workdir = dest.clone();
-        self.agent.set_workdir(dest);
-        self.slot_lock = Some(lock);
-        Ok(())
+        match workdir::lock_slot(&dest) {
+            Ok(lock) => {
+                self.slot_lock = Some(lock);
+                self.slot_dir = dest.clone();
+                let actual = workdir::best_workdir(&dest, &self.main_clone, &ghost_home);
+                self.workdir = actual.clone();
+                self.agent.set_workdir(actual);
+            }
+            Err(err) => {
+                self.push_setup_failure(plain_failure(
+                    format!("{slot} の作業ディレクトリを排他で使うため"),
+                    format!("flock {}", dest.display()),
+                    format!(
+                        "{} をこのプロセスだけで使える状態にしてから作業して",
+                        dest.display()
+                    ),
+                    &err,
+                ));
+            }
+        }
     }
 
     fn prepare_notes(&self, snap: &mut PrSnap, agent_ids: &BTreeSet<String>) {
@@ -1114,7 +1528,10 @@ fn empty_repo_notice(slug: &str, empty: bool, lang: Lang) -> Option<String> {
 /// List open PRs and issues before the TUI. An empty repo skips the picker.
 /// Preflight or `gh` failures fall through so the TUI can show them.
 fn skip_empty_picker(spec: &RunSpec) -> Result<Option<String>> {
-    if run_preflight(&spec.target.slug(), spec.lang).is_err() {
+    if !matches!(
+        classify_startup(&spec.target.slug(), spec.lang),
+        Startup::Continue { failure: None, .. }
+    ) {
         return Ok(None);
     }
     let items = match Gh::new(spec.target.slug()).open_items() {
@@ -1128,7 +1545,15 @@ fn skip_empty_picker(spec: &RunSpec) -> Result<Option<String>> {
     ))
 }
 
-fn run_preflight(slug: &str, lang: Lang) -> Result<Option<String>, String> {
+enum Startup {
+    Fatal(String),
+    Continue {
+        login: Option<String>,
+        failure: Option<SetupFailure>,
+    },
+}
+
+fn classify_startup(slug: &str, lang: Lang) -> Startup {
     let path = std::env::var("PATH").unwrap_or_default();
     let found = which("gh", &path).is_some();
     let auth_out = if found { Gh::auth_probe().ok() } else { None };
@@ -1165,8 +1590,90 @@ fn run_preflight(slug: &str, lang: Lang) -> Result<Option<String>, String> {
         None
     };
     match evaluate(&auth, repo.as_ref(), slug) {
-        Ok(ok) => Ok(ok.login),
-        Err(kind) => Err(failure_message(&kind, &auth, repo.as_ref(), slug, lang)),
+        Ok(ok) => Startup::Continue {
+            login: ok.login,
+            failure: None,
+        },
+        Err(kind) if is_fatal(&kind) => {
+            Startup::Fatal(failure_message(&kind, &auth, repo.as_ref(), slug, lang))
+        }
+        Err(_) => {
+            let probe = repo.unwrap_or(RepoProbe {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "repository probe was not run".into(),
+            });
+            let detail = if probe.stderr.trim().is_empty() {
+                probe.stdout
+            } else {
+                probe.stderr
+            };
+            Startup::Continue {
+                login: crate::preflight::parse_login(&format!("{}\n{}", auth.stdout, auth.stderr)),
+                failure: Some(SetupFailure::from_step(
+                    SetupStep {
+                        intent: format!("{slug} にアクセスできるか確認するため"),
+                        command: format!("gh repo view {slug} --json nameWithOwner"),
+                        desired_state: format!("{slug} を gh で読める状態にしてから作業して"),
+                    },
+                    probe.exit_code,
+                    detail,
+                )),
+            }
+        }
+    }
+}
+
+fn pr_purpose(mode: RunMode, number: u64) -> String {
+    match mode {
+        RunMode::Review => format!("レビュー対象の PR #{number}"),
+        RunMode::Code => format!("修正対象の PR #{number}"),
+        RunMode::Issue => format!("issue から続く PR #{number}"),
+        RunMode::Ask => format!("対象の PR #{number}"),
+        RunMode::Picker => format!("選択された PR #{number}"),
+    }
+}
+
+fn gh_failure(
+    intent: impl Into<String>,
+    command: impl Into<String>,
+    desired: impl Into<String>,
+    err: &anyhow::Error,
+) -> SetupFailure {
+    SetupFailure::from_step(
+        SetupStep {
+            intent: intent.into(),
+            command: command.into(),
+            desired_state: desired.into(),
+        },
+        1,
+        format!("{err:#}"),
+    )
+}
+
+fn plain_failure(
+    intent: impl Into<String>,
+    command: impl Into<String>,
+    desired: impl Into<String>,
+    err: &anyhow::Error,
+) -> SetupFailure {
+    gh_failure(intent, command, desired, err)
+}
+
+fn failed_checkout(
+    main: &std::path::Path,
+    dest: &std::path::Path,
+    failure: SetupFailure,
+) -> workdir::CheckoutOutcome {
+    let home = main
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| main.to_path_buf());
+    workdir::CheckoutOutcome {
+        workdir: workdir::best_workdir(dest, main, &home),
+        note: String::new(),
+        failures: vec![failure],
     }
 }
 

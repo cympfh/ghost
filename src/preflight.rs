@@ -26,6 +26,15 @@ pub struct PreflightOk {
     pub login: Option<String>,
 }
 
+/// gh missing and a missing login stop the process. A repo probe failure does not:
+/// ghost hands that step to the agent.
+pub fn is_fatal(kind: &PreflightFailure) -> bool {
+    matches!(
+        kind,
+        PreflightFailure::GhMissing | PreflightFailure::NotAuthenticated
+    )
+}
+
 pub fn evaluate(
     auth: &AuthProbe,
     repo: Option<&RepoProbe>,
@@ -197,6 +206,13 @@ mod tests {
         assert!(msg.contains("gh auth login"));
         assert!(msg.contains("gh repo view a/b"));
         assert!(msg.contains("Could not resolve"));
+    }
+
+    #[test]
+    fn only_missing_gh_and_auth_are_fatal() {
+        assert!(is_fatal(&PreflightFailure::GhMissing));
+        assert!(is_fatal(&PreflightFailure::NotAuthenticated));
+        assert!(!is_fatal(&PreflightFailure::RepoInaccessible));
     }
 
     #[test]

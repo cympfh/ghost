@@ -5,6 +5,7 @@ use crate::merge::{
     ci_badge, ci_word, judge_checks, judge_reviews, parse_life, parse_mergeable, review_badge,
     MergeInput, ReviewRef,
 };
+use crate::setup::{SetupFailure, SetupStep};
 use crate::shell::{self, CmdOut};
 use crate::watch::{Note, PrCandidate, PrSnap};
 
@@ -178,6 +179,59 @@ impl Gh {
         ])?;
         ensure_ok("gh issue view", &out)?;
         parse_issue(&out.stdout).map_err(|e| anyhow!(e))
+    }
+
+    /// Head branch name for a pull request. Failure is a setup step, not a panic.
+    pub fn head_branch(&self, number: u64, purpose: &str) -> Result<String, SetupFailure> {
+        let command = format!(
+            "gh pr view {number} --repo {} --json headRefName",
+            self.slug
+        );
+        let step = SetupStep {
+            intent: format!("{purpose} のブランチ名を知るため"),
+            command,
+            desired_state: format!(
+                "{purpose} の head ブランチ名が分かっている状態にしてから作業して"
+            ),
+        };
+        let out = match self.call(vec![
+            "pr".into(),
+            "view".into(),
+            number.to_string(),
+            "--repo".into(),
+            self.slug.clone(),
+            "--json".into(),
+            "headRefName".into(),
+        ]) {
+            Ok(out) => out,
+            Err(err) => return Err(SetupFailure::from_step(step, 1, format!("{err:#}"))),
+        };
+        if out.code != 0 {
+            let detail = if out.stderr.trim().is_empty() {
+                out.stdout
+            } else {
+                out.stderr
+            };
+            return Err(SetupFailure::from_step(step, out.code, detail));
+        }
+        let v: Value = match serde_json::from_str(&out.stdout) {
+            Ok(v) => v,
+            Err(err) => {
+                return Err(SetupFailure::from_step(
+                    step,
+                    1,
+                    format!("bad json: {err}\n{}", out.stdout),
+                ))
+            }
+        };
+        match v
+            .get("headRefName")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            Some(name) => Ok(name.to_string()),
+            None => Err(SetupFailure::from_step(step, 1, "headRefName was empty")),
+        }
     }
 
     pub fn default_branch(&self) -> Result<String> {

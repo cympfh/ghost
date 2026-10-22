@@ -13,6 +13,7 @@ pub mod lang;
 pub mod merge;
 pub mod preflight;
 pub mod prompt;
+pub mod setup;
 pub mod shell;
 pub mod state;
 pub mod target;

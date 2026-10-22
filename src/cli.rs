@@ -19,35 +19,36 @@ use crate::watch::CommentTrust;
     after_help = "\
 Examples:
   ghost github.com/owner/repo
-  ghost github.com/owner/repo/pr/3 --review
-  ghost github.com/owner/repo/pr/3 --code --interval 20s
-  ghost github.com/owner/repo/issue/7 --yes --lang ja
-  ghost --demo review
+  ghost github.com/owner/repo/pr/3 -r
+  ghost github.com/owner/repo/pr/3 -c -i 20s
+  ghost github.com/owner/repo/issue/7 -y -l ja
+  ghost -d review
 
 GitHub access is only through the `gh` CLI. One agent session is started for the
 run; later updates resume it (claude --resume, codex exec resume, grok --resume).
-The default poll interval is 20s. `--lang` defaults to ja. `--ssh-key` selects an
-ssh identity (or set GHOST_SSH_KEY). Nothing new on a poll means no agent call."
+The default poll interval is 20s (`-i`). `-l` / `--lang` defaults to ja.
+`-k` / `--ssh-key` selects an ssh identity (or set GHOST_SSH_KEY).
+`-h` prints help and `-V` prints the version. Nothing new on a poll means no agent call."
 )]
 struct Cli {
     /// github.com/OWNER/REPO, .../pr/N, or .../issue/N
     target: Option<String>,
 
     /// Review the pull request when its head SHA changes.
-    #[arg(long, conflicts_with = "code")]
+    #[arg(long, short = 'r', conflicts_with = "code")]
     review: bool,
 
     /// Update the pull request when CI fails or new review comments appear.
-    #[arg(long, conflicts_with = "review")]
+    #[arg(long, short = 'c', conflicts_with = "review")]
     code: bool,
 
     /// How often to poll `gh`. Default 20s. First check is immediate.
     /// Examples: 20s, 30s, 2m, 1h30m, or a bare number of seconds.
-    #[arg(long, default_value = "20s")]
+    #[arg(long, short = 'i', default_value = "20s")]
     interval: String,
 
     /// Coding agent. Default: first of codex, claude, grok on PATH.
-    #[arg(long, value_enum)]
+    #[arg(long, short = 'a', value_enum)]
     agent: Option<AgentKind>,
 
     /// Accept the issue-mode prompt to continue as --code.
@@ -55,24 +56,24 @@ struct Cli {
     yes: bool,
 
     /// Stop after this many agent turns so --review and --code cannot ping-pong forever.
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, short = 'n', default_value_t = 20)]
     max_iterations: u32,
 
     /// Draw a scripted screen (picker, review, code, confirm, preflight).
-    #[arg(long, value_enum)]
+    #[arg(long, short = 'd', value_enum)]
     demo: Option<DemoScene>,
 
     /// Language for prompts and user-facing text. Default: ja.
-    #[arg(long, value_enum, default_value_t = Lang::Ja)]
+    #[arg(long, short = 'l', value_enum, default_value_t = Lang::Ja)]
     lang: Lang,
 
     /// SSH private key for git and the inner agent. Default: ssh config and agent.
     /// `GHOST_SSH_KEY` is used when this flag is omitted.
-    #[arg(long)]
+    #[arg(long, short = 'k')]
     ssh_key: Option<String>,
 
     /// Which comment authors may wake --code, besides the PR author and repo owner.
-    #[arg(long, value_enum, default_value_t = CommentTrust::Collaborators)]
+    #[arg(long, short = 't', value_enum, default_value_t = CommentTrust::Collaborators)]
     trust_comments: CommentTrust,
 }
 
@@ -205,9 +206,7 @@ fn demo_header(scene: DemoScene) -> String {
 }
 
 fn lang_from_env(flag: Lang) -> Lang {
-    let explicit = std::env::args()
-        .skip(1)
-        .any(|arg| arg == "--lang" || arg.starts_with("--lang="));
+    let explicit = std::env::args().skip(1).any(|arg| arg_sets_lang(&arg));
     if explicit {
         return flag;
     }
@@ -216,6 +215,13 @@ fn lang_from_env(flag: Lang) -> Lang {
         Some("ja") => Lang::Ja,
         _ => flag,
     }
+}
+
+fn arg_sets_lang(arg: &str) -> bool {
+    arg == "--lang"
+        || arg.starts_with("--lang=")
+        || arg == "-l"
+        || (arg.starts_with("-l") && !arg.starts_with("--"))
 }
 
 fn invocation() -> String {
@@ -238,6 +244,7 @@ fn _duration_hint(d: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     fn go(args: &[&str]) -> Result<Action, String> {
         // Skip argv0-style; resolve is what we test.
@@ -263,6 +270,67 @@ mod tests {
             None,
             CommentTrust::Collaborators,
         )
+    }
+
+    #[test]
+    fn short_flags_parse_and_command_is_consistent() {
+        let mut cmd = Cli::command();
+        cmd.clone().debug_assert();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        for needle in [
+            "-r, --review",
+            "-c, --code",
+            "-i, --interval",
+            "-a, --agent",
+            "-k, --ssh-key",
+            "-l, --lang",
+            "-y, --yes",
+            "-n, --max-iterations",
+            "-t, --trust-comments",
+            "-d, --demo",
+            "-h, --help",
+            "-V, --version",
+        ] {
+            assert!(help.contains(needle), "help missing {needle}\n{help}");
+        }
+
+        let cli = Cli::try_parse_from([
+            "ghost",
+            "github.com/a/b/pr/3",
+            "-c",
+            "-i",
+            "30s",
+            "-a",
+            "claude",
+            "-k",
+            "/keys/id_ed25519",
+            "-l",
+            "en",
+            "-y",
+            "-n",
+            "4",
+            "-t",
+            "all",
+        ])
+        .unwrap();
+        assert!(cli.code);
+        assert!(!cli.review);
+        assert_eq!(cli.interval, "30s");
+        assert_eq!(cli.agent, Some(AgentKind::Claude));
+        assert_eq!(cli.ssh_key.as_deref(), Some("/keys/id_ed25519"));
+        assert_eq!(cli.lang, Lang::En);
+        assert!(cli.yes);
+        assert_eq!(cli.max_iterations, 4);
+        assert_eq!(cli.trust_comments, CommentTrust::All);
+
+        let review = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "-r"]).unwrap();
+        assert!(review.review);
+        assert!(!review.code);
+        let demo = Cli::try_parse_from(["ghost", "-d", "picker"]).unwrap();
+        assert_eq!(demo.demo, Some(DemoScene::Picker));
+        assert!(Cli::try_parse_from(["ghost", "github.com/a/b/pr/3", "-r", "-c"]).is_err());
     }
 
     #[test]
