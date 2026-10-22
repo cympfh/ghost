@@ -36,7 +36,7 @@ ghost github.com/OWNER/REPO/issue/N --yes    # 続行の確認を自動で受け
 | `-l` | `--lang` | `ja`（フラグが無いとき `GHOST_LANG`） | `ja` または `en`。 |
 | `-y` | `--yes` | | issue から `--code` への続行と、レビュー終了の確認を受け入れる。マージはしない。 |
 | | `--merge-yes` | | `--code` または issue モードで、マージ可能なら再確認のあと merge する。短縮形はない。 |
-| | `--merge-method` | リポジトリの既定 | `merge`、`squash`、`rebase`。`gh pr merge` に渡す。 |
+| | `--merge-method` | `squash` | `merge`、`squash`、`rebase`。`gh pr merge` には `--merge`、`--squash`、`--rebase` のいずれか一つを必ず渡す。 |
 | `-n` | `--max-iterations` | `20` | このプロセスのエージェントターンの上限。 |
 | `-t` | `--trust-comments` | `all` | PR 作者とリポジトリオーナー以外に、だれが code モードを起こすか。デフォルトは全員（人間、Copilot、その他の bot、外部の人）。`collaborators` または `contributors` で絞れる。 |
 | `-d` | `--demo` | | `picker`、`review`、`code`、`confirm`、`preflight`。 |
@@ -55,7 +55,7 @@ ghost は `gh` だけで poll します。各 poll は `gh api` で取ったレ�
 
 レビューはマージしません。レビューのターンが `GHOST_VERDICT: approve` で終わるか、その行が無く `LGTM / 承認相当` を含む自己レビューのコメントがあるとき、`PR #N は問題なしと判断しました。終了しますか？ [y/c]` と尋ねます。`y`、Enter、Esc、Ctrl-C は終了です。`c` は監視を続け、新しいコミットで再レビューし、次の approve でまた尋ねます。TTY でないときと `-y` は `y` です。`request_changes` と `comment` は poll を続けます。自分の PR で GitHub が approve を拒否するときは、エージェントが `gh pr review --comment` で `LGTM / 承認相当` を投稿し、最後の行は `GHOST_VERDICT: approve` のままにします。
 
-code モードで、ghost 自身の `gh` 再確認がマージ可能なら、`PR #N を merge しますか？ [y/n/c]` と尋ねます。`y` は head SHA が変わっておらず、まだマージ可能であることを再確認してから、ghost 自身が `gh pr merge` を実行します（エージェントの `gh` ラッパーはこの経路にありません）。`n`、Enter、Esc、Ctrl-C はマージせず終了です。`c` はセッションを残し、poll 間隔のあと、次にマージ可能になったらまた尋ねます。`--merge-yes` は `y` と答え、ログに `--merge-yes` で merge したと出します。`-y` はマージしません。TTY でないときは `--merge-yes` が無い限りマージしません。`--merge-yes` は `--review`、ピッカー、`--code` の無い PR URL ではエラーです。エージェントの `PATH` の先頭の `gh` は、誤って `gh pr merge` や `gh repo delete`、`gh api` の DELETE、`mergePullRequest` のような merge エンドポイントを叩いたときのための事故防止です。セキュリティ境界ではありません。デフォルトブランチへの `git push`、`gh` の alias、絶対パスの `/usr/bin/gh`、別の API の形は通ります。本当に止めたいときは、merge 権限の無いトークンを使ってください。
+code モードで、ghost 自身の `gh` 再確認がマージ可能なら、`PR #N を merge しますか？ [y/n/c]` と尋ねます。`y` は head SHA が変わっておらず、まだマージ可能であることを再確認してから、ghost 自身が `gh pr merge` を実行します（エージェントの `gh` ラッパーはこの経路にありません）。コマンドには方法フラグを必ず一つ付けます。既定は `--squash` です。`--merge-method merge`、`squash`、`rebase` で上書きします。再確認した head SHA は `--match-head-commit` に渡し、選んだ方法をログに出します（`merge 方法: --squash`）。`n`、Enter、Esc、Ctrl-C はマージせず終了です。`c` はセッションを残し、poll 間隔のあと、次にマージ可能になったらまた尋ねます。`--merge-yes` は `y` と答え、ログに `--merge-yes` で merge したと出します。`-y` はマージしません。TTY でないときは `--merge-yes` が無い限りマージしません。`--merge-yes` は `--review`、ピッカー、`--code` の無い PR URL ではエラーです。エージェントの `PATH` の先頭の `gh` は、誤って `gh pr merge` や `gh repo delete`、`gh api` の DELETE、`mergePullRequest` のような merge エンドポイントを叩いたときのための事故防止です。セキュリティ境界ではありません。デフォルトブランチへの `git push`、`gh` の alias、絶対パスの `/usr/bin/gh`、別の API の形は通ります。本当に止めたいときは、merge 権限の無いトークンを使ってください。
 
 ![同じセッションの code モード](docs/screenshots/code.png)
 

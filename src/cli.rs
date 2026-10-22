@@ -64,7 +64,7 @@ struct Cli {
     #[arg(long)]
     merge_yes: bool,
 
-    /// `gh pr merge` method. Default is the repository setting.
+    /// `gh pr merge` method. Default is squash (`--squash`).
     #[arg(long, value_enum)]
     merge_method: Option<MergeMethod>,
 

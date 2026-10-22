@@ -1085,7 +1085,15 @@ impl Ctx {
             ));
             return Ok(false);
         }
-        match self.gh.merge_pr(number, self.spec.merge_method.as_deref()) {
+        let method = crate::github::merge_method_flag(self.spec.merge_method.as_deref());
+        self.log(self.say(
+            &format!("merge 方法: {method}"),
+            &format!("merge method: {method}"),
+        ));
+        match self
+            .gh
+            .merge_pr(number, self.spec.merge_method.as_deref(), &fresh.head_sha)
+        {
             Ok(()) => {
                 let message = if self.spec.merge_yes {
                     self.say(

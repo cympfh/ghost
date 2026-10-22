@@ -120,17 +120,9 @@ impl Gh {
     }
 
     /// Real `gh pr merge`. Callers use this from ghost, not from the agent wrapper.
-    pub fn merge_pr(&self, number: u64, method: Option<&str>) -> Result<()> {
-        let mut args = vec![
-            "pr".into(),
-            "merge".into(),
-            number.to_string(),
-            "--repo".into(),
-            self.slug.clone(),
-        ];
-        if let Some(method) = method {
-            args.push(method.to_string());
-        }
+    /// Always passes one method flag and `--match-head-commit`.
+    pub fn merge_pr(&self, number: u64, method: Option<&str>, head_sha: &str) -> Result<()> {
+        let args = merge_args(&self.slug, number, method, head_sha);
         let out = self.call(args)?;
         ensure_ok("gh pr merge", &out)?;
         Ok(())
@@ -419,6 +411,31 @@ struct FeedbackLoad {
 
 const PR_FIELDS: &str = "number,title,state,isDraft,headRefOid,headRefName,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,reviews,comments,body,author,createdAt";
 const PR_CANDIDATE_FIELDS: &str = "number,state,headRefName,body,closingIssuesReferences,title";
+
+/// `gh pr merge` refuses to run non-interactively without a method flag.
+/// Missing or unknown input is `--squash`. `--merge-method` supplies the override.
+pub fn merge_method_flag(method: Option<&str>) -> &'static str {
+    match method.unwrap_or("").trim() {
+        "--merge" | "merge" => "--merge",
+        "--rebase" | "rebase" => "--rebase",
+        "--squash" | "squash" | "" => "--squash",
+        _ => "--squash",
+    }
+}
+
+/// Argv for `gh pr merge`. Exactly one of `--merge`, `--squash`, `--rebase`.
+pub fn merge_args(slug: &str, number: u64, method: Option<&str>, head_sha: &str) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "merge".into(),
+        number.to_string(),
+        "--repo".into(),
+        slug.to_string(),
+        merge_method_flag(method).into(),
+        "--match-head-commit".into(),
+        head_sha.to_string(),
+    ]
+}
 
 fn ensure_ok(what: &str, out: &CmdOut) -> Result<()> {
     if out.code == 0 {
@@ -1060,5 +1077,45 @@ mod tests {
         let issues = parse_issue_list(issues).unwrap();
         assert_eq!(issues[0].kind, ItemKind::Issue);
         assert!(issues[0].ci.is_none());
+    }
+
+    #[test]
+    fn merge_argv_always_contains_exactly_one_method_flag() {
+        let methods = [
+            None,
+            Some(""),
+            Some("--squash"),
+            Some("squash"),
+            Some("--merge"),
+            Some("merge"),
+            Some("--rebase"),
+            Some("rebase"),
+            Some("not-a-method"),
+        ];
+        for method in methods {
+            let args = merge_args("acme/app", 3, method, "abc123def");
+            let flags: Vec<_> = args
+                .iter()
+                .filter(|a| matches!(a.as_str(), "--merge" | "--squash" | "--rebase"))
+                .collect();
+            assert_eq!(flags.len(), 1, "method {method:?} argv {args:?}");
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--match-head-commit" && w[1] == "abc123def"),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            merge_method_flag(None),
+            "--squash",
+            "default method is squash"
+        );
+        assert!(merge_args("acme/app", 3, None, "abc").contains(&"--squash".to_string()));
+        let merge = merge_args("acme/app", 3, Some("--merge"), "abc");
+        assert!(merge.contains(&"--merge".to_string()));
+        assert!(!merge.iter().any(|a| a == "--squash" || a == "--rebase"));
+        let rebase = merge_args("acme/app", 3, Some("--rebase"), "abc");
+        assert!(rebase.contains(&"--rebase".to_string()));
+        assert!(!rebase.iter().any(|a| a == "--squash" || a == "--merge"));
     }
 }
