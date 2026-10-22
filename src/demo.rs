@@ -309,6 +309,7 @@ fn wait_quit(rx: &Receiver<UiCmd>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_status(
     tx: &Sender<UiEvent>,
     mode: &str,

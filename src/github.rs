@@ -409,7 +409,7 @@ struct FeedbackLoad {
     failed_all: bool,
 }
 
-const PR_FIELDS: &str = "number,title,state,isDraft,headRefOid,headRefName,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,reviews,comments,body,author,createdAt";
+const PR_FIELDS: &str = "number,title,state,isDraft,headRefOid,headRefName,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,reviews,comments,body,author,createdAt,isCrossRepository,headRepository,headRepositoryOwner,maintainerCanModify";
 const PR_CANDIDATE_FIELDS: &str = "number,state,headRefName,body,closingIssuesReferences,title";
 
 /// `gh pr merge` refuses to run non-interactively without a method flag.
@@ -476,6 +476,31 @@ pub fn parse_pr_view(json: &str) -> Result<PrSnap, String> {
     let (approvals, changes_requested) = judge_reviews(decision, &reviews);
     let life = parse_life(v.get("state").and_then(|s| s.as_str()).unwrap_or("OPEN"));
     let draft = v.get("isDraft").and_then(|d| d.as_bool()).unwrap_or(false);
+    let is_cross = v
+        .get("isCrossRepository")
+        .and_then(|d| d.as_bool())
+        .unwrap_or(false);
+    let head_owner = v
+        .pointer("/headRepositoryOwner/login")
+        .or_else(|| v.pointer("/headRepository/owner/login"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let head_repo = v
+        .pointer("/headRepository/name")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let head_url = v
+        .pointer("/headRepository/sshUrl")
+        .or_else(|| v.pointer("/headRepository/url"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let maintainer_can_modify = v
+        .get("maintainerCanModify")
+        .and_then(|d| d.as_bool())
+        .unwrap_or(!is_cross);
     let mergeable = parse_mergeable(v.get("mergeable").and_then(|s| s.as_str()).unwrap_or(""));
     let merge_state = parse_merge_state(
         v.get("mergeStateStatus")
@@ -530,6 +555,11 @@ pub fn parse_pr_view(json: &str) -> Result<PrSnap, String> {
         feedback: crate::watch::FeedbackCounts::default(),
         feedback_warnings: Vec::new(),
         comments_unavailable: false,
+        is_cross,
+        head_owner,
+        head_repo,
+        head_url,
+        maintainer_can_modify,
     })
 }
 
@@ -948,6 +978,26 @@ mod tests {
         assert!(pr.notes.iter().any(|n| n.viewer_authored));
         assert!(pr.notes.iter().any(|n| n.id == "comment:123"));
         assert!(pr.notes.iter().all(|n| n.id != "comment:IC_kwABC"));
+        assert!(!pr.is_cross);
+        assert!(pr.maintainer_can_modify);
+
+        let fork = r#"{
+            "number": 9,
+            "state": "OPEN",
+            "headRefOid": "bbbbbbbb",
+            "headRefName": "main",
+            "isCrossRepository": true,
+            "maintainerCanModify": false,
+            "headRepositoryOwner": {"login": "forker"},
+            "headRepository": {"name": "app", "sshUrl": "git@github.com:forker/app.git"}
+        }"#;
+        let fork = parse_pr_view(fork).unwrap();
+        assert!(fork.is_cross);
+        assert!(!fork.maintainer_can_modify);
+        assert_eq!(fork.head_owner, "forker");
+        assert_eq!(fork.head_repo, "app");
+        assert_eq!(fork.head_url, "git@github.com:forker/app.git");
+        assert_eq!(fork.head_branch, "main");
     }
 
     #[test]

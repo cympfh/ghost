@@ -286,6 +286,13 @@ fn _duration_hint(d: Duration) -> Duration {
     d
 }
 
+// Silence unused import if ValueEnum is only used by clap derive.
+#[allow(dead_code)]
+fn _value_enum_marker(scene: DemoScene) -> DemoScene {
+    let _ = ValueEnum::to_possible_value(&scene);
+    scene
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,11 +553,4 @@ mod tests {
         assert!(cli.merge_yes);
         assert!(matches!(cli.merge_method, Some(MergeMethod::Rebase)));
     }
-}
-
-// Silence unused import if ValueEnum is only used by clap derive.
-#[allow(dead_code)]
-fn _value_enum_marker(scene: DemoScene) -> DemoScene {
-    let _ = ValueEnum::to_possible_value(&scene);
-    scene
 }

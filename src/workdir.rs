@@ -491,23 +491,10 @@ fn checkout_pr(
     ) {
         return finish(main, dest, Vec::new(), vec![failure]);
     }
-    if let Some(branch) = branch.filter(|b| !b.is_empty()) {
-        let spec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
-        let _ = git_step(
-            main,
-            &["fetch".into(), "origin".into(), spec],
-            mode,
-            SetupStep {
-                intent: format!("{purpose} のブランチ {branch} を追跡できるようにするため"),
-                command: String::new(),
-                desired_state: desired.clone(),
-            },
-        );
-        if let Err(failure) = release_if_held(main, branch, purpose, &desired) {
-            return finish(main, dest, Vec::new(), vec![failure]);
-        }
-    }
-    match place_pr(main, dest, branch, &pr_ref, purpose, &desired) {
+    // Do not fetch `refs/heads/{headRef}` into `refs/remotes/origin/{headRef}`.
+    // A fork whose head is also named `main` would move origin/main.
+    let _ = branch;
+    match place_pr(main, dest, number, &pr_ref, purpose, &desired) {
         Ok(note) => finish(main, dest, note, Vec::new()),
         Err(failure) => finish(main, dest, Vec::new(), vec![failure]),
     }
@@ -703,6 +690,15 @@ fn end_state(purpose: &str, branch: Option<&str>, dest: &Path) -> String {
     }
 }
 
+/// Local branch for a PR worktree. The directory name (`pr-N`, `pr-N-review`,
+/// `pr-N-code`) is not the GitHub head ref, so it cannot be `origin/main`.
+pub fn local_pr_branch(dest: &Path, number: u64) -> String {
+    dest.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .unwrap_or_else(|| format!("pr-{number}"))
+}
+
 fn step_failure(
     intent: impl Into<String>,
     command: impl Into<String>,
@@ -799,22 +795,20 @@ fn release_branch(
 fn place_pr(
     main: &Path,
     dest: &Path,
-    branch: Option<&str>,
+    number: u64,
     pr_ref: &str,
     purpose: &str,
     desired: &str,
 ) -> Result<Vec<String>, SetupFailure> {
-    let Some(branch) = branch.map(str::trim).filter(|b| !b.is_empty()) else {
-        add_or_checkout(main, dest, None, pr_ref, true, purpose, desired)?;
-        return Ok(Vec::new());
-    };
-    if let Some(holder) = holder_of(main, branch, purpose, desired)? {
+    let branch = local_pr_branch(dest, number);
+    if let Some(holder) = holder_of(main, &branch, purpose, desired)? {
         if same_path(&holder, dest) || same_slot(&holder, dest) {
-            let note = update_existing(&holder, branch, pr_ref, purpose, desired)?;
+            let note = update_existing(&holder, &branch, pr_ref, purpose, desired)?;
+            clear_upstream(dest);
             return Ok(note);
         }
         if same_path(&holder, main) {
-            release_branch(main, branch, purpose, desired)?;
+            release_branch(main, &branch, purpose, desired)?;
         } else {
             return Err(step_failure(
                 format!("{purpose} のブランチを作業用 worktree に用意するため"),
@@ -832,43 +826,104 @@ fn place_pr(
         }
     }
     if dest.join(".git").exists() {
-        return update_existing(dest, branch, pr_ref, purpose, desired);
+        let note = update_existing(dest, &branch, pr_ref, purpose, desired)?;
+        clear_upstream(dest);
+        return Ok(note);
     }
-    let track = ref_exists(main, &format!("refs/remotes/origin/{branch}"));
-    let start = if track {
-        format!("origin/{branch}")
-    } else {
-        pr_ref.to_string()
-    };
-    add_or_checkout(main, dest, Some(branch), &start, track, purpose, desired)?;
-    let notes = Vec::new();
+    // Start at the PR head. Never at origin/{headRef}, and never --track.
+    add_or_checkout(main, dest, Some(&branch), pr_ref, false, purpose, desired)?;
     if ref_exists(main, &format!("refs/heads/{branch}")) {
         git_step(
             dest,
             &["merge".into(), "--ff-only".into(), pr_ref.to_string()],
             PromptMode::Batch,
             SetupStep {
-                intent: format!("{purpose} のブランチ {branch} を PR head まで進めるため"),
+                intent: format!("{purpose} のローカルブランチ {branch} を PR head まで進めるため"),
                 command: String::new(),
                 desired_state: desired.to_string(),
             },
         )?;
     }
-    let upstream = if track {
-        format!("origin/{branch}")
-    } else {
-        let short = pr_ref.strip_prefix("refs/remotes/").unwrap_or(pr_ref);
-        short.to_string()
-    };
-    let _ = git(
-        dest,
-        &[
-            "branch".into(),
-            format!("--set-upstream-to={upstream}"),
-            branch.to_string(),
-        ],
-    );
-    Ok(notes)
+    clear_upstream(dest);
+    Ok(Vec::new())
+}
+
+fn clear_upstream(dest: &Path) {
+    let _ = git(dest, &["branch".into(), "--unset-upstream".into()]);
+}
+
+/// Where a code-mode commit may be pushed. The local branch is never the ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodePush {
+    Push { remote: String, refspec: String },
+    ReadOnly { head_ref: String },
+}
+
+pub struct PushQuery<'a> {
+    pub base_owner: &'a str,
+    pub base_repo: &'a str,
+    pub head_owner: &'a str,
+    pub head_name: &'a str,
+    pub head_ref: &'a str,
+    pub head_url: &'a str,
+    pub is_cross: bool,
+    pub maintainer_can_modify: bool,
+}
+
+/// Same-repo pushes `origin HEAD:{headRef}`. A fork pushes the head repo URL
+/// only when `maintainerCanModify`. Otherwise the plan is read-only.
+pub fn plan_code_push(q: &PushQuery<'_>) -> CodePush {
+    let head_ref = q.head_ref.trim();
+    if head_ref.is_empty() {
+        return CodePush::ReadOnly {
+            head_ref: String::new(),
+        };
+    }
+    if !q.is_cross {
+        let _ = (q.base_owner, q.base_repo, q.head_owner, q.head_name);
+        return CodePush::Push {
+            remote: "origin".into(),
+            refspec: format!("HEAD:{head_ref}"),
+        };
+    }
+    if !q.maintainer_can_modify {
+        return CodePush::ReadOnly {
+            head_ref: head_ref.to_string(),
+        };
+    }
+    CodePush::Push {
+        remote: push_remote(q.head_owner, q.head_name, q.head_url),
+        refspec: format!("HEAD:{head_ref}"),
+    }
+}
+
+fn push_remote(owner: &str, name: &str, url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return format!("https://github.com/{owner}/{name}.git");
+    }
+    if (url.starts_with("https://github.com/") || url.starts_with("http://github.com/"))
+        && !url.ends_with(".git")
+    {
+        return format!("{url}.git");
+    }
+    url.to_string()
+}
+
+/// Run the planned push. Read-only does not invoke git.
+pub fn apply_push(repo: &Path, plan: &CodePush) -> Result<(), String> {
+    match plan {
+        CodePush::ReadOnly { head_ref } => Err(format!("read-only: not pushing to {head_ref}")),
+        CodePush::Push { remote, refspec } => {
+            let out = git(repo, &["push".into(), remote.clone(), refspec.clone()])
+                .map_err(|err| err.to_string())?;
+            if out.code != 0 {
+                Err(format!("{}{}", out.stdout, out.stderr))
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 fn place_issue(
@@ -1328,6 +1383,7 @@ pub fn lock_slot(dest: &Path) -> Result<SlotLock> {
     let lock_path = dest.with_file_name(format!("{name}.lock"));
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -1752,10 +1808,30 @@ detached
                 .collect::<Vec<_>>()
         );
         assert_eq!(outcome.workdir, dest);
-        assert_eq!(abbrev(&dest), "ghost/issue-1");
-        let parked = abbrev(&main);
-        assert_ne!(parked, "ghost/issue-1", "main still holds the PR branch");
-        assert!(parked == "main" || parked == "HEAD", "{parked}");
+        assert_eq!(abbrev(&dest), "pr-2");
+        assert_eq!(
+            rev_parse(&dest, "HEAD"),
+            rev_parse(&origin, "refs/pull/2/head")
+        );
+        assert_eq!(abbrev(&main), "ghost/issue-1");
+        assert_eq!(
+            rev_parse(&origin, "refs/heads/main"),
+            rev_parse(&main, "main")
+        );
+        let upstream = std::process::Command::new("git")
+            .args([
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ])
+            .current_dir(&dest)
+            .output()
+            .unwrap();
+        assert!(
+            !upstream.status.success(),
+            "PR worktree must not track origin"
+        );
         let stash = std::process::Command::new("git")
             .args(["stash", "list"])
             .current_dir(&main)
@@ -1763,8 +1839,8 @@ detached
             .unwrap();
         let stash = String::from_utf8_lossy(&stash.stdout);
         assert!(
-            stash.contains("ghost: detach main clone off ghost/issue-1"),
-            "{stash}"
+            !stash.contains("ghost: detach"),
+            "the main clone stays on the old branch: {stash}"
         );
 
         let again = sync_and_checkout(
@@ -1780,16 +1856,136 @@ detached
         );
         assert!(again.failures.is_empty(), "{:?}", again.failures);
         assert_eq!(again.workdir, dest);
-        assert_eq!(abbrev(&dest), "ghost/issue-1");
+        assert_eq!(abbrev(&dest), "pr-2");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fork_push_updates_the_fork_and_leaves_origin() {
+        let root = std::env::temp_dir().join(format!(
+            "ghost-fork-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let origin = root.join("origin.git");
+        let fork = root.join("fork.git");
+        let main = root.join("main");
+        fs::create_dir_all(&origin).unwrap();
+        let git_at = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?} in {}", dir.display());
+        };
+        git_at(&origin, &["init", "--bare", "-b", "main"]);
+        git_at(&root, &["clone", origin.to_str().unwrap(), "main"]);
+        git_at(&main, &["config", "user.email", "t@example.com"]);
+        git_at(&main, &["config", "user.name", "t"]);
+        fs::write(main.join("f"), "A\n").unwrap();
+        git_at(&main, &["add", "f"]);
+        git_at(&main, &["commit", "-m", "A"]);
+        git_at(&main, &["push", "-u", "origin", "main"]);
+        let sha_a = rev_parse(&origin, "refs/heads/main");
+        git_at(
+            &root,
+            &["clone", "--bare", origin.to_str().unwrap(), "fork.git"],
+        );
+        fs::write(main.join("f"), "B\n").unwrap();
+        git_at(&main, &["commit", "-am", "B"]);
+        git_at(&main, &["push", "origin", "HEAD:refs/pull/4/head"]);
+        let dest = root.join("wt").join("pr-4-code");
+        let outcome = sync_and_checkout(
+            &main,
+            &dest,
+            "acme/app",
+            Checkout::Pr {
+                number: 4,
+                branch: Some("main".into()),
+            },
+            PromptMode::Batch,
+            "コード対象の PR #4",
+        );
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(abbrev(&dest), "pr-4-code");
+        assert_ne!(rev_parse(&dest, "HEAD"), sha_a);
+        assert_eq!(rev_parse(&origin, "refs/heads/main"), sha_a);
+        fs::write(dest.join("f"), "C\n").unwrap();
+        git_at(&dest, &["commit", "-am", "C"]);
+        let plan = plan_code_push(&PushQuery {
+            base_owner: "acme",
+            base_repo: "app",
+            head_owner: "forker",
+            head_name: "app",
+            head_ref: "main",
+            head_url: fork.to_str().unwrap(),
+            is_cross: true,
+            maintainer_can_modify: true,
+        });
+        apply_push(&dest, &plan).unwrap();
+        assert_eq!(
+            rev_parse(&fork, "refs/heads/main"),
+            rev_parse(&dest, "HEAD")
+        );
+        assert_eq!(rev_parse(&origin, "refs/heads/main"), sha_a);
+        let blocked = plan_code_push(&PushQuery {
+            base_owner: "acme",
+            base_repo: "app",
+            head_owner: "forker",
+            head_name: "app",
+            head_ref: "main",
+            head_url: "",
+            is_cross: true,
+            maintainer_can_modify: false,
+        });
+        assert!(apply_push(&dest, &blocked).is_err());
+        assert_eq!(rev_parse(&origin, "refs/heads/main"), sha_a);
+        let same = plan_code_push(&PushQuery {
+            base_owner: "acme",
+            base_repo: "app",
+            head_owner: "acme",
+            head_name: "app",
+            head_ref: "main",
+            head_url: "",
+            is_cross: false,
+            maintainer_can_modify: true,
+        });
+        match same {
+            CodePush::Push { remote, refspec } => {
+                assert_eq!(remote, "origin");
+                assert_eq!(refspec, "HEAD:main");
+            }
+            CodePush::ReadOnly { .. } => panic!("same-repo push must use origin"),
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
     fn abbrev(path: &Path) -> String {
+        rev_parse(path, "--abbrev-ref HEAD")
+    }
+
+    fn rev_parse(path: &Path, spec: &str) -> String {
+        let mut args = vec!["rev-parse".to_string()];
+        args.extend(spec.split_whitespace().map(|s| s.to_string()));
         let out = std::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .args(&args)
             .current_dir(path)
             .output()
             .unwrap();
+        assert!(
+            out.status.success(),
+            "rev-parse {spec} in {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 }

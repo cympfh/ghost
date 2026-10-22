@@ -99,9 +99,22 @@ pub fn state_dir() -> PathBuf {
     PathBuf::from(home).join(".local/state/ghost")
 }
 
-pub fn pr_state_path(root: &Path, owner: &str, repo: &str, number: u64) -> PathBuf {
+pub fn pr_slot_name(number: u64, slot: SessionSlot) -> String {
+    match slot {
+        SessionSlot::Review => format!("pr-{number}-review"),
+        SessionSlot::Code => format!("pr-{number}-code"),
+    }
+}
+
+pub fn pr_state_path(
+    root: &Path,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    slot: SessionSlot,
+) -> PathBuf {
     root.join(format!("{owner}__{repo}"))
-        .join(format!("pr-{number}.json"))
+        .join(format!("{}.json", pr_slot_name(number, slot)))
 }
 
 pub fn issue_state_path(root: &Path, owner: &str, repo: &str, number: u64) -> PathBuf {
@@ -123,10 +136,16 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let path = pr_state_path(&dir, "acme", "widgets", 3);
-        let mut state = GhostState::default();
-        state.last_reviewed_sha = Some("abc123".into());
-        state.seen_comment_ids = vec!["c1".into()];
+        let path = pr_state_path(&dir, "acme", "widgets", 3, SessionSlot::Code);
+        assert!(path.ends_with("acme__widgets/pr-3-code.json"));
+        let review = pr_state_path(&dir, "acme", "widgets", 3, SessionSlot::Review);
+        assert!(review.ends_with("acme__widgets/pr-3-review.json"));
+        assert_ne!(path, review);
+        let mut state = GhostState {
+            last_reviewed_sha: Some("abc123".into()),
+            seen_comment_ids: vec!["c1".into()],
+            ..GhostState::default()
+        };
         state.remember_session(SessionSlot::Code, AgentKind::Claude, "sess-1");
         state.save(&path).unwrap();
         let loaded = GhostState::load(&path).unwrap();

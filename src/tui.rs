@@ -405,7 +405,10 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Option<UiCmd> {
                     answer: ConfirmAnswer::Yes,
                     method: None,
                 },
-                ConfirmKind::ContinueAsCode => UiCmd::Interrupt,
+                ConfirmKind::ContinueAsCode => UiCmd::Confirm {
+                    answer: ConfirmAnswer::No,
+                    method: None,
+                },
             });
         }
         return Some(UiCmd::Interrupt);
@@ -716,9 +719,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
             let rows = log_rows(&app.lines, width);
             let inner_h = area.height.saturating_sub(2) as usize;
             let max_scroll = rows.len().saturating_sub(inner_h);
-            if app.stick {
-                app.scroll = max_scroll;
-            } else if app.scroll > max_scroll {
+            if app.stick || app.scroll > max_scroll {
                 app.scroll = max_scroll;
             }
             let para = Paragraph::new(rows)
@@ -1181,9 +1182,42 @@ mod tests {
             Lang::Ja,
         );
         assert_eq!(
+            on_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ),
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::No,
+                method: Some(MergeStyle::Squash),
+            }),
+            "ctrl-c on the merge confirm must not merge"
+        );
+        app.view = confirm(
+            3,
+            &merge_question(3, MergeStyle::Squash, Lang::Ja),
+            ConfirmKind::Merge(MergeStyle::Squash),
+            Lang::Ja,
+        );
+        assert_eq!(
             on_key(&mut app, key(KeyCode::Char('c'))),
             Some(UiCmd::Confirm {
                 answer: ConfirmAnswer::Continue,
+                method: None,
+            })
+        );
+        app.view = confirm(
+            12,
+            "Continue as --code on PR #12?",
+            ConfirmKind::ContinueAsCode,
+            Lang::En,
+        );
+        assert_eq!(
+            on_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ),
+            Some(UiCmd::Confirm {
+                answer: ConfirmAnswer::No,
                 method: None,
             })
         );

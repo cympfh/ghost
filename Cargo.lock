@@ -253,6 +253,7 @@ dependencies = [
  "clap",
  "crossterm",
  "instability",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

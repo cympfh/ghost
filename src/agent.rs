@@ -460,7 +460,7 @@ fn present_item(item: &Value) -> Vec<String> {
             .get("text")
             .and_then(|t| t.as_str())
             .filter(|s| !s.is_empty())
-            .map(|s| split_keep(s))
+            .map(split_keep)
             .unwrap_or_default(),
         "command_execution" => item
             .get("command")
@@ -506,6 +506,15 @@ pub fn agent_on_path(kind: AgentKind) -> bool {
     which(kind.as_str(), &path).is_some()
 }
 
+/// Where `git push` from the agent is allowed to go. Review is read-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushPlan {
+    pub readonly: bool,
+    pub remote: String,
+    pub refspec: String,
+    pub reason: String,
+}
+
 /// The long-lived handle ghost keeps from the first task until exit.
 pub struct AgentSession {
     kind: AgentKind,
@@ -523,6 +532,10 @@ pub struct AgentSession {
     last_output: String,
     clean_end: bool,
     saw_error: bool,
+    /// The child closed stdin before reading the prompt. The turn failed;
+    /// it is not a fatal error for ghost.
+    broken_pipe: bool,
+    push_plan: Option<PushPlan>,
     stub: Option<PathBuf>,
 }
 
@@ -544,12 +557,23 @@ impl AgentSession {
             last_output: String::new(),
             clean_end: false,
             saw_error: false,
+            broken_pipe: false,
+            push_plan: None,
             stub: None,
         }
     }
 
     pub fn set_workdir(&mut self, dir: PathBuf) {
         self.workdir = dir;
+    }
+
+    pub fn set_push_plan(&mut self, plan: PushPlan) {
+        self.push_plan = Some(plan);
+    }
+
+    /// True when the last prompt write got EPIPE. Cleared on the next dispatch.
+    pub fn prompt_was_refused(&self) -> bool {
+        self.broken_pipe
     }
 
     /// Test hook: run this program instead of codex/claude/grok.
@@ -613,6 +637,7 @@ impl AgentSession {
         self.last_output.clear();
         self.clean_end = false;
         self.saw_error = false;
+        self.broken_pipe = false;
         let launch = plan_launch(self.kind, self.session_id.as_deref(), &new_session_id());
         if self.kind == AgentKind::Claude && self.alive() && matches!(launch, Launch::Resume { .. })
         {
@@ -692,10 +717,10 @@ impl AgentSession {
 
     fn write_claude(&mut self, prompt: &str) -> Result<()> {
         let stdin = self.stdin.as_mut().context("claude session has no stdin")?;
-        stdin
-            .write_all(claude_user_line(prompt).as_bytes())
-            .context("write claude prompt")?;
-        stdin.flush().ok();
+        if write_ignoring_pipe(stdin, claude_user_line(prompt).as_bytes())? {
+            self.broken_pipe = true;
+            self.stdin = None;
+        }
         Ok(())
     }
 
@@ -731,17 +756,37 @@ impl AgentSession {
         ) {
             cmd.env(key, value);
         }
-        if let Some(real) = which("gh", &std::env::var("PATH").unwrap_or_default()) {
-            let bin = self.prompt_dir.join("bin");
-            if let Ok(dir) = install_gh_guard(&bin) {
-                let parent = std::env::var("PATH").unwrap_or_default();
-                let mut path = dir.display().to_string();
-                if !parent.is_empty() {
-                    path.push(':');
-                    path.push_str(&parent);
-                }
-                cmd.env("PATH", path);
+        let parent_path = std::env::var("PATH").unwrap_or_default();
+        let bin = self.prompt_dir.join("bin");
+        let mut guard_dir = None;
+        if let Some(real) = which("gh", &parent_path) {
+            if install_gh_guard(&bin).is_ok() {
                 cmd.env("GHOST_REAL_GH", real);
+                guard_dir = Some(bin.display().to_string());
+            }
+        }
+        if let Some(real) = which("git", &parent_path) {
+            if install_git_guard(&bin).is_ok() {
+                cmd.env("GHOST_REAL_GIT", real);
+                guard_dir = Some(bin.display().to_string());
+            }
+        }
+        if let Some(dir) = guard_dir {
+            let mut path = dir;
+            if !parent_path.is_empty() {
+                path.push(':');
+                path.push_str(&parent_path);
+            }
+            cmd.env("PATH", path);
+        }
+        if let Some(plan) = &self.push_plan {
+            if plan.readonly {
+                cmd.env("GHOST_PUSH_MODE", "readonly");
+                cmd.env("GHOST_PUSH_REASON", &plan.reason);
+            } else {
+                cmd.env("GHOST_PUSH_MODE", "push");
+                cmd.env("GHOST_PUSH_REMOTE", &plan.remote);
+                cmd.env("GHOST_PUSH_REFSPEC", &plan.refspec);
             }
         }
         unsafe {
@@ -762,16 +807,21 @@ impl AgentSession {
         let mut stdin = child.stdin.take().context("stdin")?;
         match spec.delivery {
             Delivery::StreamJson => {
-                stdin
-                    .write_all(claude_user_line(prompt).as_bytes())
-                    .context("write claude prompt")?;
-                stdin.flush().ok();
-                self.stdin = Some(stdin);
+                if write_ignoring_pipe(&mut stdin, claude_user_line(prompt).as_bytes())? {
+                    self.broken_pipe = true;
+                    drop(stdin);
+                    self.stdin = None;
+                } else {
+                    self.stdin = Some(stdin);
+                }
             }
             Delivery::StdinClose => {
-                stdin.write_all(prompt.as_bytes()).context("write prompt")?;
+                let mut bytes = prompt.as_bytes().to_vec();
                 if !prompt.ends_with('\n') {
-                    stdin.write_all(b"\n").ok();
+                    bytes.push(b'\n');
+                }
+                if write_ignoring_pipe(&mut stdin, &bytes)? {
+                    self.broken_pipe = true;
                 }
                 drop(stdin);
                 self.stdin = None;
@@ -855,6 +905,20 @@ impl Drop for AgentSession {
     }
 }
 
+/// EPIPE means the child exited without reading. That is a failed turn, not a
+/// fatal error: drop the pipe and keep the child so its exit and stderr arrive.
+fn write_ignoring_pipe(writer: &mut impl Write, bytes: &[u8]) -> Result<bool> {
+    match writer.write_all(bytes) {
+        Ok(()) => match writer.flush() {
+            Ok(()) => Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(true),
+            Err(err) => Err(err).context("write prompt"),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(true),
+        Err(err) => Err(err).context("write prompt"),
+    }
+}
+
 fn spawn_readers(
     stdout: impl Read + Send + 'static,
     stderr: impl Read + Send + 'static,
@@ -910,14 +974,45 @@ pub fn kill_tracked_agent() {
 }
 
 static FATAL_GUARDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TERMIOS_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct TermiosBytes(std::cell::UnsafeCell<[u8; 256]>);
+unsafe impl Sync for TermiosBytes {}
+static TERMIOS_BYTES: TermiosBytes = TermiosBytes(std::cell::UnsafeCell::new([0; 256]));
 
 pub fn install_fatal_signals() {
     if FATAL_GUARDS.swap(true, Ordering::SeqCst) {
         return;
     }
+    save_termios();
     unsafe {
         signal(1, on_fatal as usize);
         signal(15, on_fatal as usize);
+    }
+}
+
+fn save_termios() {
+    let size = std::mem::size_of::<libc::termios>();
+    if size > 256 {
+        return;
+    }
+    unsafe {
+        let ptr = (*TERMIOS_BYTES.0.get()).as_mut_ptr() as *mut libc::termios;
+        if libc::tcgetattr(libc::STDIN_FILENO, ptr) == 0 {
+            TERMIOS_READY.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Restore the terminal saved at startup. A missing snapshot does not call
+/// `tcsetattr`. Used from the SIGTERM/SIGHUP handler; it does not take locks.
+pub fn restore_termios_snapshot(saved: bool) -> bool {
+    if !saved {
+        return false;
+    }
+    unsafe {
+        let ptr = (*TERMIOS_BYTES.0.get()).as_ptr() as *const libc::termios;
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, ptr) == 0
     }
 }
 
@@ -926,6 +1021,7 @@ extern "C" fn on_fatal(sig: i32) {
     if pgid > 0 {
         unsafe { kill(-pgid, 15) };
     }
+    let _ = restore_termios_snapshot(TERMIOS_READY.load(Ordering::SeqCst));
     const SEQ: &[u8] = b"\x1b[?1049l\x1b[0m\x1b[?25h\n";
     unsafe {
         write(1, SEQ.as_ptr(), SEQ.len());
@@ -1003,6 +1099,39 @@ fi
 exec "$real" "$@"
 "#;
 
+const GIT_GUARD: &str = r#"#!/bin/sh
+# Keeps a fork PR from updating origin's same-name branch. Not a security boundary.
+real="${GHOST_REAL_GIT:-}"
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+  echo "ghost: real git is not available" >&2
+  exit 127
+fi
+if [ "$1" = "push" ]; then
+  if [ "$GHOST_PUSH_MODE" = "readonly" ]; then
+    echo "ghost: refusing git push${GHOST_PUSH_REASON:+: $GHOST_PUSH_REASON}" >&2
+    exit 99
+  fi
+  if [ -n "$GHOST_PUSH_REMOTE" ] && [ -n "$GHOST_PUSH_REFSPEC" ]; then
+    exec "$real" push "$GHOST_PUSH_REMOTE" "$GHOST_PUSH_REFSPEC"
+  fi
+fi
+exec "$real" "$@"
+"#;
+
+pub fn install_git_guard(dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("git");
+    fs::write(&path, GIT_GUARD)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+    }
+    Ok(dir.to_path_buf())
+}
+
 pub fn install_gh_guard(dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let path = dir.join("gh");
@@ -1028,6 +1157,11 @@ extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sigterm_skips_termios_when_nothing_was_saved() {
+        assert!(!restore_termios_snapshot(false));
+    }
 
     #[test]
     fn auto_pick_order_and_explicit() {

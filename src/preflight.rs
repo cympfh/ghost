@@ -130,7 +130,7 @@ fn first_line(stderr: &str, stdout: &str) -> String {
     };
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     // Never surface a token if gh printed one.
-    let line = line.replace(|c: char| c == '\t', " ");
+    let line = line.replace('\t', " ");
     if line.to_ascii_lowercase().contains("token") {
         "gh rejected the credentials".to_string()
     } else if line.is_empty() {

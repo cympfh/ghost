@@ -115,6 +115,14 @@ pub struct PrSnap {
     pub feedback_warnings: Vec<String>,
     /// All three REST comment calls failed. Do not use GraphQL ids this poll.
     pub comments_unavailable: bool,
+    /// `isCrossRepository`. Missing JSON means this PR is in the base repo.
+    pub is_cross: bool,
+    pub head_owner: String,
+    pub head_repo: String,
+    /// `sshUrl`, else `url`, of the head repository. Empty when unknown.
+    pub head_url: String,
+    /// Missing JSON means the maintainer can modify a same-repo PR.
+    pub maintainer_can_modify: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +289,17 @@ pub fn review_exit_key(key: ReviewExitKey) -> ReviewExitAnswer {
     }
 }
 
+/// `-y` continues as code. A non-TTY does not wait and does not continue.
+pub fn auto_continue_as_code(yes: bool, tty: bool) -> Option<bool> {
+    if yes {
+        Some(true)
+    } else if !tty {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// `-y` exits without asking. A non-TTY also exits. Review never merges.
 pub fn auto_review_exit(yes: bool, tty: bool) -> Option<ReviewExitAnswer> {
     if yes || !tty {
@@ -291,10 +310,7 @@ pub fn auto_review_exit(yes: bool, tty: bool) -> Option<ReviewExitAnswer> {
 }
 
 pub fn review_needed(last_reviewed_sha: Option<&str>, head_sha: &str) -> bool {
-    match last_reviewed_sha {
-        Some(prev) if !prev.is_empty() && prev == head_sha => false,
-        _ => true,
-    }
+    !matches!(last_reviewed_sha, Some(prev) if !prev.is_empty() && prev == head_sha)
 }
 
 pub fn decide_code(
@@ -397,6 +413,26 @@ pub fn association_trusted(association: &str, trust: CommentTrust) -> bool {
 
 pub fn author_is(note: &Note, login: &str) -> bool {
     !login.is_empty() && note.author.eq_ignore_ascii_case(login)
+}
+
+/// Viewer comments that appeared during a turn (not already in `prompted`)
+/// are the agent's own posts. Later polls must not treat them as new work.
+pub fn absorb_own_comments(
+    notes: &[Note],
+    prompted: &BTreeSet<String>,
+    login: &str,
+    seen: &mut BTreeSet<String>,
+    agent_ids: &mut BTreeSet<String>,
+) {
+    for note in notes {
+        if prompted.contains(&note.id) {
+            continue;
+        }
+        if author_is(note, login) {
+            agent_ids.insert(note.id.clone());
+            seen.insert(note.id.clone());
+        }
+    }
 }
 
 pub fn mark_viewer(notes: &mut [Note], login: &str) {
@@ -672,6 +708,11 @@ mod tests {
             created_at: "2024-06-01T00:00:00Z".into(),
             feedback: FeedbackCounts::default(),
             feedback_warnings: vec![],
+            is_cross: false,
+            head_owner: String::new(),
+            head_repo: String::new(),
+            head_url: String::new(),
+            maintainer_can_modify: true,
         }
     }
 
@@ -743,6 +784,9 @@ mod tests {
         assert_eq!(auto_review_exit(true, true), Some(ReviewExitAnswer::Exit));
         assert_eq!(auto_review_exit(false, false), Some(ReviewExitAnswer::Exit));
         assert_eq!(auto_review_exit(false, true), None);
+        assert_eq!(auto_continue_as_code(true, false), Some(true));
+        assert_eq!(auto_continue_as_code(false, false), Some(false));
+        assert_eq!(auto_continue_as_code(false, true), None);
         assert!(opening_runs_agent(true));
         assert!(opening_runs_agent(false));
         assert!(approve_signal("notes\nGHOST_VERDICT: approve\n"));
@@ -1196,5 +1240,26 @@ mod tests {
         let found = find_issue_pr(&candidates, 7, branch).unwrap();
         assert_eq!(found.number, 8);
         assert!(find_issue_pr(&candidates[..1], 7, branch).is_none());
+    }
+
+    #[test]
+    fn queued_turn_absorbs_the_agents_own_comments() {
+        let notes = vec![
+            Note::new("old", "me", "earlier", "comment"),
+            Note::new("new", "me", "対応しました", "comment"),
+            Note::new("human", "ada", "please fix", "comment"),
+        ];
+        let prompted = BTreeSet::from(["old".to_string()]);
+        let mut seen = BTreeSet::new();
+        let mut agent = BTreeSet::new();
+        absorb_own_comments(&notes, &prompted, "me", &mut seen, &mut agent);
+        assert!(
+            agent.contains("new"),
+            "a comment the agent posted during the queued turn is its own"
+        );
+        assert!(seen.contains("new"));
+        assert!(!agent.contains("human"));
+        assert!(!seen.contains("human"));
+        assert!(!agent.contains("old"));
     }
 }

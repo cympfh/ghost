@@ -209,6 +209,27 @@ pub fn commit_merge(ready: bool, expected_sha: &str, current_sha: &str) -> bool 
     ready && !expected_sha.is_empty() && expected_sha == current_sha
 }
 
+/// Merge is offered only after the same head has been merge-ready twice in a row.
+/// The first CLEAN poll after a push, before CI has registered, does not merge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeReadyStreak {
+    sha: Option<String>,
+}
+
+impl MergeReadyStreak {
+    pub fn observe(&mut self, sha: &str, ready: bool) -> bool {
+        if !ready || sha.is_empty() {
+            self.sha = None;
+            return false;
+        }
+        if self.sha.as_deref() == Some(sha) {
+            return true;
+        }
+        self.sha = Some(sha.to_string());
+        false
+    }
+}
+
 pub fn stop_reason(input: &MergeInput) -> Option<StopReason> {
     match input.life {
         PrLife::Merged => Some(StopReason::Merged),
@@ -493,6 +514,38 @@ mod tests {
         assert!(commit_merge(true, "abc", "abc"));
         assert!(!commit_merge(true, "abc", "zzz"));
         assert!(!commit_merge(false, "abc", "abc"));
+    }
+
+    #[test]
+    fn merge_now_recheck_rejects_a_moved_sha() {
+        assert!(
+            commit_merge(true, "abc", "abc"),
+            "merge_now merges only when the re-fetched head is still the expected SHA"
+        );
+        assert!(
+            !commit_merge(true, "abc", "def"),
+            "a moved head SHA must not merge"
+        );
+        assert!(!commit_merge(false, "abc", "abc"));
+        assert!(!commit_merge(true, "", ""));
+    }
+
+    #[test]
+    fn merge_ready_must_repeat_on_the_same_sha() {
+        let mut streak = MergeReadyStreak::default();
+        assert!(
+            !streak.observe("abc", true),
+            "the first CLEAN poll, including empty CI right after a push, does not merge"
+        );
+        assert!(streak.observe("abc", true));
+        assert!(!streak.observe("def", true), "a new head starts over");
+        assert!(streak.observe("def", true));
+        assert!(!streak.observe("def", false));
+        assert!(
+            !streak.observe("def", true),
+            "a not-ready poll clears the streak"
+        );
+        assert!(!streak.observe("", true));
     }
 
     #[test]

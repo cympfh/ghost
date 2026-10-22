@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -14,12 +15,13 @@ use anyhow::{anyhow, Result};
 
 use crate::agent::{
     agent_on_path, counts_as_agent_turn, describe_launch, pick_agent, record_progress,
-    resume_unavailable, AgentKind, AgentSession, Launch,
+    resume_unavailable, AgentKind, AgentSession, Launch, PushPlan,
 };
 use crate::github::Gh;
 use crate::lang::Lang;
 use crate::merge::{
-    auto_merge_answer, commit_merge, is_merge_ready, merge_ready_line, MergeAnswer, StopReason,
+    auto_merge_answer, commit_merge, is_merge_ready, merge_ready_line, MergeAnswer,
+    MergeReadyStreak, StopReason,
 };
 use crate::preflight::{evaluate, failure_message, is_fatal, AuthProbe, RepoProbe};
 use crate::prompt::{self, truncate};
@@ -129,24 +131,46 @@ pub fn run(spec: RunSpec) -> Result<i32> {
     let failures_for_ui = failures;
     let slot_lock = slot.lock;
     tui::run(header, move |tx, rx| {
-        if let Err(err) = babysit(
-            spec,
-            login,
-            home_for_ui,
-            main_for_ui,
-            workdir_for_ui,
-            slot_for_ui,
-            slot_lock,
-            how,
-            failures_for_ui,
-            tx.clone(),
-            rx,
-        ) {
-            let message = format!("{err:#}");
-            let _ = tx.send(UiEvent::Fatal(message.clone()));
-            let _ = tx.send(UiEvent::Exit { code: 1, message });
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            babysit(
+                spec,
+                login,
+                home_for_ui,
+                main_for_ui,
+                workdir_for_ui,
+                slot_for_ui,
+                slot_lock,
+                how,
+                failures_for_ui,
+                tx.clone(),
+                rx,
+            )
+        }));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let message = format!("{err:#}");
+                let _ = tx.send(UiEvent::Fatal(message.clone()));
+                let _ = tx.send(UiEvent::Exit { code: 1, message });
+            }
+            Err(payload) => {
+                let message = panic_message(&payload);
+                let _ = tx.send(UiEvent::Fatal(message.clone()));
+                let _ = tx.send(UiEvent::Exit { code: 1, message });
+            }
         }
     })
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let text = if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".into()
+    };
+    format!("worker panicked: {text}")
 }
 
 fn show_fatal(header: String, message: String) -> Result<i32> {
@@ -339,17 +363,10 @@ struct SlotPrep {
 }
 
 fn activate_slot(spec: &RunSpec, home: &std::path::Path, main: &std::path::Path) -> SlotPrep {
-    if spec.mode == RunMode::Picker {
-        return SlotPrep {
-            intended: main.to_path_buf(),
-            workdir: main.to_path_buf(),
-            lock: None,
-            failures: Vec::new(),
-        };
-    }
     let slot = match spec.mode {
+        RunMode::Picker | RunMode::Ask => None,
         RunMode::Issue => match issue_number(&spec.target) {
-            Ok(number) => format!("issue-{number}"),
+            Ok(number) => Some(format!("issue-{number}")),
             Err(err) => {
                 return SlotPrep {
                     intended: main.to_path_buf(),
@@ -364,34 +381,39 @@ fn activate_slot(spec: &RunSpec, home: &std::path::Path, main: &std::path::Path)
                 };
             }
         },
-        _ => match pull_number(&spec.target) {
-            Ok(number) => format!("pr-{number}"),
+        RunMode::Review => match pull_number(&spec.target) {
+            Ok(number) => Some(state::pr_slot_name(number, SessionSlot::Review)),
             Err(err) => {
-                return SlotPrep {
-                    intended: main.to_path_buf(),
-                    workdir: main.to_path_buf(),
-                    lock: None,
-                    failures: vec![plain_failure(
-                        "対象の番号を読むため",
-                        "parse pull request url",
-                        "PR 番号が分かっている状態にしてから作業して",
-                        &err,
-                    )],
-                };
+                return slot_parse_failure(main, err);
             }
         },
+        RunMode::Code => match pull_number(&spec.target) {
+            Ok(number) => Some(state::pr_slot_name(number, SessionSlot::Code)),
+            Err(err) => {
+                return slot_parse_failure(main, err);
+            }
+        },
+    };
+    let Some(slot) = slot else {
+        return SlotPrep {
+            intended: main.to_path_buf(),
+            workdir: main.to_path_buf(),
+            lock: None,
+            failures: Vec::new(),
+        };
     };
     let dest = workdir::slot_path(home, spec.target.owner(), spec.target.repo(), &slot);
     match workdir::lock_slot(&dest) {
         Ok(lock) => SlotPrep {
-            workdir: workdir::best_workdir(&dest, main, home),
+            workdir: dest.clone(),
             intended: dest,
             lock: Some(lock),
             failures: Vec::new(),
         },
         Err(err) => SlotPrep {
-            intended: main.to_path_buf(),
-            workdir: main.to_path_buf(),
+            // A failed lock must not fall back to the main clone.
+            intended: dest.clone(),
+            workdir: dest.clone(),
             lock: None,
             failures: vec![plain_failure(
                 format!("{slot} の作業ディレクトリを排他で使うため"),
@@ -406,6 +428,21 @@ fn activate_slot(spec: &RunSpec, home: &std::path::Path, main: &std::path::Path)
     }
 }
 
+fn slot_parse_failure(main: &std::path::Path, err: anyhow::Error) -> SlotPrep {
+    SlotPrep {
+        intended: main.to_path_buf(),
+        workdir: main.to_path_buf(),
+        lock: None,
+        failures: vec![plain_failure(
+            "対象の番号を読むため",
+            "parse pull request url",
+            "PR 番号が分かっている状態にしてから作業して",
+            &err,
+        )],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn babysit(
     spec: RunSpec,
     login: Option<String>,
@@ -476,6 +513,11 @@ fn babysit(
         quit: false,
         interrupted: false,
         last_idle_sha: None,
+        merge_streak: MergeReadyStreak::default(),
+        code_pr: None,
+        code_path: None,
+        code_seen: BTreeSet::new(),
+        code_agent_ids: BTreeSet::new(),
         state_root: state::state_dir(),
     };
 
@@ -531,6 +573,11 @@ struct Ctx {
     quit: bool,
     interrupted: bool,
     last_idle_sha: Option<String>,
+    merge_streak: MergeReadyStreak,
+    code_pr: Option<u64>,
+    code_path: Option<PathBuf>,
+    code_seen: BTreeSet<String>,
+    code_agent_ids: BTreeSet<String>,
     state_root: PathBuf,
 }
 
@@ -538,8 +585,15 @@ impl Ctx {
     fn review_loop(&mut self, number: u64) -> Result<()> {
         self.status.mode = "review".into();
         self.status.target = format!("PR #{number}");
-        let path = state::pr_state_path(&self.state_root, &self.owner, &self.repo, number);
+        let path = state::pr_state_path(
+            &self.state_root,
+            &self.owner,
+            &self.repo,
+            number,
+            SessionSlot::Review,
+        );
         let mut stored = GhostState::load(&path)?;
+        self.arm_review_push();
         // Launch starts a new session. A saved id is not resumed.
         self.push_status();
         let mut opened = false;
@@ -736,24 +790,39 @@ impl Ctx {
     fn code_loop(&mut self, number: u64, launch: CodeLaunch) -> Result<()> {
         self.status.mode = "code".into();
         self.status.target = format!("PR #{number}");
-        let path = state::pr_state_path(&self.state_root, &self.owner, &self.repo, number);
+        let path = state::pr_state_path(
+            &self.state_root,
+            &self.owner,
+            &self.repo,
+            number,
+            SessionSlot::Code,
+        );
         let mut stored = GhostState::load(&path)?;
         // Do not resume a saved code session. Issue handoff already holds its id
         // in this process; a fresh `--code` launch starts a new session.
-        let mut seen: BTreeSet<String> = stored.seen_comment_ids.iter().cloned().collect();
-        let mut agent_ids: BTreeSet<String> = stored.agent_comment_ids.iter().cloned().collect();
+        self.code_pr = Some(number);
+        self.code_path = Some(path.clone());
+        self.code_seen = stored.seen_comment_ids.iter().cloned().collect();
+        self.code_agent_ids = stored.agent_comment_ids.iter().cloned().collect();
         let mut surveyed = matches!(launch, CodeLaunch::Handoff);
         self.push_status();
         loop {
             if self.quit {
                 return Ok(());
             }
-            let snap = match self.poll_pr(number)? {
+            let (snap, merge_confirmed) = match self.poll_pr(number)? {
                 Some(mut snap) => {
+                    let agent_ids = self.code_agent_ids.clone();
                     let filtered = self.prepare_notes(&mut snap, &agent_ids);
                     self.log(filtered);
                     self.log(merge_ready_line(&snap.merge));
-                    snap
+                    let merge_confirmed = self
+                        .merge_streak
+                        .observe(&snap.head_sha, is_merge_ready(&snap.merge));
+                    if is_merge_ready(&snap.merge) && !merge_confirmed {
+                        self.log_merge_wait(&snap.head_sha);
+                    }
+                    (snap, merge_confirmed)
                 }
                 None => return Ok(()),
             };
@@ -768,6 +837,7 @@ impl Ctx {
                 continue;
             }
             let handled = ci_handled(&stored);
+            let seen = self.code_seen.clone();
             let action = match decide_code(
                 &snap,
                 &seen,
@@ -784,7 +854,7 @@ impl Ctx {
             match code_step(launch, surveyed, action) {
                 CodeStep::Action(CodeAction::Stop(reason)) => {
                     if reason == StopReason::MergeReady {
-                        if self.offer_merge(number, &snap)? {
+                        if merge_confirmed && self.offer_merge(number, &snap)? {
                             return Ok(());
                         }
                     } else {
@@ -801,29 +871,14 @@ impl Ctx {
                     ci_failed,
                     new_notes,
                 }) => {
-                    self.run_code_fix(
-                        number,
-                        &snap,
-                        &path,
-                        &mut stored,
-                        &mut seen,
-                        &mut agent_ids,
-                        ci_failed,
-                        new_notes,
-                    )?;
+                    self.run_code_fix(number, &snap, &path, &mut stored, ci_failed, new_notes)?;
                     if self.quit {
                         return Ok(());
                     }
                 }
                 CodeStep::Survey => {
-                    let (leave, progressed) = self.run_code_survey(
-                        number,
-                        &snap,
-                        &path,
-                        &mut stored,
-                        &mut seen,
-                        &mut agent_ids,
-                    )?;
+                    let (leave, progressed) =
+                        self.run_code_survey(number, &snap, &path, &mut stored)?;
                     if leave {
                         return Ok(());
                     }
@@ -844,8 +899,6 @@ impl Ctx {
         snap: &PrSnap,
         path: &std::path::Path,
         stored: &mut GhostState,
-        seen: &mut BTreeSet<String>,
-        agent_ids: &mut BTreeSet<String>,
     ) -> Result<(bool, bool)> {
         self.log_situation();
         self.checkout(
@@ -861,6 +914,7 @@ impl Ctx {
         let startup_ids: Vec<String> = snap.notes.iter().map(|n| n.id.clone()).collect();
         let user_notes = self.take_queued_for_prompt();
         let ci_failed = snap.merge.checks == crate::merge::ChecksVerdict::Failed;
+        let push = self.arm_code_push(snap);
         let task = self.decorate(prompt::code_survey(
             &self.slug,
             number,
@@ -872,6 +926,7 @@ impl Ctx {
             &snap.notes,
             &user_notes,
             self.spec.lang,
+            &push,
         ));
         let ok = self.dispatch_task(&task)?;
         self.note_setup_result(ok);
@@ -889,16 +944,12 @@ impl Ctx {
             return Ok((false, false));
         }
         for id in seen_after_survey(&startup_ids, true) {
-            seen.insert(id);
+            self.code_seen.insert(id);
         }
-        self.absorb_agent_replies(
-            number,
-            &startup_ids.iter().cloned().collect(),
-            seen,
-            agent_ids,
-        );
-        stored.seen_comment_ids = seen.iter().cloned().collect();
-        stored.agent_comment_ids = agent_ids.iter().cloned().collect();
+        self.absorb_into_code_sets(number, &startup_ids.iter().cloned().collect());
+        record_handled_ci(stored, snap);
+        stored.seen_comment_ids = self.code_seen.iter().cloned().collect();
+        stored.agent_comment_ids = self.code_agent_ids.iter().cloned().collect();
         self.remember(stored, SessionSlot::Code);
         stored.save(path)?;
         self.log(self.say(
@@ -914,9 +965,12 @@ impl Ctx {
         };
         self.log(merge_ready_line(&fresh.merge));
         if after_opening_survey(is_merge_ready(&fresh.merge)) == AfterSurvey::MergePrompt {
-            let leave = self.offer_merge(number, &fresh)?;
+            let leave = self.offer_if_merge_repeated(number, &fresh)?;
             return Ok((leave, true));
         }
+        let _ = self
+            .merge_streak
+            .observe(&fresh.head_sha, is_merge_ready(&fresh.merge));
         Ok((false, true))
     }
 
@@ -926,8 +980,6 @@ impl Ctx {
         snap: &PrSnap,
         path: &std::path::Path,
         stored: &mut GhostState,
-        seen: &mut BTreeSet<String>,
-        agent_ids: &mut BTreeSet<String>,
         ci_failed: bool,
         new_notes: Vec<Note>,
     ) -> Result<()> {
@@ -943,6 +995,7 @@ impl Ctx {
             return Ok(());
         }
         let user_notes = self.take_queued_for_prompt();
+        let push = self.arm_code_push(snap);
         let task = self.decorate(if self.agent.session_id().is_some() {
             prompt::code_followup(
                 &self.slug,
@@ -955,6 +1008,7 @@ impl Ctx {
                 &new_notes,
                 &user_notes,
                 self.spec.lang,
+                &push,
             )
         } else {
             prompt::code_initial(
@@ -968,6 +1022,7 @@ impl Ctx {
                 &new_notes,
                 &user_notes,
                 self.spec.lang,
+                &push,
             )
         });
         let prompted: BTreeSet<String> = new_notes.iter().map(|n| n.id.clone()).collect();
@@ -987,18 +1042,12 @@ impl Ctx {
             return Ok(());
         }
         for id in &prompted {
-            seen.insert(id.clone());
+            self.code_seen.insert(id.clone());
         }
-        self.absorb_agent_replies(number, &prompted, seen, agent_ids);
-        if snap.merge.checks == crate::merge::ChecksVerdict::Failed {
-            stored.handled_ci_sha = Some(snap.head_sha.clone());
-            stored.handled_failing_checks = snap.failing_checks.clone();
-        } else {
-            stored.handled_ci_sha = None;
-            stored.handled_failing_checks.clear();
-        }
-        stored.seen_comment_ids = seen.iter().cloned().collect();
-        stored.agent_comment_ids = agent_ids.iter().cloned().collect();
+        self.absorb_into_code_sets(number, &prompted);
+        record_handled_ci(stored, snap);
+        stored.seen_comment_ids = self.code_seen.iter().cloned().collect();
+        stored.agent_comment_ids = self.code_agent_ids.iter().cloned().collect();
         self.remember(stored, SessionSlot::Code);
         stored.save(path)?;
         self.log(self.say(
@@ -1013,10 +1062,34 @@ impl Ctx {
             }
         };
         self.log(merge_ready_line(&fresh.merge));
-        if is_merge_ready(&fresh.merge) {
-            let _ = self.offer_merge(number, &fresh)?;
-        }
+        let _ = self.offer_if_merge_repeated(number, &fresh)?;
         Ok(())
+    }
+
+    /// Offer merge only when this head was already merge-ready on the previous look.
+    fn offer_if_merge_repeated(&mut self, number: u64, snap: &PrSnap) -> Result<bool> {
+        let ready = is_merge_ready(&snap.merge);
+        let confirmed = self.merge_streak.observe(&snap.head_sha, ready);
+        if ready && !confirmed {
+            self.log_merge_wait(&snap.head_sha);
+            return Ok(false);
+        }
+        if confirmed {
+            return self.offer_merge(number, snap);
+        }
+        Ok(false)
+    }
+
+    fn log_merge_wait(&mut self, sha: &str) {
+        let short = short_sha(sha);
+        self.log(self.say(
+            &format!(
+                "merge-ready を一度確認しました（{short}）。次の poll でも同じ head なら merge を尋ねます。"
+            ),
+            &format!(
+                "Saw merge-ready once ({short}). The next poll of this same head will ask to merge."
+            ),
+        ));
     }
 
     fn offer_merge(&mut self, number: u64, snap: &PrSnap) -> Result<bool> {
@@ -1117,23 +1190,76 @@ impl Ctx {
         }
     }
 
-    fn absorb_agent_replies(
-        &mut self,
-        number: u64,
-        prompted: &BTreeSet<String>,
-        seen: &mut BTreeSet<String>,
-        agent_ids: &mut BTreeSet<String>,
-    ) {
-        if let Ok(fresh) = self.gh.pr(number) {
-            let login = self.login();
-            for note in fresh.notes {
-                let arrived_during_turn = !prompted.contains(&note.id);
-                if arrived_during_turn && crate::watch::author_is(&note, &login) {
-                    agent_ids.insert(note.id.clone());
-                    seen.insert(note.id);
-                }
-            }
-        }
+    fn absorb_into_code_sets(&mut self, number: u64, prompted: &BTreeSet<String>) {
+        let Ok(fresh) = self.gh.pr(number) else {
+            return;
+        };
+        let login = self.login();
+        let mut seen = std::mem::take(&mut self.code_seen);
+        let mut agent_ids = std::mem::take(&mut self.code_agent_ids);
+        crate::watch::absorb_own_comments(
+            &fresh.notes,
+            prompted,
+            &login,
+            &mut seen,
+            &mut agent_ids,
+        );
+        self.code_seen = seen;
+        self.code_agent_ids = agent_ids;
+    }
+
+    fn arm_review_push(&mut self) {
+        self.agent.set_push_plan(PushPlan {
+            readonly: true,
+            remote: String::new(),
+            refspec: String::new(),
+            reason: "review mode does not push".into(),
+        });
+    }
+
+    fn arm_issue_push(&mut self, branch: &str) {
+        self.agent.set_push_plan(PushPlan {
+            readonly: false,
+            remote: "origin".into(),
+            refspec: format!("HEAD:{branch}"),
+            reason: String::new(),
+        });
+    }
+
+    fn arm_code_push(&mut self, snap: &PrSnap) -> String {
+        let plan = workdir::plan_code_push(&workdir::PushQuery {
+            base_owner: &self.owner,
+            base_repo: &self.repo,
+            head_owner: &snap.head_owner,
+            head_name: &snap.head_repo,
+            head_ref: &snap.head_branch,
+            head_url: &snap.head_url,
+            is_cross: snap.is_cross,
+            maintainer_can_modify: snap.maintainer_can_modify,
+        });
+        let (readonly, remote, refspec, reason, head_ref) = match &plan {
+            workdir::CodePush::ReadOnly { head_ref } => (
+                true,
+                String::new(),
+                String::new(),
+                format!("fork head {head_ref} is not pushable"),
+                head_ref.clone(),
+            ),
+            workdir::CodePush::Push { remote, refspec } => (
+                false,
+                remote.clone(),
+                refspec.clone(),
+                String::new(),
+                snap.head_branch.clone(),
+            ),
+        };
+        self.agent.set_push_plan(PushPlan {
+            readonly,
+            remote: remote.clone(),
+            refspec: refspec.clone(),
+            reason,
+        });
+        prompt::describe_push(readonly, &remote, &refspec, &head_ref, self.spec.lang)
     }
 
     fn log_situation(&mut self) {
@@ -1268,6 +1394,7 @@ impl Ctx {
             );
         }
         let task = self.decorate(task);
+        self.arm_issue_push(&branch);
         let ok = self.dispatch_task(&task)?;
         self.note_setup_result(ok);
         if !ok {
@@ -1302,7 +1429,13 @@ impl Ctx {
 
     /// Seen-set stays empty. Only viewer comments that predate the PR are agent ids.
     fn baseline_new_pr(&mut self, pr: u64, created_here: bool) -> Result<()> {
-        let ppath = state::pr_state_path(&self.state_root, &self.owner, &self.repo, pr);
+        let ppath = state::pr_state_path(
+            &self.state_root,
+            &self.owner,
+            &self.repo,
+            pr,
+            SessionSlot::Code,
+        );
         let mut pstate = GhostState::load(&ppath)?;
         if created_here || pstate.seen_comment_ids.is_empty() {
             let snap = self.gh.pr(pr)?;
@@ -1347,34 +1480,59 @@ impl Ctx {
             &format!("PR #{pr} を --code として続けますか？"),
             &format!("Continue as --code on PR #{pr}?"),
         );
-        let yes = if self.spec.yes {
-            self.log(format!("{message} yes (--yes)"));
-            true
-        } else {
-            let _ = self.tx.send(UiEvent::Confirm {
-                number: pr,
-                message: message.clone(),
-                kind: ConfirmKind::ContinueAsCode,
-                lang: self.spec.lang,
-            });
-            self.status.phase = "confirm".into();
-            self.push_status();
-            match self.wait_confirm()? {
-                None => return Ok(()),
-                Some((ConfirmAnswer::Yes, _)) => true,
-                Some((ConfirmAnswer::No | ConfirmAnswer::Continue, _)) => false,
+        let yes = match crate::watch::auto_continue_as_code(self.spec.yes, stdin_is_tty()) {
+            Some(true) => {
+                self.log(format!("{message} yes (--yes)"));
+                true
+            }
+            Some(false) => {
+                self.log(format!("{message} n (not a TTY)"));
+                false
+            }
+            None => {
+                let _ = self.tx.send(UiEvent::Confirm {
+                    number: pr,
+                    message: message.clone(),
+                    kind: ConfirmKind::ContinueAsCode,
+                    lang: self.spec.lang,
+                });
+                self.status.phase = "confirm".into();
+                self.push_status();
+                match self.wait_confirm()? {
+                    None => return Ok(()),
+                    Some((ConfirmAnswer::Yes, _)) => true,
+                    Some((ConfirmAnswer::No | ConfirmAnswer::Continue, _)) => false,
+                }
             }
         };
         if !yes {
             self.stop(0, format!("PR #{pr} left as-is. Not continuing as --code."));
             return Ok(());
         }
+        if !self.hold_pr_slot(pr, SessionSlot::Code) {
+            return Ok(());
+        }
         self.log(format!(
             "continuing as --code on PR #{pr} in the same {} session",
             self.agent.kind()
         ));
-        // Same AgentSession. code_loop only seeds an id when this one has none.
+        // Same AgentSession. code_loop does not resume a saved id.
         self.code_loop(pr, CodeLaunch::Handoff)
+    }
+
+    fn hold_pr_slot(&mut self, number: u64, slot: SessionSlot) -> bool {
+        let name = state::pr_slot_name(number, slot);
+        if self.use_slot(&name) {
+            return true;
+        }
+        self.stop(
+            1,
+            self.say(
+                "worktree をロックできなかったので、メインクローンでは作業しません。",
+                "Could not lock the worktree, so ghost will not work in the main clone.",
+            ),
+        );
+        false
     }
 
     fn ask_mode(&mut self, number: u64) -> Result<()> {
@@ -1386,8 +1544,18 @@ impl Ctx {
         self.push_status();
         loop {
             match self.rx.recv() {
-                Ok(UiCmd::Choose(Side::Review)) => return self.review_loop(number),
-                Ok(UiCmd::Choose(Side::Code)) => return self.code_loop(number, CodeLaunch::Survey),
+                Ok(UiCmd::Choose(Side::Review)) => {
+                    if !self.hold_pr_slot(number, SessionSlot::Review) {
+                        return Ok(());
+                    }
+                    return self.review_loop(number);
+                }
+                Ok(UiCmd::Choose(Side::Code)) => {
+                    if !self.hold_pr_slot(number, SessionSlot::Code) {
+                        return Ok(());
+                    }
+                    return self.code_loop(number, CodeLaunch::Survey);
+                }
                 Ok(UiCmd::Quit) | Err(_) => {
                     self.stop(0, "quit".into());
                     return Ok(());
@@ -1420,11 +1588,28 @@ impl Ctx {
         let Some((kind, number, side)) = choice else {
             return Ok(());
         };
-        let slot = match kind {
-            crate::github::ItemKind::Pull => format!("pr-{number}"),
-            crate::github::ItemKind::Issue => format!("issue-{number}"),
+        let slot = match (kind, side) {
+            (crate::github::ItemKind::Pull, Some(Side::Review)) => {
+                Some(state::pr_slot_name(number, SessionSlot::Review))
+            }
+            (crate::github::ItemKind::Pull, Some(Side::Code)) => {
+                Some(state::pr_slot_name(number, SessionSlot::Code))
+            }
+            (crate::github::ItemKind::Issue, _) => Some(format!("issue-{number}")),
+            (crate::github::ItemKind::Pull, None) => None,
         };
-        self.use_slot(&slot);
+        if let Some(slot) = slot {
+            if !self.use_slot(&slot) {
+                self.stop(
+                    1,
+                    self.say(
+                        "worktree をロックできなかったので、メインクローンでは作業しません。",
+                        "Could not lock the worktree, so ghost will not work in the main clone.",
+                    ),
+                );
+                return Ok(());
+            }
+        }
         match (kind, side) {
             (crate::github::ItemKind::Pull, Some(Side::Review)) => self.review_loop(number),
             (crate::github::ItemKind::Pull, Some(Side::Code)) => {
@@ -1514,7 +1699,7 @@ impl Ctx {
     }
 
     fn checkout(&mut self, checkout: Checkout, purpose: &str) {
-        if self.slot_dir == self.main_clone {
+        if self.slot_lock.is_none() || self.slot_dir == self.main_clone {
             self.push_setup_failure(plain_failure(
                 format!("{purpose} のブランチを作業用 worktree に用意するため"),
                 format!("flock {}", self.slot_dir.display()),
@@ -1522,7 +1707,9 @@ impl Ctx {
                     "{purpose} を {} で作業できる状態にしてから作業して",
                     self.slot_dir.display()
                 ),
-                &anyhow!("the per-PR worktree lock is not held, so ghost will not check the branch out in the main clone"),
+                &anyhow!(
+                    "the worktree lock is not held, so ghost will not check the branch out in the main clone"
+                ),
             ));
             return;
         }
@@ -1541,8 +1728,25 @@ impl Ctx {
         if !outcome.note.is_empty() {
             self.log(outcome.note);
         }
-        self.workdir = outcome.workdir.clone();
-        self.agent.set_workdir(outcome.workdir);
+        let fell_back = outcome.workdir == self.main_clone && self.slot_dir != self.main_clone;
+        let workdir = if fell_back {
+            self.slot_dir.clone()
+        } else {
+            outcome.workdir.clone()
+        };
+        if fell_back {
+            self.push_setup_failure(plain_failure(
+                "作業ディレクトリを決めるため",
+                "best_workdir",
+                format!(
+                    "{} で作業できる状態にしてから作業して",
+                    self.slot_dir.display()
+                ),
+                &anyhow!("refusing to fall back to the main clone"),
+            ));
+        }
+        self.workdir = workdir.clone();
+        self.agent.set_workdir(workdir);
         for failure in outcome.failures {
             self.push_setup_failure(failure);
         }
@@ -1657,12 +1861,20 @@ impl Ctx {
             }
             self.refresh_session_status();
             self.push_status();
-            let ok = record_progress(
-                self.interrupted,
-                exit_code,
-                self.agent.clean_live(),
-                self.agent.saw_error(),
-            );
+            let broken_pipe = self.agent.prompt_was_refused();
+            if broken_pipe {
+                self.log(self.say(
+                    "エージェントがプロンプトを読まずに終了しました（EPIPE）。このターンは失敗です。",
+                    "The agent closed the prompt pipe (EPIPE). This turn failed.",
+                ));
+            }
+            let ok = !broken_pipe
+                && record_progress(
+                    self.interrupted,
+                    exit_code,
+                    self.agent.clean_live(),
+                    self.agent.saw_error(),
+                );
             if ok {
                 self.fail_streak = 0;
                 return Ok(true);
@@ -1909,12 +2121,48 @@ impl Ctx {
             &notes.join("\n\n"),
             true,
         ));
+        let before = self.comment_ids_now();
         let ok = self.dispatch_task(&prompt)?;
         self.note_setup_result(ok);
-        if !ok {
+        if ok {
+            self.absorb_queued_replies(&before);
+        } else {
             self.requeue_after_failed_send(notes);
         }
         Ok(())
+    }
+
+    fn comment_ids_now(&mut self) -> BTreeSet<String> {
+        let Some(number) = self.code_pr else {
+            return BTreeSet::new();
+        };
+        match self.gh.pr(number) {
+            Ok(snap) => snap.notes.into_iter().map(|note| note.id).collect(),
+            Err(_) => BTreeSet::new(),
+        }
+    }
+
+    /// A queued follow-up can post comments. Those ids are the agent's, so the
+    /// next code poll must not reply to them.
+    fn absorb_queued_replies(&mut self, before: &BTreeSet<String>) {
+        let Some(number) = self.code_pr else {
+            return;
+        };
+        let Some(path) = self.code_path.clone() else {
+            return;
+        };
+        self.absorb_into_code_sets(number, before);
+        let Ok(mut stored) = GhostState::load(&path) else {
+            return;
+        };
+        stored.seen_comment_ids = self.code_seen.iter().cloned().collect();
+        stored.agent_comment_ids = self.code_agent_ids.iter().cloned().collect();
+        if stored.save(&path).is_ok() {
+            self.log(self.say(
+                "送信したフォローのあいだに付いた自分のコメントは、新しい作業にしません",
+                "comments posted during the queued follow-up are not new work",
+            ));
+        }
     }
 
     fn find_pr_after(&mut self, issue: u64, branch: &str) -> Result<Option<u64>> {
@@ -1995,7 +2243,12 @@ impl Ctx {
         self.login.clone().unwrap_or_default()
     }
 
-    fn use_slot(&mut self, slot: &str) {
+    fn use_slot(&mut self, slot: &str) -> bool {
+        if self.slot_lock.is_some()
+            && self.slot_dir.file_name().and_then(|name| name.to_str()) == Some(slot)
+        {
+            return true;
+        }
         let Some(ghost_home) = self
             .main_clone
             .parent()
@@ -2008,16 +2261,16 @@ impl Ctx {
                 format!("{slot} の worktree パスが分かっている状態にしてから作業して"),
                 &anyhow!("work directory has no home"),
             ));
-            return;
+            return false;
         };
         let dest = workdir::slot_path(&ghost_home, &self.owner, &self.repo, slot);
         match workdir::lock_slot(&dest) {
             Ok(lock) => {
                 self.slot_lock = Some(lock);
                 self.slot_dir = dest.clone();
-                let actual = workdir::best_workdir(&dest, &self.main_clone, &ghost_home);
-                self.workdir = actual.clone();
-                self.agent.set_workdir(actual);
+                self.workdir = dest.clone();
+                self.agent.set_workdir(dest);
+                true
             }
             Err(err) => {
                 self.push_setup_failure(plain_failure(
@@ -2029,6 +2282,7 @@ impl Ctx {
                     ),
                     &err,
                 ));
+                false
             }
         }
     }
@@ -2337,13 +2591,28 @@ pub fn confirm_merge_answer(answer: ConfirmAnswer) -> MergeAnswer {
     }
 }
 
+fn record_handled_ci(stored: &mut GhostState, snap: &PrSnap) {
+    if snap.merge.checks == crate::merge::ChecksVerdict::Failed {
+        stored.handled_ci_sha = Some(snap.head_sha.clone());
+        stored.handled_failing_checks = snap.failing_checks.clone();
+    } else {
+        stored.handled_ci_sha = None;
+        stored.handled_failing_checks.clear();
+    }
+}
+
+fn ci_handled(stored: &GhostState) -> Option<CiHandled> {
+    let sha = stored.handled_ci_sha.clone()?;
+    Some(CiHandled::new(sha, stored.handled_failing_checks.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
         agent_backoff, confirm_merge_answer, confirm_review_answer, empty_repo_notice,
-        input_delivery_log, plan_user_input, stop_after_failures, InputPlan,
+        input_delivery_log, panic_message, plan_user_input, stop_after_failures, InputPlan,
         MAX_CONSECUTIVE_AGENT_FAILURES,
     };
     use crate::lang::Lang;
@@ -2411,9 +2680,12 @@ mod tests {
             MergeAnswer::Continue
         );
     }
-}
 
-fn ci_handled(stored: &GhostState) -> Option<CiHandled> {
-    let sha = stored.handled_ci_sha.clone()?;
-    Some(CiHandled::new(sha, stored.handled_failing_checks.clone()))
+    #[test]
+    fn worker_panic_is_reported_and_does_not_stay_running() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(&payload), "worker panicked: boom");
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+        assert_eq!(panic_message(&payload), "worker panicked: boom");
+    }
 }
