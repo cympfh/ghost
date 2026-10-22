@@ -870,6 +870,38 @@ mod tests {
     }
 
     #[test]
+    fn no_ci_clean_pull_is_merge_ready_on_a_quiet_poll() {
+        let mut pr = snap("abc", ChecksVerdict::None);
+        pr.ci_label = "none".into();
+        pr.merge.merge_state = crate::merge::MergeState::Clean;
+        pr.merge.mergeable = Mergeability::Mergeable;
+        pr.merge.approvals = 0;
+        pr.merge.changes_requested = false;
+        let action = decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap();
+        assert_eq!(action, CodeAction::Stop(StopReason::MergeReady));
+        assert_eq!(
+            code_step(CodeLaunch::Survey, true, action.clone()),
+            CodeStep::Action(action),
+            "after the opening turn, a quiet no-CI poll still offers merge"
+        );
+        assert_eq!(
+            crate::merge::merge_ready_line(&pr.merge),
+            "merge-ready? CI none(ok) / CLEAN / changes requested 0 → yes"
+        );
+        pr.merge.checks = ChecksVerdict::Pending;
+        assert_eq!(
+            decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap(),
+            CodeAction::Idle,
+            "pending checks wait and do not prompt"
+        );
+        pr.merge.checks = ChecksVerdict::AllGreen;
+        assert_eq!(
+            decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap(),
+            CodeAction::Stop(StopReason::MergeReady)
+        );
+    }
+
+    #[test]
     fn quiet_poll_does_not_wake_the_agent() {
         let pr = snap("abc", ChecksVerdict::None);
         let review = decide_review(&pr, Some("abc"), 0, 20, ReviewSignal::default()).unwrap();

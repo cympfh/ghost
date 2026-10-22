@@ -21,7 +21,7 @@ cargo install --path .
 ```sh
 ghost github.com/OWNER/REPO                  # オープンな PR と issue のピッカー
 ghost github.com/OWNER/REPO/pr/N --review    # head SHA が変わったらレビュー
-ghost github.com/OWNER/REPO/pr/N --code      # 赤い CI と新しいレビューコメントを直す
+ghost github.com/OWNER/REPO/pr/N --code      # 失敗した CI チェックと新しいレビューコメントを直す
 ghost github.com/OWNER/REPO/issue/N          # 実装して PR を開き、--code として続ける
 ghost github.com/OWNER/REPO/issue/N --yes    # 続行の確認を自動で受け入れる
 ```
@@ -29,7 +29,7 @@ ghost github.com/OWNER/REPO/issue/N --yes    # 続行の確認を自動で受け
 | 短縮 | 長い形 | デフォルト | |
 | --- | --- | --- | --- |
 | `-r` | `--review` | | head SHA が変わったらレビュー。`-c` と同時には付けられない。 |
-| `-c` | `--code` | | 赤い CI と新しいレビューコメントを直す。`-r` と同時には付けられない。 |
+| `-c` | `--code` | | 失敗した CI チェック（`gh pr checks` が失敗）と、新しいレビューコメントを直す。`-r` と同時には付けられない。 |
 | `-i` | `--interval` | `20s` | poll 間隔（`30s`、`2m`、`1h30m`、または単位なしの秒数）。 |
 | `-a` | `--agent` | `PATH` 上の最初 | `codex`、`claude`、`grok`。 |
 | `-k` | `--ssh-key` | ssh の設定、または `GHOST_SSH_KEY` | `ssh -i PATH -o IdentitiesOnly=yes`。鍵を省略すると identity を強制しない（`~/.ssh/id_rsa` は仮定しない）。 |
@@ -83,6 +83,6 @@ code モードで、ghost 自身の `gh` 再確認がマージ可能なら、`PR
 
 最後にレビューした SHA、既読コメント id、処理済みの CI シグネチャ、セッション id は `$GHOST_STATE_DIR`、または `$XDG_STATE_HOME/ghost`、または `~/.local/state/ghost` に保存します。パニックまたは SIGTERM では端末を戻し、エージェントのプロセスグループにシグナルを送ります。
 
-マージ可能とは、オープンで draft ではなく、`mergeStateStatus` が CLEAN、チェックが登録されてすべて成功（チェックが無いのは成功ではない）、コンフリクトがなく、未解決の changes requested が無いことです。同じレビュアーの後からの `COMMENTED` は、それより前の approve を消しません。
+マージ可能とは、オープンで draft ではなく、`mergeStateStatus` が CLEAN、コンフリクトがなく、未解決の changes requested が無いことです。`gh pr checks` にチェックがあれば、すべて成功している必要があります。pending は待ちます。一覧が空なら CI は無いので無視します。approve の件数は要りません。同じレビュアーの後からの `COMMENTED` は、それより前の approve を消しません。
 
 `q` で終了します。`i` で同じセッションにメッセージを送ります。`ctrl-c` はターンを中断し、セッション id は残します。`ghost --demo picker|review|code|confirm` は上の画面を台本データで描きます。

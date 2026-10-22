@@ -21,7 +21,7 @@ At startup ghost runs `gh auth status` and `gh repo view OWNER/REPO`. If either 
 ```sh
 ghost github.com/OWNER/REPO                  # picker of open PRs and issues
 ghost github.com/OWNER/REPO/pr/N --review    # review when the head SHA changes
-ghost github.com/OWNER/REPO/pr/N --code      # fix red CI and new review comments
+ghost github.com/OWNER/REPO/pr/N --code      # fix failing CI checks and new review comments
 ghost github.com/OWNER/REPO/issue/N          # implement, open a PR, then continue as --code
 ghost github.com/OWNER/REPO/issue/N --yes    # same, accepting the continue prompt
 ```
@@ -29,7 +29,7 @@ ghost github.com/OWNER/REPO/issue/N --yes    # same, accepting the continue prom
 | Short | Long | Default | |
 | --- | --- | --- | --- |
 | `-r` | `--review` | | Review when the head SHA changes. Conflicts with `-c`. |
-| `-c` | `--code` | | Fix red CI and new review comments. Conflicts with `-r`. |
+| `-c` | `--code` | | Fix failing CI checks (`gh pr checks`) and new review comments. Conflicts with `-r`. |
 | `-i` | `--interval` | `20s` | Poll interval (`30s`, `2m`, `1h30m`, or a bare number of seconds). |
 | `-a` | `--agent` | first on `PATH` | `codex`, `claude`, or `grok`. |
 | `-k` | `--ssh-key` | ssh config, or `GHOST_SSH_KEY` | `ssh -i PATH -o IdentitiesOnly=yes`. No key means no forced identity (`~/.ssh/id_rsa` is not assumed). |
@@ -83,6 +83,6 @@ An `Enter passphrase for key` prompt is answered before the TUI starts. Later `g
 
 Last reviewed SHA, seen comment ids, handled CI signature, and the session id are stored under `$GHOST_STATE_DIR`, or `$XDG_STATE_HOME/ghost`, or `~/.local/state/ghost`. A panic or SIGTERM restores the terminal and signals the agent process group.
 
-Merge-ready means open, not a draft, `mergeStateStatus` CLEAN, checks registered and all green (no checks is not green), not conflicting, and no outstanding changes requested. A later `COMMENTED` review does not clear an earlier approval from the same reviewer.
+Merge-ready means open, not a draft, `mergeStateStatus` CLEAN, not conflicting, and no outstanding changes requested. If `gh pr checks` lists checks, every one must have passed; a pending check waits. An empty check list means the PR has no CI, and CI is ignored. Approvals are not required. A later `COMMENTED` review does not clear an earlier approval from the same reviewer.
 
 `q` quits. `i` sends a message into the same session. `ctrl-c` interrupts the turn and leaves the session id in place. `ghost --demo picker|review|code|confirm` draws the screens above with scripted data.

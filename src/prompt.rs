@@ -65,6 +65,24 @@ fn role_code(lang: Lang) -> &'static str {
     }
 }
 
+/// Same rule ghost uses for `is_merge_ready`, so `GHOST_STATUS` matches the poll.
+fn ci_status_rule(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ja => "\
+CI の判断（`GHOST_STATUS` もこれと同じ）:
+- `gh pr checks` の一覧（statusCheckRollup）が空なら、この PR に CI は無い。CI は無視する。
+- 一覧が空でないなら、今の head のチェックがすべて成功しているときだけ CI は通る。pending やまだ出ていないチェックは待つ（needs_work）。失敗も needs_work。
+- mergeStateStatus が CLEAN、コンフリクトなし、未解決の changes requested なし、かつ CI が空かすべて成功なら `GHOST_STATUS: merge_ready`。approve の件数は要らない。
+",
+        Lang::En => "\
+CI rule (judge `GHOST_STATUS` the same way):
+- If `gh pr checks` (statusCheckRollup) is empty, this PR has no CI. Ignore CI.
+- If the list is not empty, CI passes only when every check on the current head has passed. Pending or not-yet-registered checks mean wait (`needs_work`). A failure is also `needs_work`.
+- `GHOST_STATUS: merge_ready` only when mergeStateStatus is CLEAN, there is no conflict, there is no outstanding changes requested, and CI is empty or all green. An approval count is not required.
+",
+    }
+}
+
 fn review_verdict_rules(lang: Lang, slug: &str, number: u64) -> String {
     match lang {
         Lang::Ja => format!(
@@ -239,10 +257,12 @@ pub fn code_survey(
              `gh` で説明、diff、CI、すべてのレビュー、インラインコメント、issue コメント、未回答のスレッドを読む。要約する。\n\
              未対応があればこのターンで扱う。落ちている CI は直す。未対応のコメントは直すか、スレッドに返信する。\n\
              作業ディレクトリ {wd} にブランチがチェックアウトされている。直すなら commit し、同じブランチへ `git push` する。\n\
+             {ci}\
              最後の行は次のどちらか一つだけにする:\n\
              GHOST_STATUS: merge_ready\n\
              GHOST_STATUS: needs_work\n\
              ghost が `gh` でマージ可否を自分で再確認する。この行だけではマージしない。\n",
+            ci = ci_status_rule(Lang::Ja),
             wd = workdir.display(),
         ),
         Lang::En => format!(
@@ -251,10 +271,12 @@ pub fn code_survey(
              Use `gh` to read the description, diff, CI, every review, inline comment, issue comment, and unanswered thread. Summarize.\n\
              Handle anything outstanding in this turn. Fix failing CI. Fix or reply to unaddressed comments.\n\
              The branch is checked out in {wd}. When you change code, commit and `git push` the same branch.\n\
+             {ci}\
              The last line must be exactly one of:\n\
              GHOST_STATUS: merge_ready\n\
              GHOST_STATUS: needs_work\n\
              ghost re-checks merge-readiness itself with `gh`. That line alone does not merge.\n",
+            ci = ci_status_rule(Lang::En),
             wd = workdir.display(),
         ),
     };
@@ -574,6 +596,8 @@ mod tests {
         assert!(survey.contains("GHOST_STATUS: merge_ready"));
         assert!(survey.contains("GHOST_STATUS: needs_work"));
         assert!(survey.contains("Never merge"));
+        assert!(survey.contains("statusCheckRollup"));
+        assert!(survey.contains("Ignore CI"));
 
         let follow = review_followup("acme/app", 3, "aaa", "bbb", dir, "d", &[], Lang::En);
         assert!(follow.contains("same review session"));
@@ -640,6 +664,22 @@ mod tests {
         assert!(issue.contains("マージしない"));
         assert!(!issue.contains("ghost/issue"));
         assert!(issue.contains("コーディング担当"));
+        let survey = code_survey(
+            "acme/app",
+            3,
+            "fix/3",
+            "abc",
+            dir,
+            false,
+            &[],
+            &[],
+            &[],
+            Lang::Ja,
+        );
+        assert!(survey.contains("一覧が空"));
+        assert!(survey.contains("CI は無視する"));
+        assert!(survey.contains("GHOST_STATUS: merge_ready"));
+        assert!(survey.contains("pending"));
         let review = review_initial("acme/app", 3, "abc", dir, "diff", &[], Lang::Ja);
         assert!(review.contains("日本語"));
         assert!(review.contains("マージしない"));

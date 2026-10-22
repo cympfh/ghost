@@ -65,8 +65,9 @@ pub enum Launch {
 }
 
 /// Decide whether the next turn starts the session or resumes it.
-/// A non-empty existing id always resumes, including across the issue → --code
-/// transition and across ghost restarts.
+/// A non-empty id resumes only when this process already holds that id
+/// (a follow-up, or text the user sent with `i`). A launch does not resume
+/// an id loaded from disk.
 pub fn plan_launch(kind: AgentKind, existing: Option<&str>, new_uuid: &str) -> Launch {
     if let Some(id) = existing {
         if !id.is_empty() {
@@ -289,10 +290,28 @@ pub fn event_is_error(kind: AgentKind, line: &str) -> bool {
     }
 }
 
-/// A resume that dies in CLI parsing never became an agent turn.
-/// A real failure (`turn.failed`, exit 1) still counts.
+/// A resume that dies in CLI parsing, or whose session does not exist,
+/// never became an agent turn. A real failure (`turn.failed`, exit 1) still counts.
 pub fn counts_as_agent_turn(launch: &Launch, exit_code: Option<i32>, output: &str) -> bool {
-    !(matches!(launch, Launch::Resume { .. }) && cli_usage_failure(exit_code, output))
+    if !matches!(launch, Launch::Resume { .. }) {
+        return true;
+    }
+    !(cli_usage_failure(exit_code, output) || resume_unavailable(exit_code, output))
+}
+
+/// Codex has no rollout for this thread id, or the session is otherwise unknown.
+/// Exit 0 and a real turn result are not this case.
+pub fn resume_unavailable(exit_code: Option<i32>, output: &str) -> bool {
+    if exit_code == Some(0) || has_agent_result_event(output) {
+        return false;
+    }
+    let text = output.to_ascii_lowercase();
+    text.contains("no rollout found")
+        || text.contains("thread/resume")
+        || text.contains("unknown session")
+        || text.contains("session not found")
+        || text.contains("no such session")
+        || text.contains("-32600")
 }
 
 fn cli_usage_failure(exit_code: Option<i32>, output: &str) -> bool {
@@ -699,9 +718,7 @@ impl AgentSession {
             .clone()
             .unwrap_or_else(|| PathBuf::from(spec.program));
         let mut cmd = Command::new(&program);
-        if self.stub.is_none() {
-            cmd.args(&spec.args);
-        }
+        cmd.args(&spec.args);
         cmd.current_dir(&self.workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -743,30 +760,25 @@ impl AgentSession {
         let (rx, readers) = spawn_readers(stdout, stderr);
         track_agent_pgid(child.id());
         let mut stdin = child.stdin.take().context("stdin")?;
-        if self.stub.is_some() {
-            drop(stdin);
-            self.stdin = None;
-        } else {
-            match spec.delivery {
-                Delivery::StreamJson => {
-                    stdin
-                        .write_all(claude_user_line(prompt).as_bytes())
-                        .context("write claude prompt")?;
-                    stdin.flush().ok();
-                    self.stdin = Some(stdin);
+        match spec.delivery {
+            Delivery::StreamJson => {
+                stdin
+                    .write_all(claude_user_line(prompt).as_bytes())
+                    .context("write claude prompt")?;
+                stdin.flush().ok();
+                self.stdin = Some(stdin);
+            }
+            Delivery::StdinClose => {
+                stdin.write_all(prompt.as_bytes()).context("write prompt")?;
+                if !prompt.ends_with('\n') {
+                    stdin.write_all(b"\n").ok();
                 }
-                Delivery::StdinClose => {
-                    stdin.write_all(prompt.as_bytes()).context("write prompt")?;
-                    if !prompt.ends_with('\n') {
-                        stdin.write_all(b"\n").ok();
-                    }
-                    drop(stdin);
-                    self.stdin = None;
-                }
-                Delivery::PromptFile => {
-                    drop(stdin);
-                    self.stdin = None;
-                }
+                drop(stdin);
+                self.stdin = None;
+            }
+            Delivery::PromptFile => {
+                drop(stdin);
+                self.stdin = None;
             }
         }
         self.child = Some(child);
@@ -1310,6 +1322,11 @@ mod tests {
         let failed = r#"{"type":"turn.failed"}"#;
         assert!(counts_as_agent_turn(&resume, Some(1), failed));
         assert!(counts_as_agent_turn(&resume, Some(0), ""));
+        let missing = "Error: thread/resume: thread/resume failed: no rollout found for thread id ec326e07-1111-4111-8111-111111111111 (code -32600)\n";
+        assert!(resume_unavailable(Some(1), missing));
+        assert!(!counts_as_agent_turn(&resume, Some(1), missing));
+        assert!(!resume_unavailable(Some(0), missing));
+        assert!(!resume_unavailable(Some(1), failed));
         let start = Launch::Start {
             preset_session_id: None,
         };
@@ -1443,6 +1460,88 @@ mod tests {
         assert!(
             matches!(again, Launch::Start { .. }),
             "resume failure starts a fresh session"
+        );
+        session.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_rollout_starts_a_fresh_session_and_runs_the_prompt() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-rollout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt_out = dir.join("prompt.txt");
+        let stub = dir.join("stub-codex");
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" resume \"*)\n    echo 'Error: thread/resume: thread/resume failed: no rollout found for thread id ec326e07-1111-4111-8111-111111111111 (code -32600)' >&2\n    exit 1\n    ;;\nesac\ncat > '{}'\necho '{{\"type\":\"turn.completed\"}}'\nexit 0\n",
+            prompt_out.display()
+        );
+        std::fs::write(&stub, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).unwrap();
+        }
+        let home = dir.join("home");
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut session = AgentSession::new(AgentKind::Codex, work, &home);
+        session.set_stub(stub);
+        session.seed(Some("ec326e07-1111-4111-8111-111111111111".into()));
+        let prompt = "SITUATION CHECK please";
+        let launch = session.dispatch(prompt).unwrap();
+        assert!(
+            matches!(launch, Launch::Resume { .. }),
+            "a seeded id resumes"
+        );
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "stub hung"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = session.recent_output().to_string();
+        assert!(output.contains("no rollout found"), "stderr was {output}");
+        assert!(!counts_as_agent_turn(
+            &launch,
+            session.last_exit_code(),
+            &output
+        ));
+        assert!(resume_unavailable(session.last_exit_code(), &output));
+        session.forget_session();
+        let again = session.dispatch(prompt).unwrap();
+        assert!(
+            matches!(again, Launch::Start { .. }),
+            "missing rollout starts fresh, got {again:?}"
+        );
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "fresh stub hung"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(session.last_exit_code(), Some(0));
+        assert!(counts_as_agent_turn(
+            &again,
+            session.last_exit_code(),
+            session.recent_output()
+        ));
+        let saved = std::fs::read_to_string(&prompt_out).unwrap();
+        assert!(
+            saved.contains(prompt),
+            "fresh session did not receive the prompt: {saved}"
         );
         session.stop();
         let _ = std::fs::remove_dir_all(&dir);

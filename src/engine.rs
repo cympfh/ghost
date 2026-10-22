@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 
 use crate::agent::{
-    agent_on_path, counts_as_agent_turn, describe_launch, pick_agent, record_progress, AgentKind,
-    AgentSession, Launch,
+    agent_on_path, counts_as_agent_turn, describe_launch, pick_agent, record_progress,
+    resume_unavailable, AgentKind, AgentSession, Launch,
 };
 use crate::github::Gh;
 use crate::lang::Lang;
-use crate::merge::{auto_merge_answer, commit_merge, is_merge_ready, MergeAnswer, StopReason};
+use crate::merge::{
+    auto_merge_answer, commit_merge, is_merge_ready, merge_ready_line, MergeAnswer, StopReason,
+};
 use crate::preflight::{evaluate, failure_message, is_fatal, AuthProbe, RepoProbe};
 use crate::prompt::{self, truncate};
 use crate::setup::{SetupFailure, SetupStep};
@@ -537,8 +539,7 @@ impl Ctx {
         self.status.target = format!("PR #{number}");
         let path = state::pr_state_path(&self.state_root, &self.owner, &self.repo, number);
         let mut stored = GhostState::load(&path)?;
-        self.agent
-            .seed(stored.session_for(SessionSlot::Review, self.agent.kind()));
+        // Launch starts a new session. A saved id is not resumed.
         self.push_status();
         let mut opened = false;
         loop {
@@ -735,9 +736,8 @@ impl Ctx {
         self.status.target = format!("PR #{number}");
         let path = state::pr_state_path(&self.state_root, &self.owner, &self.repo, number);
         let mut stored = GhostState::load(&path)?;
-        // Do not replace a session that issue mode already started.
-        self.agent
-            .seed(stored.session_for(SessionSlot::Code, self.agent.kind()));
+        // Do not resume a saved code session. Issue handoff already holds its id
+        // in this process; a fresh `--code` launch starts a new session.
         let mut seen: BTreeSet<String> = stored.seen_comment_ids.iter().cloned().collect();
         let mut agent_ids: BTreeSet<String> = stored.agent_comment_ids.iter().cloned().collect();
         let mut surveyed = matches!(launch, CodeLaunch::Handoff);
@@ -750,6 +750,7 @@ impl Ctx {
                 Some(mut snap) => {
                     let filtered = self.prepare_notes(&mut snap, &agent_ids);
                     self.log(filtered);
+                    self.log(merge_ready_line(&snap.merge));
                     snap
                 }
                 None => return Ok(()),
@@ -909,6 +910,7 @@ impl Ctx {
                 return Ok((false, true));
             }
         };
+        self.log(merge_ready_line(&fresh.merge));
         if after_opening_survey(is_merge_ready(&fresh.merge)) == AfterSurvey::MergePrompt {
             let leave = self.offer_merge(number, &fresh)?;
             return Ok((leave, true));
@@ -1001,6 +1003,17 @@ impl Ctx {
             "対応したコメントだけを記録しました",
             "recorded the comments this turn handled",
         ));
+        let fresh = match self.gh.pr(number) {
+            Ok(fresh) => fresh,
+            Err(err) => {
+                self.log_kind(LogKind::Error, format!("merge re-check failed: {err:#}"));
+                return Ok(());
+            }
+        };
+        self.log(merge_ready_line(&fresh.merge));
+        if is_merge_ready(&fresh.merge) {
+            let _ = self.offer_merge(number, &fresh)?;
+        }
         Ok(())
     }
 
@@ -1199,8 +1212,8 @@ impl Ctx {
         };
         let ipath = state::issue_state_path(&self.state_root, &self.owner, &self.repo, number);
         let mut istate = GhostState::load(&ipath)?;
-        self.agent
-            .seed(istate.session_for(SessionSlot::Code, self.agent.kind()));
+        // The launch situation check starts a new session. Later turns in this
+        // process, and `i`, resume that id. A saved id is not resumed.
         self.checkout(
             Checkout::Issue {
                 branch: branch.clone(),
@@ -1608,17 +1621,24 @@ impl Ctx {
             if self.quit {
                 return Ok(false);
             }
-            if !counts_as_agent_turn(
-                &launch,
-                self.agent.last_exit_code(),
-                self.agent.recent_output(),
-            ) {
+            let exit_code = self.agent.last_exit_code();
+            let output = self.agent.recent_output().to_string();
+            let counts = counts_as_agent_turn(&launch, exit_code, &output);
+            let missing = resume_unavailable(exit_code, &output);
+            if !counts {
                 self.turns = self.turns.saturating_sub(1);
                 self.status.turns = format!("{}/{}", self.turns, self.spec.max_turns);
-                self.log(self.say(
-                    "resume の起動引数が拒否されたため、この試行はターンに数えません",
-                    "resume rejected its arguments, so this attempt does not count as a turn",
-                ));
+                if missing {
+                    self.log(self.say(
+                        "resume できないセッション（rollout が無い、または不明）なので、この試行はターンに数えません",
+                        "resume target is missing, so this attempt does not count as a turn",
+                    ));
+                } else {
+                    self.log(self.say(
+                        "resume の起動引数が拒否されたため、この試行はターンに数えません",
+                        "resume rejected its arguments, so this attempt does not count as a turn",
+                    ));
+                }
             } else {
                 self.log(format!(
                     "agent turn finished ({}/{})",
@@ -1629,7 +1649,7 @@ impl Ctx {
             self.push_status();
             let ok = record_progress(
                 self.interrupted,
-                self.agent.last_exit_code(),
+                exit_code,
                 self.agent.clean_live(),
                 self.agent.saw_error(),
             );
@@ -1640,11 +1660,6 @@ impl Ctx {
             if self.interrupted {
                 return Ok(false);
             }
-            let usage = !counts_as_agent_turn(
-                &launch,
-                self.agent.last_exit_code(),
-                self.agent.recent_output(),
-            );
             if allow_fresh && matches!(launch, Launch::Resume { .. }) {
                 self.log(self.say(
                     "resume に失敗したので、同じ文脈で新しいセッションを開始します",
@@ -1652,7 +1667,9 @@ impl Ctx {
                 ));
                 self.agent.forget_session();
                 allow_fresh = false;
-                if !usage {
+                // A missing session or a rejected argv is not a failed turn:
+                // start the fresh session now, with no backoff and no streak.
+                if counts {
                     self.backoff_after_failure()?;
                     if self.quit {
                         return Ok(false);
@@ -1660,16 +1677,23 @@ impl Ctx {
                 }
                 continue;
             }
-            let code = self
-                .agent
-                .last_exit_code()
+            let code = exit_code
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "none".into());
             self.log(self.say(
                 &format!("エージェントのターンが失敗しました（exit {code}）"),
                 &format!("agent turn failed (exit {code})"),
             ));
-            if !usage {
+            if matches!(launch, Launch::Start { .. }) && !output.trim().is_empty() {
+                self.log(self.say(
+                    &format!(
+                        "新しいセッションの出力:\n{}",
+                        truncate(output.trim(), 2_000)
+                    ),
+                    &format!("fresh session output:\n{}", truncate(output.trim(), 2_000)),
+                ));
+            }
+            if counts {
                 self.backoff_after_failure()?;
             }
             return Ok(false);
