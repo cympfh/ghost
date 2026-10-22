@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 
 use crate::agent::{
-    agent_on_path, describe_launch, pick_agent, record_progress, AgentKind, AgentSession, Launch,
+    agent_on_path, counts_as_agent_turn, describe_launch, pick_agent, record_progress, AgentKind,
+    AgentSession, Launch,
 };
 use crate::github::Gh;
 use crate::lang::Lang;
@@ -1181,11 +1182,28 @@ impl Ctx {
             self.status.turns = format!("{}/{}", self.turns, self.spec.max_turns);
             self.push_status();
             self.wait_turn()?;
-            self.refresh_session_status();
-            self.push_status();
             if self.quit {
                 return Ok(false);
             }
+            if !counts_as_agent_turn(
+                &launch,
+                self.agent.last_exit_code(),
+                self.agent.recent_output(),
+            ) {
+                self.turns = self.turns.saturating_sub(1);
+                self.status.turns = format!("{}/{}", self.turns, self.spec.max_turns);
+                self.log(self.say(
+                    "resume の起動引数が拒否されたため、この試行はターンに数えません",
+                    "resume rejected its arguments, so this attempt does not count as a turn",
+                ));
+            } else {
+                self.log(format!(
+                    "agent turn finished ({}/{})",
+                    self.turns, self.spec.max_turns
+                ));
+            }
+            self.refresh_session_status();
+            self.push_status();
             let ok = record_progress(
                 self.interrupted,
                 self.agent.last_exit_code(),
@@ -1236,10 +1254,6 @@ impl Ctx {
                 }
             }
             if self.agent.turn_finished() {
-                self.log(format!(
-                    "agent turn finished ({}/{})",
-                    self.turns, self.spec.max_turns
-                ));
                 if !self.quit && !self.interrupted {
                     self.flush_queued()?;
                 }

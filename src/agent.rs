@@ -146,6 +146,9 @@ pub fn command_for(
             ],
             delivery: Delivery::StreamJson,
         },
+        // `--resume` continues the id. `--session-id` would start a different
+        // conversation, and `--fork-session` would copy it. No cwd flag; the
+        // child process cwd is the worktree. stream-json still needs `--verbose`.
         (AgentKind::Claude, Launch::Resume { session_id }) => AgentCommand {
             program: "claude",
             args: vec![
@@ -174,17 +177,20 @@ pub fn command_for(
             ],
             delivery: Delivery::StdinClose,
         },
+        // `codex exec resume` does not accept `-C`/`--cd` (it is not on ResumeArgs
+        // and is not an exec global). The child process cwd is the worktree.
+        // `--json`, the bypass flag, and `--skip-git-repo-check` are exec globals,
+        // so they go before `resume`. Do not pass `-s`/`--sandbox`; the bypass
+        // flag is the accepted global, not a `-c` override.
         (AgentKind::Codex, Launch::Resume { session_id }) => AgentCommand {
             program: "codex",
             args: vec![
                 "exec".into(),
-                "resume".into(),
-                session_id.clone(),
                 "--json".into(),
                 "--dangerously-bypass-approvals-and-sandbox".into(),
                 "--skip-git-repo-check".into(),
-                "-C".into(),
-                dir,
+                "resume".into(),
+                session_id.clone(),
                 "-".into(),
             ],
             delivery: Delivery::StdinClose,
@@ -209,6 +215,10 @@ pub fn command_for(
             ],
             delivery: Delivery::PromptFile,
         },
+        // `--resume` is a top-level flag, not a subcommand. Docs accept
+        // `--cwd`, `--yolo`, `--prompt-file`, and `--output-format` with it.
+        // `--session-id` creates a new session, so it stays off this argv.
+        // The child process cwd is also the worktree.
         (AgentKind::Grok, Launch::Resume { session_id }) => AgentCommand {
             program: "grok",
             args: vec![
@@ -277,6 +287,31 @@ pub fn event_is_error(kind: AgentKind, line: &str) -> bool {
             ty == "error" || v.get("is_error").and_then(|b| b.as_bool()) == Some(true)
         }
     }
+}
+
+/// A resume that dies in CLI parsing never became an agent turn.
+/// A real failure (`turn.failed`, exit 1) still counts.
+pub fn counts_as_agent_turn(launch: &Launch, exit_code: Option<i32>, output: &str) -> bool {
+    !(matches!(launch, Launch::Resume { .. }) && cli_usage_failure(exit_code, output))
+}
+
+fn cli_usage_failure(exit_code: Option<i32>, output: &str) -> bool {
+    if has_agent_result_event(output) {
+        return false;
+    }
+    let text = output.to_ascii_lowercase();
+    let clap_usage = text.contains("unexpected argument")
+        || text.contains("unexpected option")
+        || (text.contains("error:") && text.contains("usage:"));
+    exit_code == Some(2) || (exit_code.is_some_and(|code| code != 0) && clap_usage)
+}
+
+fn has_agent_result_event(output: &str) -> bool {
+    let compact = output.replace(' ', "");
+    compact.contains("\"type\":\"turn.completed\"")
+        || compact.contains("\"type\":\"turn.failed\"")
+        || compact.contains("\"type\":\"result\"")
+        || compact.contains("\"type\":\"end\"")
 }
 
 /// Record a review SHA or seen comments only after a finished successful turn.
@@ -466,6 +501,7 @@ pub struct AgentSession {
     turn_open: bool,
     exited: bool,
     last_exit: Option<i32>,
+    last_output: String,
     clean_end: bool,
     saw_error: bool,
     stub: Option<PathBuf>,
@@ -486,6 +522,7 @@ impl AgentSession {
             turn_open: false,
             exited: false,
             last_exit: None,
+            last_output: String::new(),
             clean_end: false,
             saw_error: false,
             stub: None,
@@ -503,6 +540,11 @@ impl AgentSession {
 
     pub fn last_exit_code(&self) -> Option<i32> {
         self.last_exit
+    }
+
+    /// Stdout and stderr captured for this launch, used to spot CLI usage errors.
+    pub fn recent_output(&self) -> &str {
+        &self.last_output
     }
 
     pub fn clean_live(&self) -> bool {
@@ -549,6 +591,7 @@ impl AgentSession {
 
     pub fn dispatch(&mut self, prompt: &str) -> Result<Launch> {
         self.last_exit = None;
+        self.last_output.clear();
         self.clean_end = false;
         self.saw_error = false;
         let launch = plan_launch(self.kind, self.session_id.as_deref(), &new_session_id());
@@ -585,6 +628,7 @@ impl AgentSession {
         self.drain_rx();
         let mut shown = Vec::new();
         while let Some(raw) = self.pending.pop_front() {
+            self.remember_output(&raw);
             if let Some(id) = extract_session_id(&raw) {
                 self.session_id = Some(id);
             }
@@ -729,6 +773,18 @@ impl AgentSession {
         self.rx = Some(rx);
         self.readers = readers;
         Ok(())
+    }
+
+    fn remember_output(&mut self, line: &str) {
+        const CAP: usize = 8_000;
+        self.last_output.push_str(line);
+        if self.last_output.len() > CAP {
+            let mut start = self.last_output.len() - CAP;
+            while !self.last_output.is_char_boundary(start) {
+                start += 1;
+            }
+            self.last_output.drain(..start);
+        }
     }
 
     fn drain_rx(&mut self) {
@@ -1028,8 +1084,19 @@ mod tests {
             file,
         )
         .unwrap();
-        assert_eq!(&codex.args[..3], ["exec", "resume", "th-1"]);
-        assert!(codex.args.iter().any(|a| a == "--json"));
+        assert_eq!(
+            codex.args,
+            [
+                "exec",
+                "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--skip-git-repo-check",
+                "resume",
+                "th-1",
+                "-",
+            ]
+        );
+        assert!(!codex.args.iter().any(|a| a == "-C" || a == "--cd"));
 
         let grok = command_for(
             AgentKind::Grok,
@@ -1062,6 +1129,205 @@ mod tests {
         .unwrap();
         assert!(grok_new.args.windows(2).any(|w| w == ["--session-id", id]));
         assert!(!grok_new.args.iter().any(|a| a == "--resume"));
+    }
+
+    #[test]
+    fn argv_for_initial_and_resume_invocations() {
+        let dir = Path::new("/work/acme__app");
+        let file = Path::new("/tmp/prompt.md");
+        let id = "11111111-1111-4111-8111-111111111111";
+        let args = |kind, launch: Launch| command_for(kind, &launch, dir, file).unwrap().args;
+
+        assert_eq!(
+            args(
+                AgentKind::Codex,
+                Launch::Start {
+                    preset_session_id: None,
+                }
+            ),
+            vec![
+                "exec".to_string(),
+                "--json".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                "--skip-git-repo-check".into(),
+                "-C".into(),
+                "/work/acme__app".into(),
+                "-".into(),
+            ]
+        );
+        let codex_resume = args(
+            AgentKind::Codex,
+            Launch::Resume {
+                session_id: "01a16307-thread".into(),
+            },
+        );
+        assert_eq!(
+            codex_resume,
+            vec![
+                "exec".to_string(),
+                "--json".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                "--skip-git-repo-check".into(),
+                "resume".into(),
+                "01a16307-thread".into(),
+                "-".into(),
+            ]
+        );
+        assert!(codex_resume
+            .iter()
+            .all(|a| a != "-C" && a != "--cd" && a != "-s" && a != "--sandbox"));
+        assert!(!codex_resume.iter().any(|a| a.contains("acme__app")));
+
+        assert_eq!(
+            args(
+                AgentKind::Claude,
+                Launch::Start {
+                    preset_session_id: Some(id.into()),
+                }
+            ),
+            vec![
+                "--print".to_string(),
+                "--dangerously-skip-permissions".into(),
+                "--input-format".into(),
+                "stream-json".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+                "--session-id".into(),
+                id.into(),
+            ]
+        );
+        let claude_resume = args(
+            AgentKind::Claude,
+            Launch::Resume {
+                session_id: id.into(),
+            },
+        );
+        assert_eq!(
+            claude_resume,
+            vec![
+                "--print".to_string(),
+                "--dangerously-skip-permissions".into(),
+                "--input-format".into(),
+                "stream-json".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+                "--resume".into(),
+                id.into(),
+            ]
+        );
+        assert!(!claude_resume
+            .iter()
+            .any(|a| a == "--session-id" || a == "--fork-session"));
+
+        assert_eq!(
+            args(
+                AgentKind::Grok,
+                Launch::Start {
+                    preset_session_id: Some(id.into()),
+                }
+            ),
+            vec![
+                "--prompt-file".to_string(),
+                "/tmp/prompt.md".into(),
+                "--session-id".into(),
+                id.into(),
+                "--output-format".into(),
+                "streaming-json".into(),
+                "--yolo".into(),
+                "--cwd".into(),
+                "/work/acme__app".into(),
+            ]
+        );
+        let grok_resume = args(
+            AgentKind::Grok,
+            Launch::Resume {
+                session_id: id.into(),
+            },
+        );
+        assert_eq!(
+            grok_resume,
+            vec![
+                "--prompt-file".to_string(),
+                "/tmp/prompt.md".into(),
+                "--resume".into(),
+                id.into(),
+                "--output-format".into(),
+                "streaming-json".into(),
+                "--yolo".into(),
+                "--cwd".into(),
+                "/work/acme__app".into(),
+            ]
+        );
+        assert!(!grok_resume
+            .iter()
+            .any(|a| a == "--session-id" || a == "--fork-session"));
+    }
+
+    #[test]
+    fn resume_argv_usage_failure_does_not_count_as_a_turn() {
+        let resume = Launch::Resume {
+            session_id: "01a16307".into(),
+        };
+        let usage = "error: unexpected argument '-C' found\n\nUsage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]\n";
+        assert!(!counts_as_agent_turn(&resume, Some(2), usage));
+        assert!(!counts_as_agent_turn(&resume, Some(2), ""));
+        assert!(!counts_as_agent_turn(
+            &resume,
+            Some(1),
+            "error: unexpected option '--sandbox' found\nUsage: codex exec resume"
+        ));
+        let failed = r#"{"type":"turn.failed"}"#;
+        assert!(counts_as_agent_turn(&resume, Some(1), failed));
+        assert!(counts_as_agent_turn(&resume, Some(0), ""));
+        let start = Launch::Start {
+            preset_session_id: None,
+        };
+        assert!(counts_as_agent_turn(&start, Some(2), usage));
+        assert!(!record_progress(false, Some(2), false, false));
+    }
+
+    #[test]
+    fn resume_spawn_uses_the_worktree_as_process_cwd() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work = dir.join("worktree");
+        std::fs::create_dir_all(&work).unwrap();
+        let work = work.canonicalize().unwrap();
+        let stub = dir.join("stub-agent");
+        std::fs::write(&stub, "#!/bin/sh\npwd -P\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).unwrap();
+        }
+        let home = dir.join("home");
+        let mut session = AgentSession::new(AgentKind::Codex, work.clone(), &home);
+        session.set_stub(stub);
+        session.seed(Some("01a16307".into()));
+        let launch = session.dispatch("follow up").unwrap();
+        assert!(matches!(launch, Launch::Resume { .. }));
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "stub hung"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = session.recent_output().trim().to_string();
+        assert_eq!(output, work.display().to_string());
+        session.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
