@@ -24,13 +24,20 @@ ghost github.com/OWNER/REPO/pr/N --review    # review
 ghost github.com/OWNER/REPO/pr/N --code      # fix CI failures and review comments
 ghost github.com/OWNER/REPO/issue/N          # implement, open a pull request, then keep fixing
 ghost github.com/OWNER/REPO/issue/N --yes    # same, accepting the continue prompt
+ghost github.com/OWNER/REPO/issues --auto    # oldest open issue, then the next
 ```
 
 A pull request URL with no flag asks whether to review or to fix.
 
 A repository with nothing open prints one line and exits.
 
-A repository URL with `--review` or `--code` is an error. `--review` on an issue URL is an error.
+A repository URL with `--review` or `--code` is an error. `--review` on an issue URL is an error. `--auto` on a repository, pull request, or numbered issue is an error.
+
+`github.com/OWNER/REPO/issues` (and `/issue`) lists only open issues.
+
+`--auto` skips that list. Each time ghost checks GitHub, it takes the oldest open issue it has not handled and runs the usual issue flow: implement, open a pull request, then keep up with review. It skips an issue that already has an open pull request, or that failed earlier, and writes the failure reason to the log and the state file. When nothing is left, it waits for the next check instead of exiting. `q` or Ctrl-C ends the loop.
+
+Without `--merge-yes`, a merge-ready pull request uses the usual confirm. A terminal asks. Without a terminal, ghost reports the pull request and takes the next issue. `y` merges and continues, `c` stays on this pull request, and `n` or Enter leaves it unmerged and continues. `--auto --yes --merge-yes` opens the pull request, handles review, merges, and then takes the next issue.
 
 A pull request is mergeable when it is open, not a draft, free of conflicts, has no outstanding change requests, and every listed check has passed. When no checks are listed, CI is not part of that decision. ghost confirms with you before merging, and `--merge-yes` merges without that confirmation.
 
@@ -43,7 +50,8 @@ A pull request is mergeable when it is open, not a draft, free of conflicts, has
 | `-k` | `--ssh-key` | ssh config, or `GHOST_SSH_KEY` | Private key passed to ssh. |
 | `-l` | `--lang` | `ja` (`GHOST_LANG` if the flag is omitted) | `ja` or `en`. |
 | `-y` | `--yes` | | Accept the continue prompt and the review-exit prompt. Does not merge. |
-| | `--merge-yes` | | Merge without confirming. Only with `--code` or an issue. |
+| | `--merge-yes` | | Merge without confirming. Only with `--code`, an issue, or `--auto`. |
+| | `--auto` | | With `/issues`, take the oldest open issue on each check. No picker. |
 | | `--merge-method` | `squash` | `merge`, `squash`, or `rebase`. |
 | `-n` | `--max-iterations` | `20` | Stop after this many agent turns. |
 | `-t` | `--trust-comments` | `all` | Who may wake `--code`: `all`, `collaborators`, or `contributors`. |

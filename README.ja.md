@@ -24,13 +24,20 @@ ghost github.com/OWNER/REPO/pr/N --review    # レビューする
 ghost github.com/OWNER/REPO/pr/N --code      # CI の失敗とレビューコメントを直す
 ghost github.com/OWNER/REPO/issue/N          # 実装してプルリクエストを開き、直し続ける
 ghost github.com/OWNER/REPO/issue/N --yes    # 続く確認を受け入れて始める
+ghost github.com/OWNER/REPO/issues --auto    # いちばん古い issue から順に進める
 ```
 
 フラグの無いプルリクエストの URL では、レビューするか直すかを尋ねます。
 
 開いているプルリクエストも issue も無いときは、一行を出して終了します。
 
-リポジトリの URL に `--review` か `--code` を付けるとエラーです。issue の URL に `--review` を付けるとエラーです。
+リポジトリの URL に `--review` か `--code` を付けるとエラーです。issue の URL に `--review` を付けるとエラーです。リポジトリ、プルリクエスト、番号付きの issue に `--auto` を付けるとエラーです。
+
+`github.com/OWNER/REPO/issues`（`/issue` も同じ）は、開いている issue だけを一覧します。
+
+`--auto` は一覧を出さず、GitHub を確認するたびに、まだ扱っていないいちばん古い issue をいつもの流れ（実装、プルリクエスト、レビュー対応）で進め、開いているプルリクエストが付いているものと以前失敗したものを飛ばします。失敗の理由はログと状態ファイルに残り、候補が無いあいだは終了せず次の確認まで待ち、`q` と Ctrl-C でループを終えます。
+
+`--merge-yes` が無いとき、マージできる状態ではいつもの確認になり、端末では尋ね、端末が無いときは報告して次の issue に進みます。`y` はマージして次へ、`c` はそのプルリクエストに留まり、`n` と Enter はマージせず次の issue へ移り、`--auto --yes --merge-yes` は確認なしでプルリクエストを作ってレビューを直し、マージしてから次を取ります。
 
 マージできるのは、開いていて下書きではなく、衝突がなく、未解決の変更要求がなく、並んでいるチェックがすべて成功しているときです。チェックが一覧に無いときは、CI の成功を条件にしません。マージの前に確認し、`--merge-yes` のときだけ確認せずにマージします。
 
@@ -43,7 +50,8 @@ ghost github.com/OWNER/REPO/issue/N --yes    # 続く確認を受け入れて始
 | `-k` | `--ssh-key` | ssh の設定、または `GHOST_SSH_KEY` | ssh に渡す秘密鍵。 |
 | `-l` | `--lang` | `ja`（フラグが無いときは `GHOST_LANG`） | `ja` または `en`。 |
 | `-y` | `--yes` | | 続ける確認と、レビューを終える確認を受け入れる。マージはしない。 |
-| | `--merge-yes` | | 確認せずにマージする。`--code` か issue のときだけ。 |
+| | `--merge-yes` | | 確認せずにマージする。`--code`、issue、または `--auto` のときだけ。 |
+| | `--auto` | | `/issues` で、確認のたびにいちばん古いオープンな issue を取る。一覧は出さない。 |
 | | `--merge-method` | `squash` | `merge`、`squash`、または `rebase`。 |
 | `-n` | `--max-iterations` | `20` | エージェントに頼む回数の上限。 |
 | `-t` | `--trust-comments` | `all` | 直しを始めるコメントの投稿者。`all`、`collaborators`、`contributors`。 |

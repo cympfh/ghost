@@ -122,6 +122,64 @@ pub fn issue_state_path(root: &Path, owner: &str, repo: &str, number: u64) -> Pa
         .join(format!("issue-{number}.json"))
 }
 
+/// Issues `--auto` already failed, so a later check does not take them again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoState {
+    #[serde(default)]
+    pub failed: Vec<AutoFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoFailure {
+    pub number: u64,
+    pub reason: String,
+}
+
+impl AutoState {
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw =
+            fs::read_to_string(path).with_context(|| format!("read state {}", path.display()))?;
+        match serde_json::from_str(&raw) {
+            Ok(state) => Ok(state),
+            Err(_) => Ok(Self::default()),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let body = serde_json::to_vec_pretty(self)?;
+        fs::write(&tmp, body)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn record(&mut self, number: u64, reason: &str) {
+        let reason = reason.trim();
+        let reason = if reason.chars().count() > 500 {
+            let mut cut: String = reason.chars().take(500).collect();
+            cut.push('…');
+            cut
+        } else {
+            reason.to_string()
+        };
+        if let Some(row) = self.failed.iter_mut().find(|row| row.number == number) {
+            row.reason = reason;
+            return;
+        }
+        self.failed.push(AutoFailure { number, reason });
+    }
+}
+
+pub fn auto_state_path(root: &Path, owner: &str, repo: &str) -> PathBuf {
+    root.join(format!("{owner}__{repo}")).join("auto.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

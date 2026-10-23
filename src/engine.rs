@@ -48,6 +48,10 @@ pub enum RunMode {
     Code,
     Issue,
     Picker,
+    /// Open issues only. No pull requests.
+    IssueList,
+    /// Take the oldest eligible issue, then check again.
+    Auto,
     Ask,
 }
 
@@ -235,7 +239,7 @@ fn prime_checkout(
             }
         }
         RunMode::Issue => prime_issue(&gh, &slug, spec, main, dest),
-        RunMode::Picker => workdir::CheckoutOutcome {
+        RunMode::Picker | RunMode::IssueList | RunMode::Auto => workdir::CheckoutOutcome {
             workdir: dest.to_path_buf(),
             note: String::new(),
             failures: Vec::new(),
@@ -363,7 +367,7 @@ struct SlotPrep {
 
 fn activate_slot(spec: &RunSpec, home: &std::path::Path, main: &std::path::Path) -> SlotPrep {
     let slot = match spec.mode {
-        RunMode::Picker | RunMode::Ask => None,
+        RunMode::Picker | RunMode::IssueList | RunMode::Auto | RunMode::Ask => None,
         RunMode::Issue => match issue_number(&spec.target) {
             Ok(number) => Some(format!("issue-{number}")),
             Err(err) => {
@@ -525,6 +529,8 @@ fn babysit(
         code_seen: BTreeSet::new(),
         code_agent_ids: BTreeSet::new(),
         state_root: state::state_dir(),
+        auto_issue: None,
+        auto_release: None,
     };
 
     match ctx.spec.mode {
@@ -544,7 +550,9 @@ fn babysit(
             let n = pull_number(&ctx.spec.target)?;
             ctx.ask_mode(n)?;
         }
-        RunMode::Picker => ctx.picker_flow()?,
+        RunMode::Picker => ctx.picker_flow(false)?,
+        RunMode::IssueList => ctx.picker_flow(true)?,
+        RunMode::Auto => ctx.auto_loop()?,
     }
     Ok(())
 }
@@ -587,6 +595,9 @@ struct Ctx {
     code_seen: BTreeSet<String>,
     code_agent_ids: BTreeSet<String>,
     state_root: PathBuf,
+    /// Set while `--auto` is inside one issue, so `stop` returns to the loop.
+    auto_issue: Option<u64>,
+    auto_release: Option<AutoRelease>,
 }
 
 impl Ctx {
@@ -1620,14 +1631,23 @@ impl Ctx {
         }
     }
 
-    fn picker_flow(&mut self) -> Result<()> {
-        self.status.mode = "picker".into();
+    fn picker_flow(&mut self, issues_only: bool) -> Result<()> {
+        self.status.mode = if issues_only { "issues" } else { "picker" }.into();
         self.status.target = self.spec.target.display_url();
         self.status.phase = "loading".into();
         self.push_status();
-        self.log("loading open pull requests and issues");
-        let items = self.gh.open_items()?;
-        let _ = self.tx.send(UiEvent::Picker(items));
+        let items = if issues_only {
+            self.log("loading open issues");
+            self.gh.open_issues()?
+        } else {
+            self.log("loading open pull requests and issues");
+            self.gh.open_items()?
+        };
+        let _ = self.tx.send(if issues_only {
+            UiEvent::IssuePicker(items)
+        } else {
+            UiEvent::Picker(items)
+        });
         self.status.phase = "choose".into();
         self.push_status();
         let choice = loop {
@@ -1673,6 +1693,130 @@ impl Ctx {
             (crate::github::ItemKind::Issue, _) => self.issue_flow(number),
             (crate::github::ItemKind::Pull, None) => self.ask_mode(number),
         }
+    }
+
+    /// Refetch open issues on each check. One issue runs at a time.
+    /// An empty list waits for the next interval instead of exiting.
+    fn auto_loop(&mut self) -> Result<()> {
+        self.status.mode = "auto".into();
+        self.status.target = self.spec.target.display_url();
+        self.push_status();
+        let path = state::auto_state_path(&self.state_root, &self.owner, &self.repo);
+        loop {
+            if self.quit {
+                self.stop(0, "quit".into());
+                return Ok(());
+            }
+            self.status.phase = "checking".into();
+            self.push_status();
+            let issues = self.gh.auto_issues()?;
+            let prs = self.gh.open_pr_links()?;
+            let stored = state::AutoState::load(&path)?;
+            let failed: Vec<(u64, String)> = stored
+                .failed
+                .iter()
+                .map(|row| (row.number, row.reason.clone()))
+                .collect();
+            let choice = crate::auto::poll(&issues, &failed, &prs);
+            for skip in &choice.skipped {
+                self.log(self.skip_line(skip));
+            }
+            match choice.action {
+                crate::auto::AutoAction::Idle => {
+                    self.log(self.say(
+                        "未処理のオープンな issue はありません。次の確認まで待ちます。",
+                        "No open issue is waiting. Checking again after the interval.",
+                    ));
+                    if self.wait_interval()? {
+                        return Ok(());
+                    }
+                }
+                crate::auto::AutoAction::Run(number) => {
+                    self.log(self.say(
+                        &format!("issue #{number} を始めます。"),
+                        &format!("Taking issue #{number}."),
+                    ));
+                    self.begin_auto_issue(number, &path)?;
+                }
+            }
+        }
+    }
+
+    fn begin_auto_issue(&mut self, number: u64, path: &std::path::Path) -> Result<()> {
+        self.auto_issue = Some(number);
+        self.auto_release = None;
+        let result = self.issue_flow(number);
+        let release = self.auto_release.take();
+        let user_quit = self.quit && release.is_none();
+        self.auto_issue = None;
+        if user_quit {
+            return Ok(());
+        }
+        if let Err(err) = result {
+            let reason = format!("{err:#}");
+            self.log_kind(LogKind::Error, reason.clone());
+            self.record_auto_failure(number, &reason, path)?;
+        } else if let Some(release) = release {
+            if release.code != 0 {
+                self.record_auto_failure(number, &release.message, path)?;
+            }
+        }
+        self.prepare_next_issue();
+        Ok(())
+    }
+
+    fn skip_line(&self, skip: &crate::auto::Skip) -> String {
+        match skip {
+            crate::auto::Skip::Failed { number, reason } => self.say(
+                &format!("issue #{number} は以前失敗したので飛ばします: {reason}"),
+                &format!("skipping issue #{number}; it failed earlier: {reason}"),
+            ),
+            crate::auto::Skip::OpenPr { number, pr } => self.say(
+                &format!("issue #{number} は開いている PR #{pr} があるので飛ばします。"),
+                &format!("skipping issue #{number}; open PR #{pr} already covers it."),
+            ),
+        }
+    }
+
+    fn record_auto_failure(
+        &mut self,
+        number: u64,
+        reason: &str,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        let mut stored = state::AutoState::load(path)?;
+        stored.record(number, reason);
+        stored.save(path)?;
+        self.log(self.say(
+            &format!("issue #{number} を失敗として記録しました。"),
+            &format!("Recorded issue #{number} as failed."),
+        ));
+        Ok(())
+    }
+
+    fn prepare_next_issue(&mut self) {
+        self.quit = false;
+        self.turns = 0;
+        self.fail_streak = 0;
+        self.queued.clear();
+        self.delivering_queue = false;
+        self.turn_signal.clear();
+        self.interrupted = false;
+        self.last_idle_sha = None;
+        self.merge_streak = MergeReadyStreak::with_gap(self.spec.interval);
+        self.merge_hold = None;
+        self.code_pr = None;
+        self.code_path = None;
+        self.code_seen.clear();
+        self.code_agent_ids.clear();
+        self.agent.forget_session();
+        self.status.turns = format!("0/{}", self.spec.max_turns);
+        self.status.session = "—".into();
+        self.push_status();
+    }
+
+    fn handing_off(&self) -> bool {
+        self.spec.mode == RunMode::Auto && self.auto_issue.is_some()
     }
 
     fn poll_pr(&mut self, number: u64) -> Result<Option<PrSnap>> {
@@ -2248,8 +2392,17 @@ impl Ctx {
 
     fn find_pr_after(&mut self, issue: u64, branch: &str) -> Result<Option<u64>> {
         for attempt in 0..3 {
-            if let Some(number) = self.gh.find_issue_pr(issue, branch)? {
-                return Ok(Some(number));
+            match self.gh.find_issue_pr(issue, branch) {
+                Ok(Some(number)) => return Ok(Some(number)),
+                Ok(None) => {}
+                Err(err) if self.handing_off() => {
+                    self.stop(
+                        1,
+                        format!("could not look up a pull request for issue #{issue}: {err:#}"),
+                    );
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
             }
             if attempt == 2 {
                 break;
@@ -2260,9 +2413,14 @@ impl Ctx {
                 return Ok(None);
             }
         }
-        Err(anyhow!(
+        let reason = format!(
             "the agent finished but no pull request for issue #{issue} was found. Expected branch {branch} or a body containing Closes #{issue}."
-        ))
+        );
+        if self.handing_off() {
+            self.stop(1, reason);
+            return Ok(None);
+        }
+        Err(anyhow!(reason))
     }
 
     fn pause(&mut self, dur: Duration) -> bool {
@@ -2296,6 +2454,15 @@ impl Ctx {
     }
 
     fn stop(&mut self, code: i32, message: String) {
+        if self.handing_off() && message != "quit" {
+            if !message.is_empty() {
+                self.log(message.clone());
+            }
+            self.auto_release = Some(AutoRelease { code, message });
+            self.agent.stop();
+            self.quit = true;
+            return;
+        }
         if !message.is_empty() && message != "quit" {
             self.log(message.clone());
         }
@@ -2523,7 +2690,9 @@ fn pr_purpose(mode: RunMode, number: u64) -> String {
         RunMode::Code => format!("修正対象の PR #{number}"),
         RunMode::Issue => format!("issue から続く PR #{number}"),
         RunMode::Ask => format!("対象の PR #{number}"),
-        RunMode::Picker => format!("選択された PR #{number}"),
+        RunMode::Picker | RunMode::IssueList | RunMode::Auto => {
+            format!("選択された PR #{number}")
+        }
     }
 }
 
@@ -2599,6 +2768,8 @@ fn mode_name(mode: RunMode) -> &'static str {
         RunMode::Code => "code",
         RunMode::Issue => "issue",
         RunMode::Picker => "picker",
+        RunMode::IssueList => "issues",
+        RunMode::Auto => "auto",
         RunMode::Ask => "pr",
     }
 }
@@ -2618,6 +2789,11 @@ pub fn stop_after_failures(streak: u32) -> bool {
 
 fn label_refs(labels: &[String]) -> Vec<&str> {
     labels.iter().map(String::as_str).collect()
+}
+
+struct AutoRelease {
+    code: i32,
+    message: String,
 }
 
 fn short_id(id: &str) -> &str {
@@ -2850,6 +3026,8 @@ mod tests {
             code_seen: std::collections::BTreeSet::new(),
             code_agent_ids: std::collections::BTreeSet::new(),
             state_root: home,
+            auto_issue: None,
+            auto_release: None,
         };
         (ctx, rx)
     }
@@ -2863,6 +3041,34 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).unwrap();
         }
+    }
+
+    #[test]
+    fn auto_moves_on_without_leaving_the_process() {
+        let (mut ctx, rx) = merge_ctx(false);
+        ctx.spec.mode = super::RunMode::Auto;
+        ctx.auto_issue = Some(4);
+        ctx.stop(0, "Exiting without merging PR #9.".into());
+        assert!(ctx.quit);
+        assert_eq!(ctx.auto_release.as_ref().map(|row| row.code), Some(0));
+        let mut saw_exit = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, crate::tui::UiEvent::Exit { .. }) {
+                saw_exit = true;
+            }
+        }
+        assert!(!saw_exit, "a finished issue returns to --auto");
+        ctx.auto_issue = None;
+        ctx.prepare_next_issue();
+        assert!(!ctx.quit);
+        ctx.stop(0, "quit".into());
+        saw_exit = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, crate::tui::UiEvent::Exit { .. }) {
+                saw_exit = true;
+            }
+        }
+        assert!(saw_exit, "q still leaves ghost");
     }
 
     /// `merge_now` re-reads the head. A moved SHA must not call `gh pr merge`.

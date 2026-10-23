@@ -180,6 +180,44 @@ impl Gh {
         parse_issue_list(&out.stdout).map_err(|e| anyhow!(e))
     }
 
+    /// Open issues, oldest first, for `--auto`.
+    pub fn auto_issues(&self) -> Result<Vec<crate::auto::IssueRow>> {
+        let out = self.call(vec![
+            "issue".into(),
+            "list".into(),
+            "--repo".into(),
+            self.slug.clone(),
+            "--state".into(),
+            "open".into(),
+            "--limit".into(),
+            "100".into(),
+            "--search".into(),
+            "is:open sort:created-asc".into(),
+            "--json".into(),
+            "number,title,labels,createdAt".into(),
+        ])?;
+        ensure_ok("gh issue list", &out)?;
+        crate::auto::parse_issues(&out.stdout).map_err(|e| anyhow!(e))
+    }
+
+    /// Open pull requests that may already cover an issue.
+    pub fn open_pr_links(&self) -> Result<Vec<crate::auto::PrLink>> {
+        let out = self.call(vec![
+            "pr".into(),
+            "list".into(),
+            "--repo".into(),
+            self.slug.clone(),
+            "--state".into(),
+            "open".into(),
+            "--limit".into(),
+            "100".into(),
+            "--json".into(),
+            "number,headRefName,body,closingIssuesReferences".into(),
+        ])?;
+        ensure_ok("gh pr list", &out)?;
+        crate::auto::parse_pr_links(&out.stdout).map_err(|e| anyhow!(e))
+    }
+
     pub fn issue(&self, number: u64) -> Result<IssueDetails> {
         let out = self.call(vec![
             "issue".into(),
