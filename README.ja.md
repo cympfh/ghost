@@ -11,7 +11,7 @@ ghost はローカルのコーディングエージェントにプルリクエ�
 [GitHub CLI](https://cli.github.com/) と、`PATH` 上の `codex`、`claude`、`grok` のいずれかが必要です。ログインには `gh auth login` を使います。
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/cympfh/ghost
 ```
 
 ## 使い方
