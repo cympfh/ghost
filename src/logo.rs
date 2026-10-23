@@ -1,4 +1,5 @@
-//! Terminal drawing of the orange diamond and white ghost in `docs/logo.svg`.
+//! Small terminal drawing of a white ghost for the startup screen.
+//! The README keeps `docs/logo.svg`; this mark is only the ghost.
 
 use std::io::{self, Write};
 use std::time::Duration;
@@ -16,36 +17,36 @@ pub fn splash_hold(elapsed: Duration) -> Duration {
     SPLASH_MIN.saturating_sub(elapsed)
 }
 
+/// Rounded head, two eyes, wavy hem. Shown when the terminal has a little room.
 const FULL: &[&str] = &[
-    "........▓........",
-    "......▓▓▓▓▓......",
-    "....▓▓▓▓▓▓▓▓▓....",
-    "...▓▓▓▓███▓▓▓▓...",
-    "..▓▓▓███████▓▓▓..",
-    ".▓▓▓███●█●███▓▓▓.",
-    "..▓▓▓███████▓▓▓..",
-    "...▓▓▓█████▓▓▓...",
-    "....▓▓█▓█▓█▓▓....",
-    "......▓▓▓▓▓......",
-    "........▓........",
+    "    ▄▄▄▄▄    ",
+    "  ▄███████▄  ",
+    "  ███•█•███  ",
+    "█████████████",
+    "█████████████",
+    " ▀▀▀ ▀▀▀ ▀▀▀ ",
 ];
 
+/// Same ghost, fewer cells, for a short terminal.
 const SMALL: &[&str] = &[
-    "....▓....",
-    "..▓███▓..",
-    ".▓█●█●█▓.",
-    "..▓█▓█▓..",
-    "....▓....",
+    "  ▄▄▄▄▄  ",
+    " ▄█████▄ ",
+    " ██•█•██ ",
+    "█████████",
+    " ▀▀ ▀ ▀▀ ",
 ];
 
-const TINY: &str = "▓█●█▓";
+const TINY: &str = "█•█•█";
 
-/// Largest mark that fits. A short row when the terminal is smaller than `SMALL`.
+/// Largest ghost that fits. A short row when the terminal is smaller than [`SMALL`].
+///
+/// The full mark asks for `height >= 10` so a 32×10 splash, which keeps one
+/// status row, still uses [`SMALL`].
 pub fn render(width: u16, height: u16) -> Vec<Line<'static>> {
     if width == 0 || height == 0 {
         return Vec::new();
     }
-    if width >= 17 && height >= 11 {
+    if width >= 13 && height >= 10 {
         return mask_lines(FULL);
     }
     if width >= 9 && height >= 5 {
@@ -92,9 +93,10 @@ fn tiny_line(width: u16) -> Line<'static> {
 
 fn span_for(ch: char) -> Span<'static> {
     match ch {
-        '▓' => Span::styled("▓", theme::logo_diamond()),
         '█' => Span::styled("█", theme::logo_ghost()),
-        '●' => Span::styled("●", theme::logo_eye()),
+        '▄' => Span::styled("▄", theme::logo_ghost()),
+        '▀' => Span::styled("▀", theme::logo_ghost()),
+        '•' => Span::styled("•", theme::logo_eye()),
         _ => Span::raw(" "),
     }
 }
@@ -105,9 +107,8 @@ fn span_ansi(span: &Span<'_>) -> String {
         return text.to_string();
     }
     match text {
-        "▓" => "\x1b[38;2;240;80;51m▓".into(),
-        "█" => "\x1b[37m█".into(),
-        "●" => "\x1b[38;2;240;80;51;47m●".into(),
+        "█" | "▄" | "▀" => format!("\x1b[37m{text}"),
+        "•" => "\x1b[38;2;240;80;51;47m•".into(),
         _ => text.to_string(),
     }
 }
@@ -149,8 +150,27 @@ mod tests {
                 text.push_str(span.content.as_ref());
             }
         }
-        assert!(text.contains('●'), "{text}");
+        assert!(text.contains('•'), "{text}");
+        assert!(!text.contains('▓'), "{text}");
         assert!(render(0, 10).is_empty());
+    }
+
+    #[test]
+    fn ghost_has_a_round_head_eyes_and_wavy_hem() {
+        let full = render(80, 24);
+        let mut text = String::new();
+        for line in &full {
+            for span in &line.spans {
+                text.push_str(span.content.as_ref());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains('▄'), "rounded head\n{text}");
+        assert!(text.contains('•'), "eyes\n{text}");
+        assert!(text.contains('▀'), "wavy hem\n{text}");
+        assert!(text.contains("▀▀▀ ▀▀▀ ▀▀▀"), "hem waves\n{text}");
+        assert!(!text.contains('▓'), "no diamond\n{text}");
+        assert_eq!(full.len(), FULL.len());
     }
 
     #[test]
@@ -159,11 +179,14 @@ mod tests {
         let on = ansi_block(80, 24);
         assert!(on.contains("38;2;240;80;51"), "{on}");
         assert!(on.contains('█'));
+        assert!(on.contains('•'));
+        assert!(!on.contains('▓'), "{on}");
         theme::force_colors_for_test(Some(false));
         let off = ansi_block(80, 24);
         assert!(!off.contains('\u{1b}'), "{off}");
         assert!(off.contains('█'));
-        assert!(off.contains('●'));
+        assert!(off.contains('•'));
+        assert!(off.contains('▄') && off.contains('▀'), "{off}");
         theme::force_colors_for_test(None);
     }
 }

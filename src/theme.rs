@@ -160,16 +160,11 @@ pub fn border_choose() -> Style {
     paint(Color::Cyan)
 }
 
-/// Orange of the startup mark (`#F05033`).
+/// Orange of the ghost's eyes (`#F05033`).
 const LOGO_ORANGE: Color = Color::Rgb(0xF0, 0x50, 0x33);
 
 pub fn logo_orange() -> Color {
     LOGO_ORANGE
-}
-
-/// Diamond of the startup mark.
-pub fn logo_diamond() -> Style {
-    paint(LOGO_ORANGE)
 }
 
 /// Ghost body of the startup mark.

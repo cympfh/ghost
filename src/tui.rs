@@ -1750,7 +1750,7 @@ mod tests {
     }
 
     #[test]
-    fn splash_renders_the_orange_diamond_and_white_ghost() {
+    fn splash_renders_a_small_white_ghost() {
         use ratatui::style::Color;
 
         let mut app = App::new("ghost github.com/cympfh/xxx".into());
@@ -1762,33 +1762,31 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
         let text = buffer_text(&buf);
-        assert!(text.contains('▓'), "{text}");
+        assert!(text.contains('▄'), "{text}");
         assert!(text.contains('█'), "{text}");
-        assert!(text.contains('●'), "{text}");
+        assert!(text.contains('▀'), "{text}");
+        assert!(text.contains('•'), "{text}");
+        assert!(!text.contains('▓'), "{text}");
         assert!(text.contains("preparing"), "{text}");
         assert!(!text.contains("terminal too small"), "{text}");
-        let mut saw_orange = false;
         let mut saw_white_ghost = false;
         let mut saw_eye = false;
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
                 let cell = &buf[(x, y)];
-                if cell.symbol() == "▓" {
-                    assert_eq!(cell.fg, Color::Rgb(0xF0, 0x50, 0x33));
-                    saw_orange = true;
-                }
-                if cell.symbol() == "█" {
+                assert_ne!(cell.symbol(), "▓");
+                if matches!(cell.symbol(), "█" | "▄" | "▀") {
                     assert_eq!(cell.fg, Color::White);
                     saw_white_ghost = true;
                 }
-                if cell.symbol() == "●" {
+                if cell.symbol() == "•" {
                     assert_eq!(cell.fg, Color::Rgb(0xF0, 0x50, 0x33));
                     assert_eq!(cell.bg, Color::White);
                     saw_eye = true;
                 }
             }
         }
-        assert!(saw_orange && saw_white_ghost && saw_eye);
+        assert!(saw_white_ghost && saw_eye);
 
         theme::force_colors_for_test(Some(false));
         let mut plain = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1796,9 +1794,10 @@ mod tests {
         let plain_buf = plain.backend().buffer().clone();
         let plain_text = buffer_text(&plain_buf);
         assert!(
-            plain_text.contains('▓') && plain_text.contains('●'),
+            plain_text.contains('▄') && plain_text.contains('•') && plain_text.contains('▀'),
             "{plain_text}"
         );
+        assert!(!plain_text.contains('▓'), "{plain_text}");
         for y in 0..plain_buf.area.height {
             for x in 0..plain_buf.area.width {
                 let cell = &plain_buf[(x, y)];
@@ -1811,21 +1810,19 @@ mod tests {
         let mut small = Terminal::new(TestBackend::new(32, 10)).unwrap();
         small.draw(|f| draw(f, &mut app)).unwrap();
         let small_text = buffer_text(small.backend().buffer());
-        assert!(small_text.contains('●'), "{small_text}");
+        assert!(small_text.contains('•'), "{small_text}");
+        assert!(!small_text.contains('▓'), "{small_text}");
         assert!(!small_text.contains("terminal too small"), "{small_text}");
         assert!(
-            small_text.lines().filter(|line| line.contains('▓')).count()
-                < text.lines().filter(|line| line.contains('▓')).count(),
-            "a short terminal uses the smaller mark\n{small_text}"
+            small_text.matches('█').count() < text.matches('█').count(),
+            "a short terminal uses the smaller ghost\n{small_text}"
         );
 
         let mut tiny = Terminal::new(TestBackend::new(8, 3)).unwrap();
         tiny.draw(|f| draw(f, &mut app)).unwrap();
         let tiny_text = buffer_text(tiny.backend().buffer());
-        assert!(
-            tiny_text.contains('●') || tiny_text.contains('▓'),
-            "{tiny_text}"
-        );
+        assert!(tiny_text.contains('•'), "{tiny_text}");
+        assert!(!tiny_text.contains('▓'), "{tiny_text}");
         assert!(!tiny_text.contains("terminal too small"), "{tiny_text}");
         theme::force_colors_for_test(None);
     }
