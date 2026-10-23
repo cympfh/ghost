@@ -74,9 +74,9 @@ pub enum Skip {
         author: String,
         association: String,
     },
-    SelfOpened {
+    /// The agent ran `gh issue create` and the wrapper recorded this number.
+    AgentCreated {
         number: u64,
-        author: String,
     },
     Backoff {
         number: u64,
@@ -108,9 +108,8 @@ pub struct PollIn<'a> {
     pub failed: &'a [AutoFailure],
     pub prs: &'a [PrLink],
     pub trust: CommentTrust,
-    pub viewer: &'a str,
-    pub seeded: bool,
-    pub seen: &'a [u64],
+    /// Issue numbers the agent created with `gh issue create`.
+    pub created: &'a [u64],
     pub now: &'a str,
     pub busy: &'a [u64],
 }
@@ -125,18 +124,15 @@ pub fn poll(input: &PollIn<'_>) -> Poll {
             skipped.push(Skip::Busy { number: row.number });
             continue;
         }
+        if input.created.contains(&row.number) {
+            skipped.push(Skip::AgentCreated { number: row.number });
+            continue;
+        }
         if !association_trusted(&row.association, input.trust) {
             skipped.push(Skip::Untrusted {
                 number: row.number,
                 author: row.author.clone(),
                 association: row.association.clone(),
-            });
-            continue;
-        }
-        if opened_by_agent(row, input.viewer, input.seeded, input.seen) {
-            skipped.push(Skip::SelfOpened {
-                number: row.number,
-                author: row.author.clone(),
             });
             continue;
         }
@@ -200,21 +196,6 @@ pub fn poll(input: &PollIn<'_>) -> Poll {
 /// Several idle checks in a row. There is no exit step.
 pub fn idle_waits(polls: &[Poll]) -> bool {
     !polls.is_empty() && polls.iter().all(|poll| poll.action == AutoAction::Idle)
-}
-
-/// Issues opened by this ghost, or by the logged-in user after the first check.
-pub fn opened_by_agent(row: &IssueRow, viewer: &str, seeded: bool, seen: &[u64]) -> bool {
-    if !seeded || seen.contains(&row.number) {
-        return false;
-    }
-    let login = row.author.trim();
-    if login.is_empty() {
-        return false;
-    }
-    if row.is_bot || login.eq_ignore_ascii_case("ghost") {
-        return true;
-    }
-    !viewer.is_empty() && login.eq_ignore_ascii_case(viewer)
 }
 
 pub fn current_head(issue: &IssueRow, prs: &[PrLink]) -> String {
@@ -556,9 +537,7 @@ mod tests {
             failed,
             prs,
             trust: CommentTrust::Collaborators,
-            viewer: "ada",
-            seeded: true,
-            seen: &[1, 2, 9],
+            created: &[],
             now: "2026-01-01T00:00:00Z",
             busy: &[],
         })
@@ -679,9 +658,7 @@ mod tests {
             failed: &[],
             prs: &[],
             trust: CommentTrust::Collaborators,
-            viewer: "ada",
-            seeded: true,
-            seen: &[4, 5, 6],
+            created: &[],
             now: "2026-01-01T00:00:00Z",
             busy: &[],
         });
@@ -696,9 +673,7 @@ mod tests {
             failed: &[],
             prs: &[],
             trust: CommentTrust::Contributors,
-            viewer: "ada",
-            seeded: true,
-            seen: &[4, 5, 6],
+            created: &[],
             now: "2026-01-01T00:00:00Z",
             busy: &[],
         });
@@ -708,9 +683,7 @@ mod tests {
             failed: &[],
             prs: &[],
             trust: CommentTrust::All,
-            viewer: "ada",
-            seeded: true,
-            seen: &[5],
+            created: &[],
             now: "2026-01-01T00:00:00Z",
             busy: &[],
         });
@@ -718,58 +691,22 @@ mod tests {
     }
 
     #[test]
-    fn issues_opened_after_the_first_check_by_the_viewer_are_skipped() {
-        let mut fresh = issue(12, "2026-02-01T00:00:00Z", "Loop");
+    fn issues_the_user_files_after_auto_starts_are_taken() {
+        // The user and the agent share one gh account, so author and time do not skip.
+        let mut fresh = issue(12, "2026-02-01T00:00:00Z", "Filed while auto runs");
         fresh.author = "ada".into();
+        let agent_made = issue(3, "2020-01-01T00:00:00Z", "Opened by gh issue create");
         let chosen = poll(&PollIn {
-            issues: &[fresh.clone()],
+            issues: &[agent_made, fresh],
             failed: &[],
             prs: &[],
             trust: CommentTrust::Collaborators,
-            viewer: "ada",
-            seeded: true,
-            seen: &[1],
+            created: &[3],
             now: "2026-02-02T00:00:00Z",
             busy: &[],
         });
-        assert_eq!(chosen.action, AutoAction::Idle);
-        assert_eq!(
-            chosen.skipped,
-            vec![Skip::SelfOpened {
-                number: 12,
-                author: "ada".into(),
-            }]
-        );
-        let before = poll(&PollIn {
-            issues: &[fresh.clone()],
-            failed: &[],
-            prs: &[],
-            trust: CommentTrust::Collaborators,
-            viewer: "ada",
-            seeded: false,
-            seen: &[],
-            now: "2026-02-02T00:00:00Z",
-            busy: &[],
-        });
-        assert_eq!(before.action, AutoAction::Run(12));
-        fresh.is_bot = true;
-        fresh.author = "dependabot".into();
-        fresh.number = 13;
-        let bot = poll(&PollIn {
-            issues: &[fresh],
-            failed: &[],
-            prs: &[],
-            trust: CommentTrust::All,
-            viewer: "ada",
-            seeded: true,
-            seen: &[],
-            now: "2026-02-02T00:00:00Z",
-            busy: &[],
-        });
-        assert!(matches!(
-            bot.skipped.first(),
-            Some(Skip::SelfOpened { number: 13, .. })
-        ));
+        assert_eq!(chosen.action, AutoAction::Run(12));
+        assert_eq!(chosen.skipped, vec![Skip::AgentCreated { number: 3 }]);
     }
 
     #[test]
@@ -796,9 +733,7 @@ mod tests {
             failed: &[hold.clone()],
             prs: &[open.clone()],
             trust: CommentTrust::Collaborators,
-            viewer: "ada",
-            seeded: true,
-            seen: &[9],
+            created: &[],
             now: "2026-01-15T00:00:00Z",
             busy: &[],
         });
@@ -809,9 +744,7 @@ mod tests {
             failed: &[hold.clone()],
             prs: &[open.clone()],
             trust: CommentTrust::Collaborators,
-            viewer: "ada",
-            seeded: true,
-            seen: &[9],
+            created: &[],
             now: "2026-02-01T00:00:00Z",
             busy: &[],
         });
@@ -823,9 +756,7 @@ mod tests {
             failed: &[hold],
             prs: &[moved],
             trust: CommentTrust::Collaborators,
-            viewer: "ada",
-            seeded: true,
-            seen: &[9],
+            created: &[],
             now: "2026-01-15T00:00:00Z",
             busy: &[],
         });
@@ -847,9 +778,7 @@ mod tests {
             failed: &[held],
             prs: &[closed],
             trust: CommentTrust::Collaborators,
-            viewer: "ada",
-            seeded: true,
-            seen: &[9],
+            created: &[],
             now: "2026-03-01T00:00:00Z",
             busy: &[],
         });
@@ -864,9 +793,7 @@ mod tests {
             failed: &[],
             prs: &[],
             trust: CommentTrust::Collaborators,
-            viewer: "ada",
-            seeded: true,
-            seen: &[1, 2, 9],
+            created: &[],
             now: "2026-01-01T00:00:00Z",
             busy: &[9],
         });

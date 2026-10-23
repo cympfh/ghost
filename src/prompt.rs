@@ -549,10 +549,10 @@ pub fn user_nudge(lang: Lang, text: &str, during_turn: bool) -> String {
 pub fn issue_resume_prefix(lang: Lang, number: u64, branch: &str) -> String {
     match lang {
         Lang::Ja => format!(
-            "同じセッションの follow-up です。issue #{number} の実装をブランチ `{branch}` で続ける。`Closes #{number}` を本文に含むプルリクエストがあることを確認する。重複して開かない。マージしない。\n\n"
+            "同じセッションの follow-up です。issue #{number} の実装をブランチ `{branch}` で続ける。`Closes #{number}` を本文に含むプルリクエストがあることを確認する。重複して開かない。マージしない。新しい issue は開かない。\n\n"
         ),
         Lang::En => format!(
-            "Follow-up in this same session. Continue implementing issue #{number} on `{branch}` and make sure a pull request whose body contains `Closes #{number}` exists. Do not open a duplicate. Do not merge.\n\n"
+            "Follow-up in this same session. Continue implementing issue #{number} on `{branch}` and make sure a pull request whose body contains `Closes #{number}` exists. Do not open a duplicate. Do not merge. Do not open a new issue.\n\n"
         ),
     }
 }

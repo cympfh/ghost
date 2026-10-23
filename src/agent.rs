@@ -565,6 +565,8 @@ pub struct AgentSession {
     broken_pipe: bool,
     push_plan: Option<PushPlan>,
     stub: Option<PathBuf>,
+    /// File the `gh` wrapper appends when the agent runs `gh issue create`.
+    created_issues: Option<PathBuf>,
 }
 
 impl AgentSession {
@@ -590,7 +592,12 @@ impl AgentSession {
             broken_pipe: false,
             push_plan: None,
             stub: None,
+            created_issues: None,
         }
+    }
+
+    pub fn set_created_issues(&mut self, path: PathBuf) {
+        self.created_issues = Some(path);
     }
 
     pub fn set_workdir(&mut self, dir: PathBuf) {
@@ -823,6 +830,9 @@ impl AgentSession {
                 path.push_str(&parent_path);
             }
             cmd.env("PATH", path);
+        }
+        if let Some(path) = &self.created_issues {
+            cmd.env("GHOST_CREATED_ISSUES", path);
         }
         if let Some(plan) = &self.push_plan {
             if plan.readonly {
@@ -1140,6 +1150,28 @@ if [ "$a1" = "api" ]; then
     echo "ghost: refusing gh api merge" >&2
     exit 99
   fi
+fi
+if [ "$a1" = "issue" ] && [ "$a2" = "create" ]; then
+  errf="${TMPDIR:-/tmp}/ghost-issue-create-$$.err"
+  out=$("$real" "$@" 2>"$errf")
+  code=$?
+  if [ -s "$errf" ]; then
+    cat "$errf" >&2
+  fi
+  printf '%s\n' "$out"
+  if [ "$code" -eq 0 ] && [ -n "${GHOST_CREATED_ISSUES:-}" ]; then
+    blob=$(printf '%s\n' "$out"; cat "$errf" 2>/dev/null)
+    num=$(printf '%s\n' "$blob" | sed -n 's#.*issues/\([0-9][0-9]*\).*#\1#p' | head -n 1)
+    if [ -z "$num" ]; then
+      num=$(printf '%s\n' "$blob" | sed -n 's/.*"number":[ ]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
+    fi
+    if [ -n "$num" ]; then
+      mkdir -p "$(dirname "$GHOST_CREATED_ISSUES")" 2>/dev/null
+      printf '%s\n' "$num" >> "$GHOST_CREATED_ISSUES"
+    fi
+  fi
+  rm -f "$errf"
+  exit "$code"
 fi
 exec "$real" "$@"
 "#;
@@ -1875,6 +1907,94 @@ mod tests {
                 "query=mutation { mergePullRequest(input:{}) { clientMutationId } }",
             ],
             "merge",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gh_wrapper_records_issue_create_and_not_a_later_user_issue() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-gh-create-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = install_gh_guard(&dir).unwrap();
+        let real = dir.join("real-gh");
+        let created = dir.join("nest").join("created-issues");
+        std::fs::write(
+            &real,
+            "#!/bin/sh\nprintf '%s\\n' \"$GHOST_FAKE_OUT\"\nif [ -n \"$GHOST_FAKE_ERR\" ]; then printf '%s\\n' \"$GHOST_FAKE_ERR\" >&2; fi\nexit \"${GHOST_FAKE_CODE:-0}\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&real).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&real, perms).unwrap();
+        }
+        let guard = bin.join("gh");
+        let run = |args: &[&str], out: &str, err: &str, code: &str| {
+            std::process::Command::new(&guard)
+                .args(args)
+                .env("GHOST_REAL_GH", &real)
+                .env("GHOST_CREATED_ISSUES", &created)
+                .env("GHOST_FAKE_OUT", out)
+                .env("GHOST_FAKE_ERR", err)
+                .env("GHOST_FAKE_CODE", code)
+                .output()
+                .unwrap()
+        };
+        let created_url = run(
+            &["issue", "create", "--title", "from the agent"],
+            "https://github.com/acme/app/issues/44",
+            "",
+            "0",
+        );
+        assert_eq!(created_url.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&created_url.stdout).contains("issues/44"));
+        assert_eq!(crate::state::read_created_issues(&created), vec![44]);
+
+        run(
+            &["issue", "create", "--json", "number"],
+            r#"{"number":81}"#,
+            "",
+            "0",
+        );
+        assert_eq!(crate::state::read_created_issues(&created), vec![44, 81]);
+
+        // A comment, or a pull request, can mention an issue URL. That is not `gh issue create`.
+        run(
+            &[
+                "issue",
+                "comment",
+                "44",
+                "--body",
+                "see https://github.com/acme/app/issues/99",
+            ],
+            "https://github.com/acme/app/issues/99",
+            "",
+            "0",
+        );
+        run(
+            &["pr", "create", "--title", "ship"],
+            "https://github.com/acme/app/pull/7",
+            "",
+            "0",
+        );
+        run(
+            &["issue", "create", "--title", "failed"],
+            "https://github.com/acme/app/issues/100",
+            "HTTP 502",
+            "1",
+        );
+        assert_eq!(
+            crate::state::read_created_issues(&created),
+            vec![44, 81],
+            "only a successful gh issue create is recorded"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

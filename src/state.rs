@@ -123,17 +123,11 @@ pub fn issue_state_path(root: &Path, owner: &str, repo: &str, number: u64) -> Pa
         .join(format!("issue-{number}.json"))
 }
 
-/// Issues `--auto` will not take again, plus the issue numbers seen on the first check.
+/// Issues `--auto` will not take again.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoState {
     #[serde(default)]
     pub failed: Vec<AutoFailure>,
-    /// Issue numbers present on the first successful check. Later issues from
-    /// the logged-in user are treated as opened by ghost.
-    #[serde(default)]
-    pub seen: Vec<u64>,
-    #[serde(default)]
-    pub seeded: bool,
 }
 
 /// One load of `auto.json`. A corrupt file is renamed aside and `warning` explains where.
@@ -276,6 +270,27 @@ pub fn auto_state_path(root: &Path, owner: &str, repo: &str) -> PathBuf {
     root.join(format!("{owner}__{repo}")).join("auto.json")
 }
 
+/// One issue number per line. The `gh` wrapper appends numbers from `gh issue create`.
+pub fn created_issues_path(root: &Path, owner: &str, repo: &str) -> PathBuf {
+    root.join(format!("{owner}__{repo}")).join("created-issues")
+}
+
+pub fn read_created_issues(path: &Path) -> Vec<u64> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut nums = Vec::new();
+    for line in raw.lines() {
+        let Ok(number) = line.trim().parse::<u64>() else {
+            continue;
+        };
+        if number > 0 && !nums.contains(&number) {
+            nums.push(number);
+        }
+    }
+    nums
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,13 +367,30 @@ mod tests {
         fs::write(&path, "{not json").unwrap();
         let loaded = AutoState::load(&path).unwrap();
         assert!(loaded.state.failed.is_empty());
-        assert!(!loaded.state.seeded);
         let warning = loaded.warning.expect("corrupt auto.json warns");
         assert!(warning.contains("corrupt"), "{warning}");
         assert!(warning.contains("acme__app"), "{warning}");
         let backup = path.with_extension("json.bad");
         assert_eq!(fs::read_to_string(&backup).unwrap(), "{not json");
         assert!(!path.exists(), "the corrupt file is moved aside");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn created_issue_file_keeps_numbers_from_gh_issue_create() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-created-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = created_issues_path(&dir, "acme", "app");
+        assert!(read_created_issues(&path).is_empty());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "44\n\nbad\n81\n44\n").unwrap();
+        assert_eq!(read_created_issues(&path), vec![44, 81]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

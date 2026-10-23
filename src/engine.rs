@@ -496,12 +496,15 @@ fn babysit(
     let slug = spec.target.slug();
     let owner = spec.target.owner().to_string();
     let repo = spec.target.repo().to_string();
+    let state_root = state::state_dir();
+    let mut agent = AgentSession::new(kind, workdir.clone(), &home, slot_name);
+    agent.set_created_issues(state::created_issues_path(&state_root, &owner, &repo));
     let mut ctx = Ctx {
         gh: Gh::new(slug.clone()),
         slug,
         owner,
         repo,
-        agent: AgentSession::new(kind, workdir.clone(), &home, slot_name),
+        agent,
         workdir,
         slot_dir,
         main_clone,
@@ -528,7 +531,7 @@ fn babysit(
         code_path: None,
         code_seen: BTreeSet::new(),
         code_agent_ids: BTreeSet::new(),
-        state_root: state::state_dir(),
+        state_root,
         auto_issue: None,
         auto_release: None,
     };
@@ -1730,24 +1733,18 @@ impl Ctx {
                     (issues, prs, stored)
                 }
             };
-            if !stored.seeded {
-                stored.seen = issues.iter().map(|row| row.number).collect();
-                stored.seeded = true;
-                if let Err(err) = stored.save(&path) {
-                    self.log_kind(LogKind::Error, format!("auto state: {err:#}"));
-                }
-            }
+            let created_path =
+                state::created_issues_path(&self.state_root, &self.owner, &self.repo);
             let mut busy = Vec::new();
             loop {
                 let now = crate::auto::now_rfc3339();
+                let created = state::read_created_issues(&created_path);
                 let choice = crate::auto::poll(&crate::auto::PollIn {
                     issues: &issues,
                     failed: &stored.failed,
                     prs: &prs,
                     trust: self.spec.trust,
-                    viewer: &self.login(),
-                    seeded: stored.seeded,
-                    seen: &stored.seen,
+                    created: &created,
                     now: &now,
                     busy: &busy,
                 });
@@ -1871,16 +1868,6 @@ impl Ctx {
                 );
                 true
             }
-            crate::auto::Skip::SelfOpened { number, author } if !stored.has_permanent(*number) => {
-                stored.record(
-                    *number,
-                    &format!("opened by {author}; skipped so --auto does not loop"),
-                    false,
-                    "",
-                    "",
-                );
-                true
-            }
             _ => false,
         }
     }
@@ -1911,11 +1898,11 @@ impl Ctx {
                     "skipping issue #{number}; {author} ({association}) is outside --trust-comments."
                 ),
             ),
-            crate::auto::Skip::SelfOpened { number, author } => self.say(
+            crate::auto::Skip::AgentCreated { number } => self.say(
                 &format!(
-                    "issue #{number} は {author} が --auto の開始後に開いたので、繰り返しを避けるため飛ばします。"
+                    "issue #{number} はエージェントが gh issue create で開いたので飛ばします。"
                 ),
-                &format!("skipping issue #{number}; {author} opened it after --auto started."),
+                &format!("skipping issue #{number}; the agent created it with gh issue create."),
             ),
             crate::auto::Skip::Backoff { number, retry_at } => self.say(
                 &format!(
