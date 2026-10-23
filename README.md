@@ -20,6 +20,7 @@ cargo install --path .
 ghost github.com/OWNER/REPO                  # pick an open pull request or issue
 ghost github.com/OWNER/REPO/pull/N --review  # review
 ghost github.com/OWNER/REPO/pull/N --code    # fix CI failures and review comments
+ghost github.com/OWNER/REPO/pulls --code     # pick an open pull request to fix
 ghost github.com/OWNER/REPO/issues/N         # implement an issue, then keep fixing
 ghost github.com/OWNER/REPO/issues --auto    # oldest open issue, then the next
 ```

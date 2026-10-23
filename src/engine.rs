@@ -50,9 +50,18 @@ pub enum RunMode {
     Picker,
     /// Open issues only. No pull requests.
     IssueList,
+    /// Open pull requests. `--review` or `--code` is chosen before the picker.
+    PullList(ListedPull),
     /// Take the oldest eligible issue, then check again.
     Auto,
     Ask,
+}
+
+/// Which loop a `/pulls` pick starts. The flag is required up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListedPull {
+    Review,
+    Code,
 }
 
 pub struct RunSpec {
@@ -242,11 +251,13 @@ fn prime_checkout(
             }
         }
         RunMode::Issue => prime_issue(&gh, &slug, spec, main, dest),
-        RunMode::Picker | RunMode::IssueList | RunMode::Auto => workdir::CheckoutOutcome {
-            workdir: dest.to_path_buf(),
-            note: String::new(),
-            failures: Vec::new(),
-        },
+        RunMode::Picker | RunMode::IssueList | RunMode::PullList(_) | RunMode::Auto => {
+            workdir::CheckoutOutcome {
+                workdir: dest.to_path_buf(),
+                note: String::new(),
+                failures: Vec::new(),
+            }
+        }
     }
 }
 
@@ -370,7 +381,11 @@ struct SlotPrep {
 
 fn activate_slot(spec: &RunSpec, home: &std::path::Path, main: &std::path::Path) -> SlotPrep {
     let slot = match spec.mode {
-        RunMode::Picker | RunMode::IssueList | RunMode::Auto | RunMode::Ask => None,
+        RunMode::Picker
+        | RunMode::IssueList
+        | RunMode::PullList(_)
+        | RunMode::Auto
+        | RunMode::Ask => None,
         RunMode::Issue => match issue_number(&spec.target) {
             Ok(number) => Some(format!("issue-{number}")),
             Err(err) => {
@@ -560,6 +575,7 @@ fn babysit(
         }
         RunMode::Picker => ctx.picker_flow(false)?,
         RunMode::IssueList => ctx.picker_flow(true)?,
+        RunMode::PullList(side) => ctx.pulls_flow(side)?,
         RunMode::Auto => ctx.auto_loop()?,
     }
     Ok(())
@@ -1702,6 +1718,55 @@ impl Ctx {
             }
             (crate::github::ItemKind::Issue, _) => self.issue_flow(number),
             (crate::github::ItemKind::Pull, None) => self.ask_mode(number),
+        }
+    }
+
+    /// Open pull requests only. The mode was chosen with `--review` or `--code`.
+    fn pulls_flow(&mut self, listed: ListedPull) -> Result<()> {
+        let side = match listed {
+            ListedPull::Review => Side::Review,
+            ListedPull::Code => Side::Code,
+        };
+        self.status.mode = "pulls".into();
+        self.status.target = self.spec.target.display_url();
+        self.status.phase = "loading".into();
+        self.push_status();
+        self.log("loading open pull requests");
+        let items = self.gh.open_prs()?;
+        let _ = self.tx.send(UiEvent::PullPicker { items, side });
+        self.status.phase = "choose".into();
+        self.push_status();
+        let number = loop {
+            match self.rx.recv() {
+                Ok(UiCmd::Pick {
+                    kind: crate::github::ItemKind::Pull,
+                    number,
+                    ..
+                }) => break number,
+                Ok(UiCmd::Quit) | Err(_) => {
+                    self.stop(0, "quit".into());
+                    return Ok(());
+                }
+                Ok(other) => self.handle_cmd(other)?,
+            }
+        };
+        let slot = match side {
+            Side::Review => state::pr_slot_name(number, SessionSlot::Review),
+            Side::Code => state::pr_slot_name(number, SessionSlot::Code),
+        };
+        if !self.use_slot(&slot) {
+            self.stop(
+                1,
+                self.say(
+                    "worktree をロックできなかったので、メインクローンでは作業しません。",
+                    "Could not lock the worktree, so ghost will not work in the main clone.",
+                ),
+            );
+            return Ok(());
+        }
+        match side {
+            Side::Review => self.review_loop(number),
+            Side::Code => self.code_loop(number, CodeLaunch::Survey),
         }
     }
 
@@ -2909,7 +2974,7 @@ fn pr_purpose(mode: RunMode, number: u64) -> String {
         RunMode::Code => format!("修正対象の PR #{number}"),
         RunMode::Issue => format!("issue から続く PR #{number}"),
         RunMode::Ask => format!("対象の PR #{number}"),
-        RunMode::Picker | RunMode::IssueList | RunMode::Auto => {
+        RunMode::Picker | RunMode::IssueList | RunMode::PullList(_) | RunMode::Auto => {
             format!("選択された PR #{number}")
         }
     }
@@ -2988,6 +3053,7 @@ fn mode_name(mode: RunMode) -> &'static str {
         RunMode::Issue => "issue",
         RunMode::Picker => "picker",
         RunMode::IssueList => "issues",
+        RunMode::PullList(_) => "pulls",
         RunMode::Auto => "auto",
         RunMode::Ask => "pr",
     }

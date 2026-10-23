@@ -28,6 +28,17 @@ pub enum Side {
     Code,
 }
 
+/// Which list the picker is showing, and how Enter behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    /// Open pull requests and issues. Enter on a pull request asks for a mode.
+    Mixed,
+    /// Open issues. Enter starts the issue.
+    Issues,
+    /// Open pull requests. Enter starts the mode given on the command line.
+    Pulls(Side),
+}
+
 #[derive(Debug, Clone)]
 pub struct LogLine {
     pub kind: LogKind,
@@ -98,6 +109,11 @@ pub enum UiEvent {
     Picker(Vec<OpenItem>),
     /// Open issues only. The empty list does not mention pull requests.
     IssuePicker(Vec<OpenItem>),
+    /// Open pull requests. `side` is the mode Enter starts.
+    PullPicker {
+        items: Vec<OpenItem>,
+        side: Side,
+    },
     ChooseMode {
         number: u64,
         title: String,
@@ -246,7 +262,7 @@ pub struct App {
     pub spinner: usize,
     picker_backup: Vec<OpenItem>,
     picker_selected: usize,
-    issues_only: bool,
+    picker_kind: PickerKind,
 }
 
 impl App {
@@ -267,7 +283,7 @@ impl App {
             spinner: 0,
             picker_backup: Vec::new(),
             picker_selected: 0,
-            issues_only: false,
+            picker_kind: PickerKind::Mixed,
         }
     }
 
@@ -381,6 +397,7 @@ where
             Ok(UiEvent::Status(_)) => {}
             Ok(UiEvent::Picker(_))
             | Ok(UiEvent::IssuePicker(_))
+            | Ok(UiEvent::PullPicker { .. })
             | Ok(UiEvent::ChooseMode { .. }) => {
                 forced = true;
                 exit_code = 1;
@@ -434,8 +451,9 @@ fn apply(app: &mut App, event: UiEvent) {
     match event {
         UiEvent::Log(line) => app.push_log(line),
         UiEvent::Status(status) => app.status = status,
-        UiEvent::Picker(items) => show_picker(app, items, false),
-        UiEvent::IssuePicker(items) => show_picker(app, items, true),
+        UiEvent::Picker(items) => show_picker(app, items, PickerKind::Mixed),
+        UiEvent::IssuePicker(items) => show_picker(app, items, PickerKind::Issues),
+        UiEvent::PullPicker { items, side } => show_picker(app, items, PickerKind::Pulls(side)),
         UiEvent::ChooseMode { number, title } => {
             app.view = View::Choose { number, title };
             app.input_mode = false;
@@ -632,8 +650,8 @@ fn move_picker(app: &mut App, delta: i32) -> Option<UiCmd> {
     None
 }
 
-fn show_picker(app: &mut App, items: Vec<OpenItem>, issues_only: bool) {
-    app.issues_only = issues_only;
+fn show_picker(app: &mut App, items: Vec<OpenItem>, kind: PickerKind) {
+    app.picker_kind = kind;
     app.picker_backup = items.clone();
     app.picker_selected = 0;
     app.view = View::Picker { items, selected: 0 };
@@ -647,6 +665,11 @@ fn picker_action(app: &mut App, side: Option<Side>) -> Option<UiCmd> {
     let item = items.get(*selected)?.clone();
     if item.kind == ItemKind::Issue && side.is_some() {
         return None;
+    }
+    if let PickerKind::Pulls(fixed) = app.picker_kind {
+        if side != Some(fixed) {
+            return None;
+        }
     }
     app.view = View::Log;
     Some(UiCmd::Pick {
@@ -672,12 +695,21 @@ fn picker_enter(app: &mut App) -> Option<UiCmd> {
             })
         }
         ItemKind::Pull => {
-            app.picker_selected = selected;
-            app.view = View::Choose {
-                number: item.number,
-                title: item.title,
-            };
-            None
+            if let PickerKind::Pulls(side) = app.picker_kind {
+                app.view = View::Log;
+                Some(UiCmd::Pick {
+                    kind: ItemKind::Pull,
+                    number: item.number,
+                    side: Some(side),
+                })
+            } else {
+                app.picker_selected = selected;
+                app.view = View::Choose {
+                    number: item.number,
+                    title: item.title,
+                };
+                None
+            }
         }
     }
 }
@@ -796,8 +828,8 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         View::Picker { items, selected } => {
             let width = area.width.saturating_sub(2) as usize;
-            let issues_only = app.issues_only;
-            let (rows, selected_row) = picker_rows(items, *selected, width, issues_only);
+            let kind = app.picker_kind;
+            let (rows, selected_row) = picker_rows(items, *selected, width, kind);
             let inner_h = area.height.saturating_sub(2) as usize;
             let offset = selected_row.saturating_sub(inner_h.saturating_sub(1));
             let para = Paragraph::new(rows).block(block).scroll((offset as u16, 0));
@@ -857,13 +889,13 @@ fn picker_rows(
     items: &[OpenItem],
     selected: usize,
     width: usize,
-    issues_only: bool,
+    kind: PickerKind,
 ) -> (Vec<Line<'static>>, usize) {
     if items.is_empty() {
-        let text = if issues_only {
-            "  no open issues"
-        } else {
-            "  no open pull requests or issues"
+        let text = match kind {
+            PickerKind::Issues => "  no open issues",
+            PickerKind::Pulls(_) => "  no open pull requests",
+            PickerKind::Mixed => "  no open pull requests or issues",
         };
         return (vec![Line::from(Span::styled(text, theme::secondary()))], 0);
     }
@@ -957,7 +989,7 @@ fn input_line(app: &App, width: usize) -> Paragraph<'static> {
     } else {
         Paragraph::new(Line::from(vec![
             Span::styled(" ❯ ", theme::warn()),
-            Span::styled(idle_hint(&app.view), theme::secondary()),
+            Span::styled(idle_hint(app), theme::secondary()),
         ]))
     }
 }
@@ -1043,9 +1075,12 @@ fn confirm_decline(app: &mut App) -> Option<UiCmd> {
     Some(UiCmd::Confirm { answer, method })
 }
 
-fn idle_hint(view: &View) -> String {
-    match view {
-        View::Picker { .. } => "r review · c code · enter select".into(),
+fn idle_hint(app: &App) -> String {
+    match &app.view {
+        View::Picker { .. } => match app.picker_kind {
+            PickerKind::Pulls(_) => "enter select".into(),
+            PickerKind::Issues | PickerKind::Mixed => "r review · c code · enter select".into(),
+        },
         View::Choose { .. } => "r review · c code · esc back".into(),
         View::Confirm { kind, lang, .. } => confirm_footer(*kind, *lang),
         View::Fatal { .. } => "q quit".into(),
@@ -1082,7 +1117,12 @@ fn hint_line(app: &App) -> Paragraph<'static> {
         " enter send · esc cancel · backspace delete".to_string()
     } else {
         match &app.view {
-            View::Picker { .. } => " j/k move · enter select · r review · c code · q quit".into(),
+            View::Picker { .. } => match app.picker_kind {
+                PickerKind::Pulls(_) => " j/k move · enter select · q quit".into(),
+                PickerKind::Issues | PickerKind::Mixed => {
+                    " j/k move · enter select · r review · c code · q quit".into()
+                }
+            },
             View::Choose { .. } => " r review · c code · esc back · q quit".into(),
             View::Confirm { kind, lang, .. } => confirm_footer(*kind, *lang),
             View::Fatal { .. } => " q quit".into(),
@@ -1481,6 +1521,45 @@ mod tests {
                 kind: ItemKind::Issue,
                 number: 7,
                 side: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pulls_picker_enter_uses_the_given_mode() {
+        let items = vec![OpenItem {
+            kind: ItemKind::Pull,
+            number: 3,
+            title: "Add ghost".into(),
+            author: "ada".into(),
+            labels: vec![],
+            ci: None,
+            review: None,
+        }];
+        let mut app = App::new("ghost github.com/acme/app/pulls --code".into());
+        show_picker(&mut app, items.clone(), PickerKind::Pulls(Side::Code));
+        assert!(on_key(&mut app, key(KeyCode::Char('r'))).is_none());
+        assert!(matches!(app.view, View::Picker { .. }));
+        let cmd = on_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            cmd,
+            UiCmd::Pick {
+                kind: ItemKind::Pull,
+                number: 3,
+                side: Some(Side::Code),
+            }
+        );
+        assert!(matches!(app.view, View::Log));
+
+        let mut app = App::new("ghost github.com/acme/app/pulls --review".into());
+        show_picker(&mut app, items, PickerKind::Pulls(Side::Review));
+        let cmd = on_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+        assert_eq!(
+            cmd,
+            UiCmd::Pick {
+                kind: ItemKind::Pull,
+                number: 3,
+                side: Some(Side::Review),
             }
         );
     }
