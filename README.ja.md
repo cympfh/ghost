@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" width="120" alt="ghost"></p>
+
 # ghost
 
 [English](README.md) | [日本語](README.ja.md)
