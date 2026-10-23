@@ -20,10 +20,10 @@ cargo install --path .
 
 ```sh
 ghost github.com/OWNER/REPO                  # 開いているプルリクエストか issue を選ぶ
-ghost github.com/OWNER/REPO/pr/N --review    # レビューする
-ghost github.com/OWNER/REPO/pr/N --code      # CI の失敗とレビューコメントを直す
-ghost github.com/OWNER/REPO/issue/N          # 実装してプルリクエストを開き、直し続ける
-ghost github.com/OWNER/REPO/issue/N --yes    # 続く確認を受け入れて始める
+ghost github.com/OWNER/REPO/pull/N --review  # レビューする
+ghost github.com/OWNER/REPO/pull/N --code    # CI の失敗とレビューコメントを直す
+ghost github.com/OWNER/REPO/issues/N         # 実装してプルリクエストを開き、直し続ける
+ghost github.com/OWNER/REPO/issues/N --yes   # 続く確認を受け入れて始める
 ghost github.com/OWNER/REPO/issues --auto    # いちばん古い issue から順に進める
 ```
 
@@ -33,7 +33,7 @@ ghost github.com/OWNER/REPO/issues --auto    # いちばん古い issue から�
 
 リポジトリの URL に `--review` か `--code` を付けるとエラーです。issue の URL に `--review` を付けるとエラーです。リポジトリ、プルリクエスト、番号付きの issue に `--auto` を付けるとエラーです。
 
-`github.com/OWNER/REPO/issues`（`/issue` も同じ）は、開いている issue だけを一覧します。
+`github.com/OWNER/REPO/issues` は、開いている issue だけを一覧します。`/pr/N` と `/issue/N` は受け付けず、`/pull/N` と `/issues/N` を使います。
 
 `--auto` は一覧を出さず、GitHub を確認するたびに、まだ扱っていないいちばん古い issue を、実装からプルリクエスト、レビュー対応までのいつもの流れで進めます。
 

@@ -2,6 +2,8 @@
 
 Behavior that the user guide does not spell out. ghost talks to GitHub only through `gh`.
 
+A target is `github.com/OWNER/REPO`, `.../pull/N`, `.../issues/N`, or `.../issues`. `/pr/N` and `/issue/N` are rejected, and the error names `/pull/N` or `/issues/N`. The local ref `refs/remotes/origin/pr/N` is where a fetched `pull/N/head` is stored. It is not a URL ghost accepts.
+
 ## What each check logs
 
 Each check logs `reviews N, inline N, comments N` from `gh api`: review submissions (`repos/OWNER/REPO/pulls/N/reviews`), inline comments (`pulls/N/comments`, paged), and issue comments. A code-mode check also logs `filtered 0`, or `filtered N (untrusted author)` when `--trust-comments` drops authors.
