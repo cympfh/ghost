@@ -22,6 +22,8 @@ If `gh` is missing, not logged in, or cannot read the repository, ghost explains
 ghost github.com/OWNER/REPO                  # pick an open pull request or issue
 ghost github.com/OWNER/REPO/pull/N --review  # review
 ghost github.com/OWNER/REPO/pull/N --code    # fix CI failures and review comments
+ghost github.com/OWNER/REPO/pulls --review   # pick an open pull request to review
+ghost github.com/OWNER/REPO/pulls --code     # pick an open pull request to fix
 ghost github.com/OWNER/REPO/issues/N         # implement, open a pull request, then keep fixing
 ghost github.com/OWNER/REPO/issues/N --yes   # same, accepting the continue prompt
 ghost github.com/OWNER/REPO/issues --auto    # oldest open issue, then the next
@@ -31,9 +33,11 @@ A pull request URL with no flag asks whether to review or to fix.
 
 A repository with nothing open prints one line and exits.
 
-A repository URL with `--review` or `--code` is an error. `--review` on an issue URL is an error. `--auto` on a repository, pull request, or numbered issue is an error.
+A repository URL with `--review` or `--code` is an error. `/pulls` without one of those is an error. `--review` on an issue URL is an error. `--auto` on a repository, pull request, numbered issue, or `/pulls` is an error.
 
-`github.com/OWNER/REPO/issues` lists only open issues. `/pr/N` and `/issue/N` are not accepted; use `/pull/N` and `/issues/N`.
+`github.com/OWNER/REPO/pulls` lists open pull requests and needs `--review` or `--code`.
+
+`github.com/OWNER/REPO/issues` lists only open issues.
 
 `--auto` skips that list. Each time ghost checks GitHub, it takes the oldest open issue it has not handled and runs the usual issue flow: implement, open a pull request, then keep up with review. `--trust-issues` chooses which authors it runs. The default is an OWNER, MEMBER, or COLLABORATOR. When nothing is left, it waits for the next check instead of exiting. `q` or Ctrl-C ends the loop.
 

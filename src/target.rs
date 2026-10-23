@@ -20,6 +20,11 @@ pub enum GhTarget {
         owner: String,
         repo: String,
     },
+    /// `github.com/OWNER/REPO/pulls` with no number. Open pull requests only.
+    Pulls {
+        owner: String,
+        repo: String,
+    },
 }
 
 impl GhTarget {
@@ -28,7 +33,8 @@ impl GhTarget {
             Self::Repo { owner, .. }
             | Self::Pull { owner, .. }
             | Self::Issue { owner, .. }
-            | Self::Issues { owner, .. } => owner,
+            | Self::Issues { owner, .. }
+            | Self::Pulls { owner, .. } => owner,
         }
     }
 
@@ -37,7 +43,8 @@ impl GhTarget {
             Self::Repo { repo, .. }
             | Self::Pull { repo, .. }
             | Self::Issue { repo, .. }
-            | Self::Issues { repo, .. } => repo,
+            | Self::Issues { repo, .. }
+            | Self::Pulls { repo, .. } => repo,
         }
     }
 
@@ -60,6 +67,7 @@ impl GhTarget {
                 number,
             } => format!("github.com/{owner}/{repo}/issues/{number}"),
             Self::Issues { owner, repo } => format!("github.com/{owner}/{repo}/issues"),
+            Self::Pulls { owner, repo } => format!("github.com/{owner}/{repo}/pulls"),
         }
     }
 }
@@ -90,7 +98,7 @@ pub fn parse_target(input: &str) -> Result<GhTarget, String> {
         (parts[0], strip_git(parts[1]), &parts[2..])
     } else {
         return Err(format!(
-                "not a github.com URL: `{input}` (expected github.com/OWNER/REPO[/pull/N|/issues/N|/issues])"
+                "not a github.com URL: `{input}` (expected github.com/OWNER/REPO[/pull/N|/pulls|/issues/N|/issues])"
             ));
     };
 
@@ -112,16 +120,18 @@ pub fn parse_target(input: &str) -> Result<GhTarget, String> {
             number: parse_number(n)?,
         }),
         ["issues"] => Ok(GhTarget::Issues { owner, repo }),
+        ["pulls"] => Ok(GhTarget::Pulls { owner, repo }),
         ["pr", rest @ ..] => Err(suggest_pull("pr", &owner, &repo, rest)),
         ["pulls", rest @ ..] => Err(suggest_pull("pulls", &owner, &repo, rest)),
         ["issue", rest @ ..] => Err(suggest_issues(&owner, &repo, rest)),
         _ => Err(format!(
-            "unsupported GitHub URL `{input}` (use github.com/OWNER/REPO, /pull/N, /issues/N, or /issues)"
+            "unsupported GitHub URL `{input}` (use github.com/OWNER/REPO, /pull/N, /pulls, /issues/N, or /issues)"
         )),
     }
 }
 
-/// `/pr/N` and `/pulls/N` are not the form ghost accepts. Point at `/pull/N`.
+/// `/pr/N` and `/pulls/N` are not pull-request URLs. Point at `/pull/N`.
+/// Bare `/pulls` is the open-list form and is handled before this.
 fn suggest_pull(rejected: &str, owner: &str, repo: &str, rest: &[&str]) -> String {
     let number = rest.first().copied().unwrap_or("N");
     let shown = if rest.len() == 1 && number.chars().all(|c| c.is_ascii_digit()) && number != "0" {
@@ -259,6 +269,26 @@ mod tests {
                 .display_url(),
             "github.com/cympfh/xxx/issues"
         );
+        assert_eq!(
+            parse_target("https://github.com/cympfh/xxx/pulls").unwrap(),
+            GhTarget::Pulls {
+                owner: "cympfh".into(),
+                repo: "xxx".into(),
+            }
+        );
+        assert_eq!(
+            parse_target("http://www.github.com/cympfh/xxx/pulls/?q=is%3Aopen")
+                .unwrap()
+                .display_url(),
+            "github.com/cympfh/xxx/pulls"
+        );
+        assert_eq!(
+            parse_target("cympfh/xxx/pulls").unwrap(),
+            GhTarget::Pulls {
+                owner: "cympfh".into(),
+                repo: "xxx".into(),
+            }
+        );
     }
 
     #[test]
@@ -275,6 +305,12 @@ mod tests {
         assert!(pr.contains("github.com/a/b/pull/3"), "{pr}");
         let pulls = parse_target("http://www.github.com/a/b/pulls/3/").unwrap_err();
         assert!(pulls.contains("/pull/3"), "{pulls}");
+        assert!(pulls.contains("github.com/a/b/pull/3"), "{pulls}");
+        let bare_pulls = parse_target("github.com/a/b/pulls").unwrap();
+        assert_eq!(bare_pulls.display_url(), "github.com/a/b/pulls");
+        assert!(!parse_target("github.com/a/b/pulls/0")
+            .unwrap_err()
+            .contains("at least 1"));
         let issue = parse_target("github.com/a/b/issue/12").unwrap_err();
         assert!(issue.contains("/issues/12"), "{issue}");
         assert!(issue.contains("github.com/a/b/issues/12"), "{issue}");
