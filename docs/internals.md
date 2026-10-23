@@ -1,8 +1,76 @@
 # Internals
 
-Behavior that the user guide does not spell out. ghost talks to GitHub only through `gh`.
+Details behind the short READMEs. ghost talks to GitHub only through `gh`.
 
 A target is `github.com/OWNER/REPO`, `.../pull/N`, `.../issues/N`, or `.../issues`. `/pr/N` and `/issue/N` are rejected, and the error names `/pull/N` or `/issues/N`. The local ref `refs/remotes/origin/pr/N` is where a fetched `pull/N/head` is stored. It is not a URL ghost accepts.
+
+You need `gh` (`gh auth login`) and one of `codex`, `claude`, or `grok` on `PATH`. Install with `cargo install --path .`. If `gh` is missing, not logged in, or cannot read the repository, ghost explains the fix and exits. It also stops when no coding agent is on `PATH`.
+
+## Flags
+
+| Short | Long | Default | Description |
+| --- | --- | --- | --- |
+| `-r` | `--review` | | Review the pull request. Cannot be combined with `-c`. |
+| `-c` | `--code` | | Fix failing CI and new review comments. Cannot be combined with `-r`. |
+| `-i` | `--interval` | `20s` | How often to check GitHub (`30s`, `2m`, `1h30m`, or a number of seconds). |
+| `-a` | `--agent` | first on `PATH` | `codex`, `claude`, or `grok`. |
+| `-k` | `--ssh-key` | ssh config, or `GHOST_SSH_KEY` | Private key passed to ssh. |
+| `-l` | `--lang` | `ja` (`GHOST_LANG` if the flag is omitted) | `ja` or `en`. |
+| `-y` | `--yes` | | Accept the continue prompt and the review-exit prompt. Does not merge. |
+| | `--merge-yes` | | Merge without confirming. Only with `--code`, an issue, or `--auto`. |
+| | `--auto` | | With `/issues`, take the oldest open issue on each check. No picker. |
+| | `--merge-method` | `squash` | `merge`, `squash`, or `rebase`. |
+| `-n` | `--max-iterations` | `20` | Stop after this many agent turns. |
+| `-t` | `--trust-comments` | `all` | Who may wake `--code`: `all`, `collaborators`, or `contributors`. |
+| | `--trust-issues` | `collaborators` | Whose issues `--auto` runs: `all`, `collaborators`, or `contributors`. |
+| `-d` | `--demo` | | Draw a sample screen: `picker`, `review`, `code`, `confirm`, or `preflight`. |
+| `-h` | `--help` | | Help. |
+| `-V` | `--version` | | Version. |
+
+A pull request URL with no flag asks whether to review or to fix. A repository with nothing open prints one line and exits. A repository URL with `--review` or `--code` is an error. `--review` on an issue URL is an error. `--auto` is only valid with `github.com/OWNER/REPO/issues`. That URL lists only open issues.
+
+## Keys
+
+- `q` quits ghost.
+- `i` sends one line to the agent from the log screen. If a turn is running, the line is delivered when that turn ends.
+- `ctrl-c` interrupts the current turn and leaves the session. On a confirm screen it does the same as `n`.
+
+| Screen | `y` | `n` / Esc | Enter | `c` | `m` |
+| --- | --- | --- | --- | --- | --- |
+| Merge confirm | Merge | Exit ghost without merging | Exit ghost without merging | Stay in the session | Cycle the method |
+| Merge confirm (`--auto`) | Merge, then take the next issue | Leave it unmerged and take the next issue | Leave it unmerged and take the next issue | Stay on this pull request | Cycle the method |
+| Review-end confirm | Exit ghost | Exit ghost | Exit ghost | Stay in the session | — |
+| Issue-to-code handoff | Continue fixing | Exit ghost without continuing | Continue fixing | — | — |
+
+On the merge confirm screen, Tab and the left and right arrows cycle the method the same way `m` does: squash, merge, rebase.
+
+`ghost --demo picker` draws these screens with sample data. The other scenes are `review`, `code`, `confirm`, and `preflight`. Screenshots of those screens are in `docs/screenshots/`.
+
+## `--auto`
+
+`--auto` skips the issue list. Each check takes the oldest open issue it has not handled and runs the usual issue flow: implement, open a pull request, then keep up with review. When nothing is left, it waits for the next check instead of exiting. `q` or Ctrl-C ends the loop.
+
+An issue that already has an open pull request is skipped for that round. Issues filed after `--auto` starts are picked up on a later check. Which authors it runs is `--trust-issues` (default OWNER, MEMBER, or COLLABORATOR). An issue the agent creates with `gh issue create` in this repository is listed in `OWNER__REPO/created-issues` and skipped. See below for closed pull requests ghost opened, and for which GitHub errors are retried.
+
+Without `--yes`, a session that is not a terminal declines the prompt that would continue into code and takes the next issue. It does not reach the merge confirm. On a terminal, `y` merges and continues, `c` stays on this pull request, and `n` or Enter leaves it unmerged and takes the next issue. `--auto --yes --merge-yes` opens the pull request, handles review, merges, and then takes the next issue.
+
+Issues `--auto` will not take again are stored in `OWNER__REPO/auto.json` under the state directory below. Delete that file to take them again.
+
+## Agent permissions
+
+The agent runs with its permission prompts turned off (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, or `--yolo`). Use `--review` only on a repository you trust with that agent's credentials.
+
+The `gh` and `git` commands placed in front of the agent only stop accidents, such as an unintended merge. To block merges for real, use a token that does not have permission to merge.
+
+`--auto` runs that agent on each chosen issue without asking first. Text in such an issue can still tell the agent what to do, so use `--auto` only on a repository you trust. `--trust-issues all` also takes issues opened by other people. `--trust-comments` defaults to `all` and chooses who may wake `--code`, including review comments while implementing an issue and during `--code`. It does not choose issue authors.
+
+## Paths
+
+An ssh passphrase is asked before the screen starts. After that, ssh runs without another prompt. If the key is locked, unlock it with `ssh-add`, pass `--ssh-key`, or switch the remote to HTTPS with `gh config set git_protocol https`.
+
+Clones stay at `~/.ghost/work/OWNER__REPO`. Set `GHOST_HOME` to replace `~/.ghost`.
+
+The last review, seen comments, and the session id are stored in `$GHOST_STATE_DIR`, or `$XDG_STATE_HOME/ghost`, or `~/.local/state/ghost`.
 
 ## What each check logs
 
