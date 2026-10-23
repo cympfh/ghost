@@ -47,7 +47,7 @@ A pull request is mergeable when it is open, not a draft, free of conflicts, has
 | | `--merge-method` | `squash` | `merge`, `squash`, or `rebase`. |
 | `-n` | `--max-iterations` | `20` | Stop after this many agent turns. |
 | `-t` | `--trust-comments` | `all` | Who may wake `--code`: `all`, `collaborators`, or `contributors`. |
-| `-d` | `--demo` | | Draw a sample screen: `picker`, `review`, `code`, `confirm`, or `preflight`. |
+| `-d` | `--demo` | | Draw a sample screen: `picker`, `review`, `code`, `confirm`, `preflight`, or `splash`. |
 | `-h` | `--help` | | Help. |
 | `-V` | `--version` | | Version. |
 
@@ -73,7 +73,7 @@ A pull request is mergeable when it is open, not a draft, free of conflicts, has
 
 On the merge confirm screen, Tab and the left and right arrows cycle the method the same way `m` does: squash, merge, rebase.
 
-`ghost --demo picker` draws these screens with sample data. The other scenes are `review`, `code`, `confirm`, and `preflight`.
+`ghost --demo picker` draws these screens with sample data. The other scenes are `review`, `code`, `confirm`, `preflight`, and `splash`.
 
 ## Agent permissions
 

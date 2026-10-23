@@ -47,7 +47,7 @@ ghost github.com/OWNER/REPO/issue/N --yes    # 続く確認を受け入れて始
 | | `--merge-method` | `squash` | `merge`、`squash`、または `rebase`。 |
 | `-n` | `--max-iterations` | `20` | エージェントに頼む回数の上限。 |
 | `-t` | `--trust-comments` | `all` | 直しを始めるコメントの投稿者。`all`、`collaborators`、`contributors`。 |
-| `-d` | `--demo` | | 見本の画面。`picker`、`review`、`code`、`confirm`、`preflight`。 |
+| `-d` | `--demo` | | 見本の画面。`picker`、`review`、`code`、`confirm`、`preflight`、`splash`。 |
 | `-h` | `--help` | | ヘルプ。 |
 | `-V` | `--version` | | バージョン。 |
 
@@ -73,7 +73,7 @@ ghost github.com/OWNER/REPO/issue/N --yes    # 続く確認を受け入れて始
 
 マージの確認では、Tab と左右のキーも `m` と同じく方法を切り替えます。順は squash、merge、rebase です。
 
-`ghost --demo picker` は見本のデータでこれらの画面を描きます。ほかの場面は `review`、`code`、`confirm`、`preflight` です。
+`ghost --demo picker` は見本のデータでこれらの画面を描きます。ほかの場面は `review`、`code`、`confirm`、`preflight`、`splash` です。
 
 ## エージェントの権限
 

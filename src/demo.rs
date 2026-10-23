@@ -19,10 +19,16 @@ pub enum DemoScene {
     Code,
     Confirm,
     Preflight,
+    Splash,
 }
 
 pub fn run(scene: DemoScene, header: String) -> anyhow::Result<i32> {
-    tui::run(header, move |tx, rx| play(scene, tx, rx))
+    let play_scene = scene;
+    if scene == DemoScene::Splash {
+        tui::run_with_splash(header, move |tx, rx| play(play_scene, tx, rx))
+    } else {
+        tui::run(header, move |tx, rx| play(play_scene, tx, rx))
+    }
 }
 
 fn play(scene: DemoScene, tx: Sender<UiEvent>, rx: Receiver<UiCmd>) {
@@ -53,6 +59,20 @@ fn play(scene: DemoScene, tx: Sender<UiEvent>, rx: Receiver<UiCmd>) {
         DemoScene::Confirm => {
             merge_confirm_scene(&tx);
             wait_merge_confirm(&tx, &rx);
+        }
+        DemoScene::Splash => {
+            send_status(
+                &tx,
+                "startup",
+                "github.com/cympfh/xxx",
+                "preparing",
+                "—",
+                "—",
+                "0",
+                "—",
+                "—",
+            );
+            wait_quit(&rx);
         }
         DemoScene::Preflight => {
             let _ = tx.send(UiEvent::Fatal(

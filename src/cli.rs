@@ -72,7 +72,7 @@ struct Cli {
     #[arg(long, short = 'n', default_value_t = 20)]
     max_iterations: u32,
 
-    /// Draw a scripted screen (picker, review, code, confirm, preflight).
+    /// Draw a scripted screen (picker, review, code, confirm, preflight, splash).
     #[arg(long, short = 'd', value_enum)]
     demo: Option<DemoScene>,
 
@@ -241,7 +241,7 @@ fn mode_for(target: &GhTarget, review: bool, code: bool) -> Result<RunMode, Stri
 
 fn demo_header(scene: DemoScene) -> String {
     match scene {
-        DemoScene::Picker => "ghost github.com/cympfh/xxx".into(),
+        DemoScene::Picker | DemoScene::Splash => "ghost github.com/cympfh/xxx".into(),
         DemoScene::Review | DemoScene::Preflight => {
             "ghost github.com/cympfh/xxx/pr/3 --review".into()
         }
