@@ -21,8 +21,10 @@ ghost github.com/OWNER/REPO                  # pick an open pull request or issu
 ghost github.com/OWNER/REPO/pull/N --review  # review
 ghost github.com/OWNER/REPO/pull/N --code    # fix CI failures and review comments
 ghost github.com/OWNER/REPO/pulls --code     # pick an open pull request to fix
-ghost github.com/OWNER/REPO/issues/N         # implement an issue, then keep fixing
+ghost github.com/OWNER/REPO/issues/N         # implement, open a pull request, then keep fixing
 ghost github.com/OWNER/REPO/issues --auto    # oldest open issue, then the next
 ```
+
+The agent runs with its permission prompts turned off, and --auto acts on issue text without asking. Use ghost only on repositories you trust. See [Agent permissions](docs/internals.md#agent-permissions).
 
 The rest of the guide is in [docs/internals.md](docs/internals.md).

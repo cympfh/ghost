@@ -4,7 +4,7 @@
 
 [English](README.md) | [日本語](README.ja.md)
 
-ghost はローカルのコーディングエージェントにプルリクエストをレビューさせたり、issue から実装させたり、CI の失敗とレビューコメントを直させたりします。マージできる状態になると、確認してから自分でマージします。
+ghost はローカルのコーディングエージェントにプルリクエストをレビューさせたり、issue から実装させたり、CI の失敗とレビューコメントを直させたりします。マージできる状態になると、あなたに確認してから、ghost がマージします。
 
 ## 必要なもの
 
@@ -24,5 +24,7 @@ ghost github.com/OWNER/REPO/pulls --code     # 開いているプルリクエス
 ghost github.com/OWNER/REPO/issues/N         # 実装してプルリクエストを開き、直し続ける
 ghost github.com/OWNER/REPO/issues --auto    # いちばん古い issue から順に進める
 ```
+
+エージェントは許可の確認を切った状態で動きます。--auto は issue の本文に従って、確認せずに作業します。信頼できるリポジトリでだけ使ってください。詳しくは [Agent permissions](docs/internals.md#agent-permissions) を見てください。
 
 詳しい説明は [docs/internals.md](docs/internals.md) にあります。
