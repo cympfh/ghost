@@ -160,23 +160,6 @@ pub fn border_choose() -> Style {
     paint(Color::Cyan)
 }
 
-/// Orange of the ghost's eyes (`#F05033`).
-const LOGO_ORANGE: Color = Color::Rgb(0xF0, 0x50, 0x33);
-
-pub fn logo_orange() -> Color {
-    LOGO_ORANGE
-}
-
-/// Ghost body of the startup mark.
-pub fn logo_ghost() -> Style {
-    paint(Color::White)
-}
-
-/// Eye: orange on the white ghost. `NO_COLOR` drops both.
-pub fn logo_eye() -> Style {
-    paint_bg(LOGO_ORANGE, Color::White)
-}
-
 pub fn badge(text: &str) -> Style {
     if text.contains('✓') || text.contains("approved") {
         ok()

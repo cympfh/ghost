@@ -10,7 +10,6 @@ pub mod engine;
 pub mod github;
 pub mod interval;
 pub mod lang;
-pub mod logo;
 pub mod merge;
 pub mod preflight;
 pub mod prompt;

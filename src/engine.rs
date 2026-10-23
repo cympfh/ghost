@@ -77,71 +77,70 @@ pub fn run(spec: RunSpec) -> Result<i32> {
         }
     }
     let header = spec.header.clone();
-    tui::run_with_splash(header, move |tx, rx| {
-        let started = Instant::now();
-        let _ = tx.send(UiEvent::Status(Status {
-            mode: mode_name(spec.mode).into(),
-            target: spec.target.display_url(),
-            phase: "preparing".into(),
-            ..Status::default()
-        }));
-        let mut failures = Vec::new();
-        let login = match classify_startup(&spec.target.slug(), spec.lang) {
-            Startup::Fatal(message) => {
-                let _ = tx.send(UiEvent::Fatal(message.clone()));
-                wait_quit(&rx);
-                let _ = tx.send(UiEvent::Exit { code: 1, message });
-                return;
+    let mut failures = Vec::new();
+    let login = match classify_startup(&spec.target.slug(), spec.lang) {
+        Startup::Fatal(message) => return show_fatal(header, message),
+        Startup::Continue { login, failure } => {
+            if let Some(failure) = failure {
+                failures.push(failure);
             }
-            Startup::Continue { login, failure } => {
-                if let Some(failure) = failure {
-                    failures.push(failure);
-                }
-                login
-            }
-        };
-        let prepared = tui::with_terminal(&tx, &rx, || prepare_on_tty(&spec, login, failures));
-        let prepared = match prepared {
-            Some(Ok(prepared)) => prepared,
-            Some(Err(err)) => {
-                let message = format!("{err:#}");
-                let _ = tx.send(UiEvent::Fatal(message.clone()));
-                let _ = tx.send(UiEvent::Exit { code: 1, message });
-                return;
-            }
-            None => {
-                let _ = tx.send(UiEvent::Exit {
-                    code: 0,
-                    message: "quit".into(),
-                });
-                return;
-            }
-        };
-        if tui::interactive_terminal() {
-            std::thread::sleep(crate::logo::splash_hold(started.elapsed()));
+            login
         }
-        let _ = tx.send(UiEvent::SplashFinished);
-        let PreparedSession {
-            login,
-            how,
-            workdir,
-            main_clone,
-            home,
-            slot_dir,
-            slot_lock,
-            failures,
-        } = prepared;
+    };
+    // Clone, fetch, and checkout on the normal terminal so ssh can ask for a
+    // key passphrase before raw mode / the alternate screen take the tty.
+    let home = workdir::ghost_home()?;
+    let path = workdir::work_path(&home, spec.target.owner(), spec.target.repo());
+    eprintln!(
+        "ghost: preparing {} (ssh may ask for a key passphrase)",
+        path.display()
+    );
+    let prepared = workdir::prepare(&home, spec.target.owner(), spec.target.repo());
+    if !prepared.note.is_empty() {
+        eprintln!("ghost: {}", prepared.note);
+    }
+    for failure in &prepared.failures {
+        eprintln!("ghost: {}", prompt::setup_warning(failure));
+    }
+    failures.extend(prepared.failures);
+    let main_clone = prepared.path;
+    let slot = activate_slot(&spec, &home, &main_clone);
+    for failure in &slot.failures {
+        eprintln!("ghost: {}", prompt::setup_warning(failure));
+    }
+    failures.extend(slot.failures);
+    let mut workdir = slot.workdir;
+    let slot_dir = slot.intended;
+    if spec.mode != RunMode::Picker && slot.lock.is_some() {
+        let primed = prime_checkout(&spec, &main_clone, &slot_dir);
+        if !primed.note.is_empty() {
+            eprintln!("ghost: {}", primed.note);
+        }
+        for failure in &primed.failures {
+            eprintln!("ghost: {}", prompt::setup_warning(failure));
+        }
+        failures.extend(primed.failures);
+        workdir = primed.workdir;
+    }
+    let how = prepared.note;
+    let workdir_for_ui = workdir.clone();
+    let main_for_ui = main_clone.clone();
+    let home_for_ui = home.clone();
+    let slot_for_ui = slot_dir.clone();
+    let failures_for_ui = failures;
+    let slot_lock = slot.lock;
+    tui::run(header, move |tx, rx| {
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             babysit(
                 spec,
                 login,
-                home,
-                main_clone,
-                workdir,
-                slot_dir,
+                home_for_ui,
+                main_for_ui,
+                workdir_for_ui,
+                slot_for_ui,
                 slot_lock,
                 how,
-                failures,
+                failures_for_ui,
                 tx.clone(),
                 rx,
             )
@@ -162,69 +161,6 @@ pub fn run(spec: RunSpec) -> Result<i32> {
     })
 }
 
-struct PreparedSession {
-    login: Option<String>,
-    how: String,
-    workdir: PathBuf,
-    main_clone: PathBuf,
-    home: PathBuf,
-    slot_dir: PathBuf,
-    slot_lock: Option<workdir::SlotLock>,
-    failures: Vec<SetupFailure>,
-}
-
-/// Clone, fetch, and checkout. The caller leaves the alternate screen first so
-/// ssh can ask for a key passphrase.
-fn prepare_on_tty(
-    spec: &RunSpec,
-    login: Option<String>,
-    mut failures: Vec<SetupFailure>,
-) -> Result<PreparedSession> {
-    let home = workdir::ghost_home()?;
-    let path = workdir::work_path(&home, spec.target.owner(), spec.target.repo());
-    eprintln!(
-        "ghost: preparing {} (ssh may ask for a key passphrase)",
-        path.display()
-    );
-    let prepared = workdir::prepare(&home, spec.target.owner(), spec.target.repo());
-    if !prepared.note.is_empty() {
-        eprintln!("ghost: {}", prepared.note);
-    }
-    for failure in &prepared.failures {
-        eprintln!("ghost: {}", prompt::setup_warning(failure));
-    }
-    failures.extend(prepared.failures);
-    let main_clone = prepared.path;
-    let slot = activate_slot(spec, &home, &main_clone);
-    for failure in &slot.failures {
-        eprintln!("ghost: {}", prompt::setup_warning(failure));
-    }
-    failures.extend(slot.failures);
-    let mut workdir = slot.workdir;
-    let slot_dir = slot.intended;
-    if spec.mode != RunMode::Picker && slot.lock.is_some() {
-        let primed = prime_checkout(spec, &main_clone, &slot_dir);
-        if !primed.note.is_empty() {
-            eprintln!("ghost: {}", primed.note);
-        }
-        for failure in &primed.failures {
-            eprintln!("ghost: {}", prompt::setup_warning(failure));
-        }
-        failures.extend(primed.failures);
-        workdir = primed.workdir;
-    }
-    Ok(PreparedSession {
-        login,
-        how: prepared.note,
-        workdir,
-        main_clone,
-        home,
-        slot_dir,
-        slot_lock: slot.lock,
-        failures,
-    })
-}
-
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     let text = if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -234,6 +170,14 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
         "unknown panic".into()
     };
     format!("worker panicked: {text}")
+}
+
+fn show_fatal(header: String, message: String) -> Result<i32> {
+    tui::run(header, move |tx, rx| {
+        let _ = tx.send(UiEvent::Fatal(message.clone()));
+        wait_quit(&rx);
+        let _ = tx.send(UiEvent::Exit { code: 1, message });
+    })
 }
 
 fn prime_checkout(
@@ -2221,11 +2165,7 @@ impl Ctx {
                 self.log("interrupted the agent; the session stays open");
             }
             UiCmd::Input(text) => self.on_input(text, self.agent.turn_open())?,
-            UiCmd::Pick { .. }
-            | UiCmd::Choose(_)
-            | UiCmd::Confirm { .. }
-            | UiCmd::TerminalFree
-            | UiCmd::TerminalClaimed => {}
+            UiCmd::Pick { .. } | UiCmd::Choose(_) | UiCmd::Confirm { .. } => {}
         }
         Ok(())
     }

@@ -11,7 +11,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -107,11 +107,6 @@ pub enum UiEvent {
         lang: Lang,
     },
     Fatal(String),
-    /// Preparation finished; leave the startup mark and show the log.
-    SplashFinished,
-    /// Git may ask for a passphrase. Leave the alternate screen until [`UiEvent::ResumeTerminal`].
-    YieldTerminal,
-    ResumeTerminal,
     Exit {
         code: i32,
         message: String,
@@ -134,10 +129,6 @@ pub enum UiCmd {
         /// Method selected on the merge dialog. Other prompts leave this empty.
         method: Option<MergeStyle>,
     },
-    /// The alternate screen is down. The worker may use the terminal.
-    TerminalFree,
-    /// Raw mode is back. The worker may send the next screen.
-    TerminalClaimed,
 }
 
 /// `gh pr merge` strategy shown on the merge dialog. `m`, Tab, and the arrow
@@ -251,8 +242,6 @@ pub struct App {
     pub exit_code: i32,
     pub exit_message: String,
     pub spinner: usize,
-    /// Startup mark, until preparation finishes or another screen takes over.
-    splash: bool,
     picker_backup: Vec<OpenItem>,
     picker_selected: usize,
 }
@@ -273,7 +262,6 @@ impl App {
             exit_code: 0,
             exit_message: String::new(),
             spinner: 0,
-            splash: false,
             picker_backup: Vec::new(),
             picker_selected: 0,
         }
@@ -308,58 +296,7 @@ pub fn interactive_terminal() -> bool {
     should_open_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())
 }
 
-/// Run `f` on the normal terminal when this process is interactive, so ssh can
-/// ask for a passphrase. The startup mark is printed there first. Headless
-/// runs `f` directly. `None` means the UI went away before `f` finished.
-pub fn with_terminal<T>(
-    tx: &Sender<UiEvent>,
-    rx: &Receiver<UiCmd>,
-    f: impl FnOnce() -> T,
-) -> Option<T> {
-    if !interactive_terminal() {
-        return Some(f());
-    }
-    let _ = tx.send(UiEvent::YieldTerminal);
-    if !wait_ui(rx, |cmd| matches!(cmd, UiCmd::TerminalFree)) {
-        return None;
-    }
-    crate::logo::print_on_stdout();
-    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    let _ = tx.send(UiEvent::ResumeTerminal);
-    let claimed = wait_ui(rx, |cmd| matches!(cmd, UiCmd::TerminalClaimed));
-    match value {
-        Ok(value) if claimed => Some(value),
-        Ok(_) => None,
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
-}
-
-fn wait_ui(rx: &Receiver<UiCmd>, ready: impl Fn(&UiCmd) -> bool) -> bool {
-    loop {
-        match rx.recv() {
-            Ok(cmd) if ready(&cmd) => return true,
-            Ok(UiCmd::Quit) | Err(_) => return false,
-            Ok(_) => {}
-        }
-    }
-}
-
 pub fn run<F>(header: String, worker: F) -> anyhow::Result<i32>
-where
-    F: FnOnce(Sender<UiEvent>, Receiver<UiCmd>) + Send + 'static,
-{
-    run_inner(header, false, worker)
-}
-
-/// Same as [`run`], starting on the startup mark.
-pub fn run_with_splash<F>(header: String, worker: F) -> anyhow::Result<i32>
-where
-    F: FnOnce(Sender<UiEvent>, Receiver<UiCmd>) + Send + 'static,
-{
-    run_inner(header, true, worker)
-}
-
-fn run_inner<F>(header: String, splash: bool, worker: F) -> anyhow::Result<i32>
 where
     F: FnOnce(Sender<UiEvent>, Receiver<UiCmd>) + Send + 'static,
 {
@@ -375,10 +312,6 @@ where
     execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let mut app = App::new(header);
-    if splash {
-        app.splash = true;
-        app.status.phase = "preparing".into();
-    }
 
     crate::agent::install_fatal_signals();
     let hook = std::panic::take_hook();
@@ -391,8 +324,8 @@ where
 
     loop {
         terminal.draw(|f| draw(f, &mut app))?;
-        if drain_events(&mut app, &ev_rx, &cmd_tx, &mut terminal)? {
-            continue;
+        while let Ok(event) = ev_rx.try_recv() {
+            apply(&mut app, event);
         }
         if app.quit {
             break;
@@ -464,13 +397,6 @@ where
                 // Unblock a worker waiting on the command channel (preflight).
                 let _ = cmd_tx.send(UiCmd::Quit);
             }
-            Ok(UiEvent::SplashFinished) => {}
-            Ok(UiEvent::YieldTerminal) => {
-                let _ = cmd_tx.send(UiCmd::TerminalFree);
-            }
-            Ok(UiEvent::ResumeTerminal) => {
-                let _ = cmd_tx.send(UiCmd::TerminalClaimed);
-            }
             Ok(UiEvent::Exit { code, message }) => {
                 if !forced {
                     exit_code = code;
@@ -491,44 +417,6 @@ where
     Ok(exit_code)
 }
 
-/// `true` when the terminal was given back to the worker and reclaimed.
-fn drain_events(
-    app: &mut App,
-    ev_rx: &Receiver<UiEvent>,
-    cmd_tx: &Sender<UiCmd>,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> anyhow::Result<bool> {
-    while let Ok(event) = ev_rx.try_recv() {
-        if matches!(event, UiEvent::YieldTerminal) {
-            suspend_for_worker(app, ev_rx, cmd_tx, terminal)?;
-            return Ok(true);
-        }
-        apply(app, event);
-    }
-    Ok(false)
-}
-
-fn suspend_for_worker(
-    app: &mut App,
-    ev_rx: &Receiver<UiEvent>,
-    cmd_tx: &Sender<UiCmd>,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> anyhow::Result<()> {
-    restore(terminal)?;
-    let _ = cmd_tx.send(UiCmd::TerminalFree);
-    loop {
-        match ev_rx.recv() {
-            Ok(UiEvent::ResumeTerminal) | Err(_) => break,
-            Ok(event) => apply(app, event),
-        }
-    }
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    terminal.clear()?;
-    let _ = cmd_tx.send(UiCmd::TerminalClaimed);
-    Ok(())
-}
-
 fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -541,14 +429,12 @@ fn apply(app: &mut App, event: UiEvent) {
         UiEvent::Log(line) => app.push_log(line),
         UiEvent::Status(status) => app.status = status,
         UiEvent::Picker(items) => {
-            app.splash = false;
             app.picker_backup = items.clone();
             app.picker_selected = 0;
             app.view = View::Picker { items, selected: 0 };
             app.input_mode = false;
         }
         UiEvent::ChooseMode { number, title } => {
-            app.splash = false;
             app.view = View::Choose { number, title };
             app.input_mode = false;
         }
@@ -558,7 +444,6 @@ fn apply(app: &mut App, event: UiEvent) {
             kind,
             lang,
         } => {
-            app.splash = false;
             app.view = View::Confirm {
                 number,
                 message,
@@ -568,16 +453,11 @@ fn apply(app: &mut App, event: UiEvent) {
             app.input_mode = false;
         }
         UiEvent::Fatal(message) => {
-            app.splash = false;
             app.exit_code = 1;
             app.exit_message = message.clone();
             app.view = View::Fatal { message };
             app.input_mode = false;
         }
-        UiEvent::SplashFinished => {
-            app.splash = false;
-        }
-        UiEvent::YieldTerminal | UiEvent::ResumeTerminal => {}
         UiEvent::Exit { code, message } => {
             app.exit_code = code;
             if !message.is_empty() {
@@ -621,9 +501,6 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Option<UiCmd> {
             app.exit_message = "quit".into();
         }
         return Some(UiCmd::Quit);
-    }
-    if app.splash {
-        return None;
     }
 
     let kind = match &app.view {
@@ -839,10 +716,6 @@ fn on_input_key(app: &mut App, key: KeyEvent) -> Option<UiCmd> {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    if app.splash {
-        draw_splash(frame, app);
-        return;
-    }
     if area.width < 40 || area.height < 10 {
         frame.render_widget(Paragraph::new("terminal too small"), area);
         return;
@@ -876,67 +749,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     {
         draw_confirm(frame, chunks[1], message, *kind, *lang);
     }
-}
-
-fn draw_splash(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let chrome = area.width >= 40 && area.height >= 16;
-    let body = if chrome {
-        frame.render_widget(
-            header_line(&app.header),
-            Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: 1,
-            },
-        );
-        frame.render_widget(
-            status_line(app, area.width as usize),
-            Rect {
-                x: area.x,
-                y: area.y + area.height - 2,
-                width: area.width,
-                height: 1,
-            },
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(" q quit", theme::secondary()))),
-            Rect {
-                x: area.x,
-                y: area.y + area.height - 1,
-                width: area.width,
-                height: 1,
-            },
-        );
-        Rect {
-            x: area.x,
-            y: area.y + 1,
-            width: area.width,
-            height: area.height.saturating_sub(3),
-        }
-    } else {
-        area
-    };
-    let phase_rows: u16 = if body.height > 8 { 1 } else { 0 };
-    let art = crate::logo::render(body.width, body.height.saturating_sub(phase_rows));
-    let used = art.len() as u16 + phase_rows;
-    let pad = body.height.saturating_sub(used) / 2;
-    let mut lines = Vec::new();
-    for _ in 0..pad {
-        lines.push(Line::raw(""));
-    }
-    lines.extend(art);
-    if phase_rows == 1 {
-        lines.push(Line::from(Span::styled(
-            app.status.phase.clone(),
-            theme::secondary(),
-        )));
-    }
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), body);
 }
 
 fn header_line(header: &str) -> Paragraph<'_> {
@@ -1746,84 +1558,6 @@ mod tests {
                 assert!(!cell.modifier.contains(Modifier::DIM));
             }
         }
-        theme::force_colors_for_test(None);
-    }
-
-    #[test]
-    fn splash_renders_a_small_white_ghost() {
-        use ratatui::style::Color;
-
-        let mut app = App::new("ghost github.com/cympfh/xxx".into());
-        app.splash = true;
-        app.status.phase = "preparing".into();
-
-        theme::force_colors_for_test(Some(true));
-        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = term.backend().buffer().clone();
-        let text = buffer_text(&buf);
-        assert!(text.contains('▄'), "{text}");
-        assert!(text.contains('█'), "{text}");
-        assert!(text.contains('▀'), "{text}");
-        assert!(text.contains('•'), "{text}");
-        assert!(!text.contains('▓'), "{text}");
-        assert!(text.contains("preparing"), "{text}");
-        assert!(!text.contains("terminal too small"), "{text}");
-        let mut saw_white_ghost = false;
-        let mut saw_eye = false;
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                let cell = &buf[(x, y)];
-                assert_ne!(cell.symbol(), "▓");
-                if matches!(cell.symbol(), "█" | "▄" | "▀") {
-                    assert_eq!(cell.fg, Color::White);
-                    saw_white_ghost = true;
-                }
-                if cell.symbol() == "•" {
-                    assert_eq!(cell.fg, Color::Rgb(0xF0, 0x50, 0x33));
-                    assert_eq!(cell.bg, Color::White);
-                    saw_eye = true;
-                }
-            }
-        }
-        assert!(saw_white_ghost && saw_eye);
-
-        theme::force_colors_for_test(Some(false));
-        let mut plain = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        plain.draw(|f| draw(f, &mut app)).unwrap();
-        let plain_buf = plain.backend().buffer().clone();
-        let plain_text = buffer_text(&plain_buf);
-        assert!(
-            plain_text.contains('▄') && plain_text.contains('•') && plain_text.contains('▀'),
-            "{plain_text}"
-        );
-        assert!(!plain_text.contains('▓'), "{plain_text}");
-        for y in 0..plain_buf.area.height {
-            for x in 0..plain_buf.area.width {
-                let cell = &plain_buf[(x, y)];
-                assert_eq!(cell.fg, Color::Reset);
-                assert_eq!(cell.bg, Color::Reset);
-            }
-        }
-
-        theme::force_colors_for_test(Some(true));
-        let mut small = Terminal::new(TestBackend::new(32, 10)).unwrap();
-        small.draw(|f| draw(f, &mut app)).unwrap();
-        let small_text = buffer_text(small.backend().buffer());
-        assert!(small_text.contains('•'), "{small_text}");
-        assert!(!small_text.contains('▓'), "{small_text}");
-        assert!(!small_text.contains("terminal too small"), "{small_text}");
-        assert!(
-            small_text.matches('█').count() < text.matches('█').count(),
-            "a short terminal uses the smaller ghost\n{small_text}"
-        );
-
-        let mut tiny = Terminal::new(TestBackend::new(8, 3)).unwrap();
-        tiny.draw(|f| draw(f, &mut app)).unwrap();
-        let tiny_text = buffer_text(tiny.backend().buffer());
-        assert!(tiny_text.contains('•'), "{tiny_text}");
-        assert!(!tiny_text.contains('▓'), "{tiny_text}");
-        assert!(!tiny_text.contains("terminal too small"), "{tiny_text}");
         theme::force_colors_for_test(None);
     }
 }
