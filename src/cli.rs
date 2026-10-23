@@ -91,11 +91,15 @@ struct Cli {
     #[arg(long, short = 'k')]
     ssh_key: Option<String>,
 
-    /// Who may wake --code, and which issue authors --auto may run.
-    /// Pull requests default to all authors.
-    /// Issues and --auto default to collaborators (OWNER, MEMBER, COLLABORATOR).
+    /// Who may wake --code, including review comments during an issue and during --code.
+    /// Default: all.
     #[arg(long, short = 't', value_enum)]
     trust_comments: Option<CommentTrust>,
+
+    /// Which issue authors --auto may run.
+    /// Default: collaborators (OWNER, MEMBER, COLLABORATOR).
+    #[arg(long, value_enum)]
+    trust_issues: Option<CommentTrust>,
 }
 
 pub fn run() -> Result<i32> {
@@ -121,6 +125,7 @@ pub fn run() -> Result<i32> {
         lang,
         ssh_key,
         cli.trust_comments,
+        cli.trust_issues,
         cli.merge_yes,
         cli.merge_method
             .map(MergeMethod::gh_flag)
@@ -156,6 +161,7 @@ fn resolve(
     lang: Lang,
     ssh_key: Option<String>,
     trust: Option<CommentTrust>,
+    trust_issues: Option<CommentTrust>,
     merge_yes: bool,
     merge_method: Option<String>,
 ) -> Result<Action, String> {
@@ -204,10 +210,8 @@ fn resolve(
         max_turns: max_iterations,
         lang,
         ssh_key,
-        trust: trust.unwrap_or(match mode {
-            RunMode::Issue | RunMode::IssueList | RunMode::Auto => CommentTrust::Collaborators,
-            _ => CommentTrust::All,
-        }),
+        trust: trust.unwrap_or(CommentTrust::All),
+        trust_issues: trust_issues.unwrap_or(CommentTrust::Collaborators),
     }))
 }
 
@@ -376,6 +380,7 @@ mod tests {
             Lang::Ja,
             None,
             None,
+            None,
             merge_yes,
             merge_method,
         )
@@ -400,6 +405,7 @@ mod tests {
             "--merge-method",
             "-n, --max-iterations",
             "-t, --trust-comments",
+            "--trust-issues",
             "--auto",
             "-d, --demo",
             "-h, --help",
@@ -416,6 +422,10 @@ mod tests {
             "--auto must not have a short flag\n{help}"
         );
         assert!(!help.contains(", --merge-method"));
+        assert!(
+            !help.contains(", --trust-issues"),
+            "--trust-issues must not have a short flag\n{help}"
+        );
 
         let cli = Cli::try_parse_from([
             "ghost",
@@ -473,6 +483,7 @@ mod tests {
             None,
             "ghost".into(),
             cli.lang,
+            None,
             None,
             None,
             false,
@@ -547,6 +558,7 @@ mod tests {
             Lang::Ja,
             None,
             None,
+            None,
             false,
             None,
         )
@@ -563,6 +575,7 @@ mod tests {
             None,
             "ghost".into(),
             Lang::En,
+            None,
             None,
             None,
             false,
@@ -665,12 +678,16 @@ mod tests {
             Lang::Ja,
             None,
             None,
+            None,
             false,
             None,
         )
         .unwrap()
         {
-            Action::Run(spec) => assert_eq!(spec.trust, CommentTrust::Collaborators),
+            Action::Run(spec) => {
+                assert_eq!(spec.trust, CommentTrust::All);
+                assert_eq!(spec.trust_issues, CommentTrust::Collaborators);
+            }
             Action::Demo { .. } => panic!("expected a run"),
         }
         match resolve(
@@ -685,6 +702,7 @@ mod tests {
             None,
             "ghost".into(),
             Lang::Ja,
+            None,
             None,
             None,
             false,
@@ -709,12 +727,65 @@ mod tests {
             Lang::Ja,
             None,
             Some(CommentTrust::All),
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+        {
+            Action::Run(spec) => {
+                assert_eq!(spec.trust, CommentTrust::All);
+                assert_eq!(spec.trust_issues, CommentTrust::Collaborators);
+            }
+            Action::Demo { .. } => panic!("expected a run"),
+        }
+        match resolve(
+            Some("github.com/a/b/issue/4"),
+            false,
+            false,
+            false,
+            "20s",
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            None,
+            None,
             false,
             None,
         )
         .unwrap()
         {
             Action::Run(spec) => assert_eq!(spec.trust, CommentTrust::All),
+            Action::Demo { .. } => panic!("expected a run"),
+        }
+        match resolve(
+            Some("github.com/a/b/issues"),
+            false,
+            false,
+            true,
+            "20s",
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            None,
+            Some(CommentTrust::All),
+            false,
+            None,
+        )
+        .unwrap()
+        {
+            Action::Run(spec) => {
+                assert_eq!(spec.trust, CommentTrust::All);
+                assert_eq!(spec.trust_issues, CommentTrust::All);
+            }
             Action::Demo { .. } => panic!("expected a run"),
         }
     }

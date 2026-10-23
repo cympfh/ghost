@@ -37,17 +37,11 @@ ghost github.com/OWNER/REPO/issues --auto    # いちばん古い issue から�
 
 `--auto` は一覧を出さず、GitHub を確認するたびに、まだ扱っていないいちばん古い issue を、実装からプルリクエスト、レビュー対応までのいつもの流れで進めます。
 
-既定では OWNER、MEMBER、COLLABORATOR が開いた issue だけを取り、`--trust-comments` で対象を広げられます。
+投稿者は `--trust-issues` で選び、既定は OWNER、MEMBER、COLLABORATOR です。候補が無いあいだは終了せず次の確認まで待ち、`q` と Ctrl-C でループを終えます。
 
-開いているプルリクエストが付いている issue はその回だけ飛ばし、人が閉じたプルリクエストは記録してやり直しません。
+開いているプルリクエストが付いている issue はその回だけ飛ばし、開始後に自分で開いた issue は次の確認で取って、エージェントがこのリポジトリで `gh issue create` した番号は `OWNER__REPO/created-issues` に残して飛ばします。
 
-一時的な通信エラーは、待ったあと、またはプルリクエストの先端が変わったときにやり直し、やり直さない記録は `OWNER__REPO/auto.json` に残して、そのファイルを消せば最初から取り直せます。
-
-`--auto` の開始後に自分で開いた issue も、次の確認で取ります。エージェントが `gh issue create` で開いた issue は `OWNER__REPO/created-issues` に記録して飛ばし、候補が無いあいだは終了せず次の確認まで待ち、`q` と Ctrl-C でループを終えます。
-
-`--merge-yes` が無いとき、マージできる状態ではいつもの確認になります。端末では尋ね、端末が無いときは報告して次の issue に進みます。
-
-`y` はマージして次へ進み、`c` はそのプルリクエストに留まり、`n` と Enter はマージせず次の issue へ移ります。
+`--yes` が無いとき、端末が無ければ続ける確認をその場で断り、マージの確認には進まず次の issue へ移ります。端末では `y` がマージして次へ進み、`c` がそのプルリクエストに留まり、`n` と Enter がマージせず次の issue へ移ります。
 
 `--auto --yes --merge-yes` は確認なしでプルリクエストを作り、レビューを直し、マージしてから次を取ります。
 
@@ -66,7 +60,8 @@ ghost github.com/OWNER/REPO/issues --auto    # いちばん古い issue から�
 | | `--auto` | | `/issues` で、確認のたびにいちばん古いオープンな issue を取る。一覧は出さない。 |
 | | `--merge-method` | `squash` | `merge`、`squash`、または `rebase`。 |
 | `-n` | `--max-iterations` | `20` | エージェントに頼む回数の上限。 |
-| `-t` | `--trust-comments` | プルリクエストは `all`。issue と `--auto` は `collaborators` | 直しを始めるコメントの投稿者と、`--auto` が取る issue の投稿者。`all`、`collaborators`、`contributors`。 |
+| `-t` | `--trust-comments` | `all` | 直しを始めるコメントの投稿者。`all`、`collaborators`、`contributors`。 |
+| | `--trust-issues` | `collaborators` | `--auto` が取る issue の投稿者。`all`、`collaborators`、`contributors`。 |
 | `-d` | `--demo` | | 見本の画面。`picker`、`review`、`code`、`confirm`、`preflight`。 |
 | `-h` | `--help` | | ヘルプ。 |
 | `-V` | `--version` | | バージョン。 |
@@ -104,9 +99,9 @@ ghost github.com/OWNER/REPO/issues --auto    # いちばん古い issue から�
 
 `--auto` は、選んだ issue を確認なしでそのエージェントに任せます。
 
-既定では OWNER、MEMBER、COLLABORATOR が開いた issue だけを取り、その人の書いた issue でもエージェントへの指示になり得ます。
+`--trust-issues` の既定は collaborators で、OWNER、MEMBER、COLLABORATOR が開いた issue だけを取ります。その文面もエージェントへの指示になり得るので、`--auto` は任せてよいリポジトリだけで使ってください。`--trust-issues all` にすると、外部の人が開いた issue も対象になります。
 
-`--auto` は、任せてよいリポジトリだけで使ってください。`--trust-comments all` にすると、外部の人が開いた issue も対象になります。
+`--trust-comments` はレビューコメントの投稿者を選び、既定は `all` です。issue の投稿者の設定とは別で、番号付きの issue と `--code` のコメントにも使います。
 
 ## よくある問題
 
@@ -118,10 +113,8 @@ ssh のパスフレーズは、画面が始まる前に答えます。そのあ�
 
 最後のレビュー、読んだコメント、セッションの id は `$GHOST_STATE_DIR`、`$XDG_STATE_HOME/ghost`、または `~/.local/state/ghost` にあります。
 
-`--auto` がやり直さない issue は、その状態ディレクトリの `OWNER__REPO/auto.json` に記録し、ファイルを消せばもう一度取ります。
+`--auto` がやり直さない issue は、状態ディレクトリの `OWNER__REPO/auto.json` に残し、ファイルを消せばもう一度取ります。GitHub の一時的なエラーは、待ったあと、またはプルリクエストの先端が変わったときにやり直し、5 回でやり直しをやめます。
 
-GitHub の一時的なエラーは、待ったあと、またはプルリクエストの先端が変わったときにやり直し、ずっと記録したままにはしません。
-
-人が閉じたプルリクエストの issue は記録に残り、同じ作業を繰り返しません。
+ghost が開いたプルリクエスト（issue から付けたブランチ、またはエージェントが `gh pr create` で作ったもの）が閉じられていると、その issue は記録に残してやり直しません。他の人が `Closes #N` と書いて閉じたプルリクエストだけでは、その issue を飛ばしません。
 
 GitHub を確認する間隔、作業用コピー、マージの手順は [docs/internals.md](docs/internals.md) にあります。

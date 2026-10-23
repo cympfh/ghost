@@ -110,8 +110,23 @@ pub struct PollIn<'a> {
     pub trust: CommentTrust,
     /// Issue numbers the agent created with `gh issue create`.
     pub created: &'a [u64],
+    /// Pull request numbers the agent created with `gh pr create`.
+    pub created_prs: &'a [u64],
     pub now: &'a str,
     pub busy: &'a [u64],
+}
+
+/// Transient retries, including an immediate retry when the head moved, stop after this many failures.
+pub const MAX_TRANSIENT_ATTEMPTS: u32 = 5;
+
+/// `attempts_after` is the count once this failure is stored. The fifth one is permanent.
+pub fn keep_transient(was_transient: bool, attempts_after: u32) -> bool {
+    was_transient && attempts_after < MAX_TRANSIENT_ATTEMPTS
+}
+
+/// A stored blip can run again only while it is still under the cap.
+pub fn failure_can_retry(row: &AutoFailure) -> bool {
+    row.transient && row.attempts < MAX_TRANSIENT_ATTEMPTS
 }
 
 /// Oldest eligible issue. Dated issues come before ones with an empty timestamp.
@@ -138,9 +153,12 @@ pub fn poll(input: &PollIn<'_>) -> Poll {
         }
         let links = linked(row, input.prs);
         let open = links.iter().find(|pr| pr.state.is_open()).copied();
-        let closed = links.iter().find(|pr| !pr.state.is_open()).copied();
+        // A third-party pull request that merely says `Closes #N` does not count once it is closed.
+        let ghost_closed = links
+            .iter()
+            .find(|pr| !pr.state.is_open() && ghost_opened(pr, row, input.created_prs));
         if open.is_none() {
-            if let Some(pr) = closed {
+            if let Some(pr) = ghost_closed {
                 skipped.push(Skip::Closed {
                     number: row.number,
                     pr: pr.number,
@@ -153,7 +171,7 @@ pub fn poll(input: &PollIn<'_>) -> Poll {
             .iter()
             .find(|row_fail| row_fail.number == row.number)
         {
-            if !hold.transient {
+            if !failure_can_retry(hold) {
                 skipped.push(Skip::Failed {
                     number: row.number,
                     reason: hold.reason.clone(),
@@ -208,28 +226,6 @@ pub fn current_head(issue: &IssueRow, prs: &[PrLink]) -> String {
         .unwrap_or_default()
 }
 
-/// `502`, `503`, `504`, `429`, timeouts, and connection failures are retried.
-pub fn is_transient(reason: &str) -> bool {
-    let text = reason.to_ascii_lowercase();
-    [
-        "502",
-        "503",
-        "504",
-        "429",
-        "timeout",
-        "timed out",
-        "rate limit",
-        "connection",
-        "temporarily",
-        "temporary",
-        "bad gateway",
-        "service unavailable",
-        "gateway timeout",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
-}
-
 pub fn now_rfc3339() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -262,6 +258,13 @@ fn head_moved(hold: &AutoFailure, issue: &IssueRow, prs: &[PrLink]) -> bool {
     }
     let current = current_head(issue, prs);
     !current.is_empty() && current != hold.head
+}
+
+/// Ghost opened this pull request: the issue branch, or `gh pr create` during an agent turn.
+fn ghost_opened(pr: &PrLink, issue: &IssueRow, created_prs: &[u64]) -> bool {
+    let labels: Vec<&str> = issue.labels.iter().map(String::as_str).collect();
+    let branch = workdir::issue_branch(issue.number, &issue.title, &labels);
+    pr.head_ref == branch || created_prs.contains(&pr.number)
 }
 
 fn linked<'a>(issue: &IssueRow, prs: &'a [PrLink]) -> Vec<&'a PrLink> {
@@ -538,6 +541,7 @@ mod tests {
             prs,
             trust: CommentTrust::Collaborators,
             created: &[],
+            created_prs: &[],
             now: "2026-01-01T00:00:00Z",
             busy: &[],
         })
@@ -611,25 +615,63 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_pull_request_is_not_redone() {
-        let prs = vec![PrLink {
+    fn a_closed_pull_request_is_not_redone_only_when_ghost_opened_it() {
+        let third_party = vec![PrLink {
             number: 8,
             head_ref: "feature".into(),
             head_oid: "abc".into(),
             body: "Closes #9".into(),
+            closing: vec![9],
+            state: PrLife::Closed,
+        }];
+        let chosen = choose(&sample(), &[], &third_party);
+        assert_eq!(
+            chosen.action,
+            AutoAction::Run(9),
+            "a closed third-party pull request that says Closes #N is not ghost's"
+        );
+        assert!(chosen.skipped.is_empty());
+
+        let branch = workdir::issue_branch(9, "Oldest", &[]);
+        let ours = vec![PrLink {
+            number: 8,
+            head_ref: branch,
+            head_oid: "abc".into(),
+            body: String::new(),
             closing: vec![],
             state: PrLife::Closed,
         }];
-        let chosen = choose(&sample(), &[], &prs);
+        let chosen = choose(&sample(), &[], &ours);
         assert_eq!(chosen.action, AutoAction::Run(2));
         assert_eq!(chosen.skipped, vec![Skip::Closed { number: 9, pr: 8 }]);
         let merged = vec![PrLink {
             state: PrLife::Merged,
-            ..prs[0].clone()
+            ..ours[0].clone()
         }];
         let chosen = choose(&[issue(9, "2020-01-01T00:00:00Z", "Oldest")], &[], &merged);
         assert_eq!(chosen.action, AutoAction::Idle);
         assert_eq!(chosen.skipped, vec![Skip::Closed { number: 9, pr: 8 }]);
+
+        let agent_pr = vec![PrLink {
+            number: 15,
+            head_ref: "someone-elses-branch".into(),
+            head_oid: "abc".into(),
+            body: "Closes #9".into(),
+            closing: vec![9],
+            state: PrLife::Closed,
+        }];
+        let chosen = poll(&PollIn {
+            issues: &[issue(9, "2020-01-01T00:00:00Z", "Oldest")],
+            failed: &[],
+            prs: &agent_pr,
+            trust: CommentTrust::Collaborators,
+            created: &[],
+            created_prs: &[15],
+            now: "2026-01-01T00:00:00Z",
+            busy: &[],
+        });
+        assert_eq!(chosen.action, AutoAction::Idle);
+        assert_eq!(chosen.skipped, vec![Skip::Closed { number: 9, pr: 15 }]);
     }
 
     #[test]
@@ -659,6 +701,7 @@ mod tests {
             prs: &[],
             trust: CommentTrust::Collaborators,
             created: &[],
+            created_prs: &[],
             now: "2026-01-01T00:00:00Z",
             busy: &[],
         });
@@ -674,6 +717,7 @@ mod tests {
             prs: &[],
             trust: CommentTrust::Contributors,
             created: &[],
+            created_prs: &[],
             now: "2026-01-01T00:00:00Z",
             busy: &[],
         });
@@ -684,6 +728,7 @@ mod tests {
             prs: &[],
             trust: CommentTrust::All,
             created: &[],
+            created_prs: &[],
             now: "2026-01-01T00:00:00Z",
             busy: &[],
         });
@@ -702,6 +747,7 @@ mod tests {
             prs: &[],
             trust: CommentTrust::Collaborators,
             created: &[3],
+            created_prs: &[],
             now: "2026-02-02T00:00:00Z",
             busy: &[],
         });
@@ -734,6 +780,7 @@ mod tests {
             prs: &[open.clone()],
             trust: CommentTrust::Collaborators,
             created: &[],
+            created_prs: &[],
             now: "2026-01-15T00:00:00Z",
             busy: &[],
         });
@@ -745,6 +792,7 @@ mod tests {
             prs: &[open.clone()],
             trust: CommentTrust::Collaborators,
             created: &[],
+            created_prs: &[],
             now: "2026-02-01T00:00:00Z",
             busy: &[],
         });
@@ -757,6 +805,7 @@ mod tests {
             prs: &[moved],
             trust: CommentTrust::Collaborators,
             created: &[],
+            created_prs: &[],
             now: "2026-01-15T00:00:00Z",
             busy: &[],
         });
@@ -779,6 +828,7 @@ mod tests {
             prs: &[closed],
             trust: CommentTrust::Collaborators,
             created: &[],
+            created_prs: &[],
             now: "2026-03-01T00:00:00Z",
             busy: &[],
         });
@@ -794,6 +844,7 @@ mod tests {
             prs: &[],
             trust: CommentTrust::Collaborators,
             created: &[],
+            created_prs: &[],
             now: "2026-01-01T00:00:00Z",
             busy: &[9],
         });
@@ -859,8 +910,85 @@ mod tests {
     fn rfc3339_round_trips_known_days() {
         assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(format_rfc3339(1_609_459_200), "2021-01-01T00:00:00Z");
-        assert!(is_transient("gh issue list failed: HTTP 502"));
-        assert!(is_transient("connection reset"));
-        assert!(!is_transient("no pull request appeared"));
+    }
+
+    #[test]
+    fn issue_text_is_not_transient_and_the_cap_includes_a_moved_head() {
+        let reason = "the agent finished but no pull request for issue #502 was found. Expected branch fix/8-fix-timeout. connection rate limit";
+        let plain = anyhow::anyhow!(reason);
+        assert!(
+            !crate::github::failure_is_transient(&plain),
+            "a reason string is not classified, even when it contains timeout, connection, rate limit, and #502"
+        );
+        let from_stdout = crate::github::gh_exit_failure("gh issue view", "", reason);
+        assert!(!from_stdout.is_transient());
+        assert!(from_stdout.to_string().contains("timeout"));
+        assert!(from_stdout.to_string().contains("502"));
+        assert!(from_stdout.to_string().contains("connection"));
+        assert!(from_stdout.to_string().contains("rate limit"));
+        let from_stderr = crate::github::gh_exit_failure("gh issue list", "HTTP 502", reason);
+        assert!(from_stderr.is_transient());
+        assert!(crate::github::failure_is_transient(&anyhow::Error::from(
+            from_stderr
+        )));
+        assert!(crate::github::stderr_is_transient(
+            "connection reset by peer"
+        ));
+        assert!(!crate::github::stderr_is_transient(""));
+
+        assert!(keep_transient(true, 4));
+        assert!(!keep_transient(true, 5));
+        assert!(!keep_transient(false, 1));
+
+        let row = issue(9, "2020-01-01T00:00:00Z", "Oldest");
+        let branch = workdir::issue_branch(9, "Oldest", &[]);
+        let mut moved = open_pr(40, &branch, "", vec![]);
+        moved.head_oid = "bbb".into();
+        let capped = AutoFailure {
+            number: 9,
+            reason: reason.into(),
+            transient: true,
+            retry_at: "2099-01-01T00:00:00Z".into(),
+            head: "aaa".into(),
+            attempts: MAX_TRANSIENT_ATTEMPTS,
+        };
+        let chosen = poll(&PollIn {
+            issues: &[row.clone()],
+            failed: &[capped],
+            prs: &[moved.clone()],
+            trust: CommentTrust::Collaborators,
+            created: &[],
+            created_prs: &[],
+            now: "2026-01-15T00:00:00Z",
+            busy: &[],
+        });
+        assert_ne!(
+            chosen.action,
+            AutoAction::Run(9),
+            "a moved head does not retry once the attempt cap is reached"
+        );
+        assert!(matches!(
+            chosen.skipped.first(),
+            Some(Skip::Failed { number: 9, .. })
+        ));
+        let under = AutoFailure {
+            number: 9,
+            reason: "HTTP 502".into(),
+            transient: true,
+            retry_at: "2099-01-01T00:00:00Z".into(),
+            head: "aaa".into(),
+            attempts: MAX_TRANSIENT_ATTEMPTS - 1,
+        };
+        let still = poll(&PollIn {
+            issues: &[row],
+            failed: &[under],
+            prs: &[moved],
+            trust: CommentTrust::Collaborators,
+            created: &[],
+            created_prs: &[],
+            now: "2026-01-15T00:00:00Z",
+            busy: &[],
+        });
+        assert_eq!(still.action, AutoAction::Run(9));
     }
 }

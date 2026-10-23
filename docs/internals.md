@@ -6,7 +6,9 @@ Behavior that the user guide does not spell out. ghost talks to GitHub only thro
 
 Each check logs `reviews N, inline N, comments N` from `gh api`: review submissions (`repos/OWNER/REPO/pulls/N/reviews`), inline comments (`pulls/N/comments`, paged), and issue comments. A code-mode check also logs `filtered 0`, or `filtered N (untrusted author)` when `--trust-comments` drops authors.
 
-`--trust-comments` defaults to `all`: humans, Copilot, other bots, and people outside the repository. Copilot review bodies (`copilot-pull-request-reviewer[bot]`) and inline comments (`Copilot`, or that same bot login) stay. `collaborators` and `contributors` narrow the set. The pull request author and the repository owner always pass. The prompt tells the agent to judge each comment, fix and push when it agrees, and reply on the thread when it does not.
+`--trust-comments` defaults to `all`: humans, Copilot, other bots, and people outside the repository. That default applies to review comments in `--code` and while implementing an issue. Copilot review bodies (`copilot-pull-request-reviewer[bot]`) and inline comments (`Copilot`, or that same bot login) stay. `collaborators` and `contributors` narrow the set. The pull request author and the repository owner always pass. The prompt tells the agent to judge each comment, fix and push when it agrees, and reply on the thread when it does not.
+
+`--trust-issues` is separate and defaults to `collaborators` (OWNER, MEMBER, COLLABORATOR). It only chooses which issue authors `--auto` runs. `--trust-comments all` does not widen that set.
 
 On launch, review, code, and issue mode each start the agent once, even when saved state says nothing is new. That launch starts a new session. Later checks call the agent only when something changed: a new commit in review, or new feedback or a new CI failure signature in code. A failed turn does not mark that commit or those comments done. A failed resume starts a fresh session with the same context. A resume that dies because the session is missing (`no rollout found`) or because the arguments were rejected does not count as a turn and does not wait. A prompt write that gets `EPIPE` fails that turn and does not kill ghost. Real failures back off from 20 seconds, doubling up to 10 minutes, and ghost exits 1 after five in a row.
 
@@ -43,6 +45,10 @@ ghost offers merge only after the same commit has been mergeable on two checks a
 When stdin or stdout is not a terminal, ghost does not open `/dev/tty`. Opening that device with no controlling terminal fails with ENXIO (os error 6). Confirms then take the non-interactive answers: review exits, an issue does not continue into code without `-y`, and a merge happens only with `--merge-yes`.
 
 The agent's `PATH` starts with a `gh` wrapper that refuses `gh pr merge`, `gh repo delete`, `gh api` DELETE, and merge endpoints such as `mergePullRequest`. The `git` wrapper skips global options (`-C`, `-c`, `--git-dir`, `--work-tree`, `--namespace`, `--no-pager`, `--bare`, and the rest) and then sends `git push` to the planned remote and refspec, or refuses it in review and when a fork is not pushable. An alias or an absolute `/usr/bin/gh` or `/usr/bin/git` still runs. Neither wrapper is a security boundary.
+
+A successful `gh issue create` for this repository appends the issue number to `OWNER__REPO/created-issues`, and `--auto` skips that number. `-R` and `--repo` must be omitted or name this repository; another repository is not recorded. `gh issue create --web` often prints no issue number, and `gh api` (including a GraphQL `createIssue`) is not watched, so those issues are not skipped. A successful `gh pr create` for this repository is recorded in `OWNER__REPO/created-prs`. Together with the issue branch name, that is how a closed pull request counts as ghost's.
+
+A GitHub failure is transient only when `gh` says so on stderr (or the command times out). The recorded reason is not scanned, so a branch such as `fix/8-fix-timeout` or issue `#502` does not retry by itself. A transient failure is retried after a wait, or when the pull request head changes, and becomes permanent after five attempts. Both paths share that cap. The head compared on the next check is the one seen before the attempt, so a push during the attempt looks like a new head and still counts.
 
 ## Agent commands
 

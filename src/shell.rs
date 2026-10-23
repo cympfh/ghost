@@ -14,6 +14,26 @@ pub struct CmdOut {
     pub stderr: String,
 }
 
+/// The command exceeded its deadline. Transience is this type, not a scan of stderr.
+#[derive(Debug)]
+pub struct CommandTimeout {
+    secs: u64,
+    stderr: String,
+}
+
+impl std::fmt::Display for CommandTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "timed out after {}s\n{}", self.secs, self.stderr)
+    }
+}
+
+impl std::error::Error for CommandTimeout {}
+
+pub fn is_timeout(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<CommandTimeout>().is_some())
+}
+
 pub fn which(bin: &str, path_env: &str) -> Option<PathBuf> {
     if bin.contains('/') {
         let path = PathBuf::from(bin);
@@ -350,7 +370,11 @@ fn capture_once(
             stdout,
             stderr,
         }),
-        None => anyhow::bail!("timed out after {}s\n{stderr}", timeout.as_secs()),
+        None => Err(CommandTimeout {
+            secs: timeout.as_secs(),
+            stderr,
+        }
+        .into()),
     }
 }
 

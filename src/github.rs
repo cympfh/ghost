@@ -199,12 +199,13 @@ impl Gh {
         Ok(rows)
     }
 
-    /// Pull requests that may already cover an issue, including closed and merged ones.
+    /// Open pull requests, plus recent closed and merged ones, for `--auto`.
+    /// Fewer pages than the issue list: only the states and fields that selection uses.
     pub fn auto_pr_links(&self) -> Result<Vec<crate::auto::PrLink>> {
         let (owner, name) = split_slug(&self.slug)?;
         let mut rows = Vec::new();
         let mut cursor: Option<String> = None;
-        for _ in 0..AUTO_PAGE_CAP {
+        for _ in 0..AUTO_PR_PAGE_CAP {
             let out = self.call(graphql_args(PR_QUERY, owner, name, cursor.as_deref()))?;
             ensure_ok("gh pr list", &out)?;
             let page = crate::auto::parse_pr_page(&out.stdout).map_err(|e| anyhow!(e))?;
@@ -356,7 +357,17 @@ impl Gh {
     }
 
     fn call(&self, args: Vec<String>) -> Result<CmdOut> {
-        shell::gh(&args, None, Some(&self.slug))
+        match shell::gh(&args, None, Some(&self.slug)) {
+            Ok(out) => Ok(out),
+            Err(err) => {
+                let transient = shell::is_timeout(&err);
+                Err(GhFailure {
+                    message: format!("{err:#}"),
+                    transient,
+                }
+                .into())
+            }
+        }
     }
 
     /// Issue comments, review submissions, and inline review comments.
@@ -476,10 +487,12 @@ pub fn merge_args(slug: &str, number: u64, method: Option<&str>, head_sha: &str)
 }
 
 const AUTO_PAGE_CAP: usize = 20;
+/// Three short pages. Selection needs open links and ghost's own closed or merged heads, not every historical body.
+const AUTO_PR_PAGE_CAP: usize = 3;
 
 const ISSUE_QUERY: &str = "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(states:OPEN,first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){pageInfo{hasNextPage endCursor}nodes{number title createdAt authorAssociation author{__typename login}labels(first:20){nodes{name}}}}}}";
 
-const PR_QUERY: &str = "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(states:[OPEN,CLOSED,MERGED],first:100,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage endCursor}nodes{number state headRefName headRefOid body closingIssuesReferences(first:50){nodes{number}}}}}}";
+const PR_QUERY: &str = "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(states:[OPEN,CLOSED,MERGED],first:20,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage endCursor}nodes{number state headRefName headRefOid closingIssuesReferences(first:20){nodes{number}}}}}}";
 
 fn split_slug(slug: &str) -> Result<(&str, &str)> {
     let (owner, name) = slug
@@ -509,16 +522,77 @@ fn graphql_args(query: &str, owner: &str, name: &str, cursor: Option<&str>) -> V
     args
 }
 
+/// A failed `gh` call. `transient` is decided here, from stderr or a timeout, and is not recomputed from the message.
+#[derive(Debug)]
+pub struct GhFailure {
+    message: String,
+    transient: bool,
+}
+
+impl GhFailure {
+    pub fn is_transient(&self) -> bool {
+        self.transient
+    }
+}
+
+impl std::fmt::Display for GhFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GhFailure {}
+
+/// True only when a `GhFailure` in the chain was marked transient at the call.
+/// The display text is not scanned: it often contains the branch name and issue number.
+pub fn failure_is_transient(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<GhFailure>()
+            .is_some_and(|fail| fail.transient)
+    })
+}
+
+/// Needles that mean a blip. Applied to `gh` stderr only, never to a title or a recorded reason.
+pub fn stderr_is_transient(stderr: &str) -> bool {
+    let text = stderr.to_ascii_lowercase();
+    [
+        "502",
+        "503",
+        "504",
+        "429",
+        "timeout",
+        "timed out",
+        "rate limit",
+        "connection",
+        "temporarily",
+        "temporary",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+/// Non-zero `gh`. The message may quote stdout when stderr is empty, but transience looks at stderr alone.
+pub fn gh_exit_failure(what: &str, stderr: &str, stdout: &str) -> GhFailure {
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    GhFailure {
+        message: format!("{what} failed: {detail}"),
+        transient: stderr_is_transient(stderr),
+    }
+}
+
 fn ensure_ok(what: &str, out: &CmdOut) -> Result<()> {
     if out.code == 0 {
         Ok(())
     } else {
-        let detail = if out.stderr.trim().is_empty() {
-            out.stdout.trim()
-        } else {
-            out.stderr.trim()
-        };
-        Err(anyhow!("{what} failed: {detail}"))
+        Err(gh_exit_failure(what, &out.stderr, &out.stdout).into())
     }
 }
 

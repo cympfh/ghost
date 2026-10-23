@@ -68,7 +68,10 @@ pub struct RunSpec {
     pub max_turns: u32,
     pub lang: Lang,
     pub ssh_key: Option<String>,
+    /// Who may wake `--code`. Default `all`, including issue and `--code` review comments.
     pub trust: CommentTrust,
+    /// Which issue authors `--auto` may run. Default collaborators.
+    pub trust_issues: CommentTrust,
 }
 
 pub fn run(spec: RunSpec) -> Result<i32> {
@@ -499,6 +502,8 @@ fn babysit(
     let state_root = state::state_dir();
     let mut agent = AgentSession::new(kind, workdir.clone(), &home, slot_name);
     agent.set_created_issues(state::created_issues_path(&state_root, &owner, &repo));
+    agent.set_created_prs(state::created_prs_path(&state_root, &owner, &repo));
+    agent.set_repo_slug(slug.clone());
     let mut ctx = Ctx {
         gh: Gh::new(slug.clone()),
         slug,
@@ -1233,6 +1238,8 @@ impl Ctx {
             }
             Err(err) => {
                 let detail = format!("{err:#}");
+                let transient =
+                    crate::github::failure_is_transient(&err) && !merge_method_rejected(&detail);
                 let flag = method.flag();
                 let message = if merge_method_rejected(&detail) {
                     self.say(
@@ -1250,7 +1257,7 @@ impl Ctx {
                     )
                 };
                 if self.spec.merge_yes {
-                    self.stop(1, message);
+                    self.stop_with(1, message, transient);
                     return Ok(true);
                 }
                 self.log_kind(LogKind::Error, message);
@@ -1735,16 +1742,20 @@ impl Ctx {
             };
             let created_path =
                 state::created_issues_path(&self.state_root, &self.owner, &self.repo);
+            let created_prs_path =
+                state::created_prs_path(&self.state_root, &self.owner, &self.repo);
             let mut busy = Vec::new();
             loop {
                 let now = crate::auto::now_rfc3339();
                 let created = state::read_created_issues(&created_path);
+                let created_prs = state::read_created_prs(&created_prs_path);
                 let choice = crate::auto::poll(&crate::auto::PollIn {
                     issues: &issues,
                     failed: &stored.failed,
                     prs: &prs,
-                    trust: self.spec.trust,
+                    trust: self.spec.trust_issues,
                     created: &created,
+                    created_prs: &created_prs,
                     now: &now,
                     busy: &busy,
                 });
@@ -1838,16 +1849,22 @@ impl Ctx {
             return Ok(true);
         }
         if let Err(err) = result {
+            let transient = crate::github::failure_is_transient(&err);
             let reason = format!("{err:#}");
             self.log_kind(LogKind::Error, reason.clone());
-            if let Err(save_err) = self.record_auto_failure(number, &reason, path, head) {
+            if let Err(save_err) = self.record_auto_failure(number, &reason, path, head, transient)
+            {
                 self.log_kind(LogKind::Error, format!("auto state: {save_err:#}"));
             }
         } else if let Some(release) = release {
             if release.code != 0 {
-                if let Err(save_err) =
-                    self.record_auto_failure(number, &release.message, path, head)
-                {
+                if let Err(save_err) = self.record_auto_failure(
+                    number,
+                    &release.message,
+                    path,
+                    head,
+                    release.transient,
+                ) {
                     self.log_kind(LogKind::Error, format!("auto state: {save_err:#}"));
                 }
             }
@@ -1892,10 +1909,10 @@ impl Ctx {
                 association,
             } => self.say(
                 &format!(
-                    "issue #{number} の投稿者 {author}（{association}）は --trust-comments の対象外なので飛ばします。"
+                    "issue #{number} の投稿者 {author}（{association}）は --trust-issues の対象外なので飛ばします。"
                 ),
                 &format!(
-                    "skipping issue #{number}; {author} ({association}) is outside --trust-comments."
+                    "skipping issue #{number}; {author} ({association}) is outside --trust-issues."
                 ),
             ),
             crate::auto::Skip::AgentCreated { number } => self.say(
@@ -1925,14 +1942,15 @@ impl Ctx {
         reason: &str,
         path: &std::path::Path,
         head: &str,
+        transient: bool,
     ) -> Result<()> {
         let loaded = state::AutoState::load(path)?;
         if let Some(warning) = loaded.warning {
             self.log_kind(LogKind::Error, warning);
         }
         let mut stored = loaded.state;
-        let transient = crate::auto::is_transient(reason);
         let attempts = stored.attempts(number).saturating_add(1);
+        let transient = crate::auto::keep_transient(transient, attempts);
         let retry_at = if transient {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1949,10 +1967,21 @@ impl Ctx {
         if transient {
             self.log(self.say(
                 &format!(
-                    "issue #{number} は一時的な失敗です。待つか、プルリクエストの先端が変わったらやり直します。"
+                    "issue #{number} は一時的な失敗です（{attempts}/{}）。待つか、プルリクエストの先端が変わったらやり直します。",
+                    crate::auto::MAX_TRANSIENT_ATTEMPTS
                 ),
                 &format!(
-                    "issue #{number} failed temporarily. Retrying after a wait, or when the pull request head changes."
+                    "issue #{number} failed temporarily ({attempts}/{}). Retrying after a wait, or when the pull request head changes.",
+                    crate::auto::MAX_TRANSIENT_ATTEMPTS
+                ),
+            ));
+        } else if attempts >= crate::auto::MAX_TRANSIENT_ATTEMPTS {
+            self.log(self.say(
+                &format!(
+                    "issue #{number} は {attempts} 回失敗したので、やり直さず記録します。"
+                ),
+                &format!(
+                    "issue #{number} failed {attempts} times, so it stays recorded and is not retried."
                 ),
             ));
         } else {
@@ -2567,9 +2596,11 @@ impl Ctx {
                 Ok(Some(number)) => return Ok(Some(number)),
                 Ok(None) => {}
                 Err(err) if self.handing_off() => {
-                    self.stop(
+                    let transient = crate::github::failure_is_transient(&err);
+                    self.stop_with(
                         1,
                         format!("could not look up a pull request for issue #{issue}: {err:#}"),
+                        transient,
                     );
                     return Ok(None);
                 }
@@ -2625,11 +2656,19 @@ impl Ctx {
     }
 
     fn stop(&mut self, code: i32, message: String) {
+        self.stop_with(code, message, false);
+    }
+
+    fn stop_with(&mut self, code: i32, message: String, transient: bool) {
         if self.handing_off() && message != "quit" {
             if !message.is_empty() {
                 self.log(message.clone());
             }
-            self.auto_release = Some(AutoRelease { code, message });
+            self.auto_release = Some(AutoRelease {
+                code,
+                message,
+                transient,
+            });
             self.agent.stop();
             self.quit = true;
             return;
@@ -2974,6 +3013,8 @@ fn label_refs(labels: &[String]) -> Vec<&str> {
 struct AutoRelease {
     code: i32,
     message: String,
+    /// Set at the `gh` failure. A reason that merely mentions a branch or an issue number stays false.
+    transient: bool,
 }
 
 enum AutoFetch {
@@ -3160,9 +3201,15 @@ mod tests {
         }
     }
 
-    fn merge_ctx(merge_yes: bool) -> (super::Ctx, std::sync::mpsc::Receiver<crate::tui::UiEvent>) {
+    fn merge_ctx(
+        merge_yes: bool,
+    ) -> (
+        super::Ctx,
+        std::sync::mpsc::Receiver<crate::tui::UiEvent>,
+        std::sync::mpsc::Sender<crate::tui::UiCmd>,
+    ) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let home = std::env::temp_dir();
         let target = crate::target::parse_target("github.com/acme/app/pr/1").unwrap();
         let ctx = super::Ctx {
@@ -3179,6 +3226,7 @@ mod tests {
                 lang: Lang::Ja,
                 ssh_key: None,
                 trust: crate::watch::CommentTrust::All,
+                trust_issues: crate::watch::CommentTrust::Collaborators,
             },
             tx,
             rx: cmd_rx,
@@ -3219,7 +3267,7 @@ mod tests {
             auto_issue: None,
             auto_release: None,
         };
-        (ctx, rx)
+        (ctx, rx, cmd_tx)
     }
 
     fn write_exe(path: &std::path::Path, body: &str) {
@@ -3235,7 +3283,7 @@ mod tests {
 
     #[test]
     fn auto_moves_on_without_leaving_the_process() {
-        let (mut ctx, rx) = merge_ctx(false);
+        let (mut ctx, rx, _cmd) = merge_ctx(false);
         ctx.spec.mode = super::RunMode::Auto;
         ctx.auto_issue = Some(4);
         ctx.stop(0, "Exiting without merging PR #9.".into());
@@ -3311,7 +3359,7 @@ mod tests {
         };
         std::fs::write(&view, ready("def")).unwrap();
         let _ = std::fs::remove_file(&marker);
-        let (mut ctx, rx) = merge_ctx(true);
+        let (mut ctx, rx, _cmd) = merge_ctx(true);
         let merged = ctx
             .merge_now(1, "abc", crate::tui::MergeStyle::Squash)
             .unwrap();
@@ -3323,7 +3371,7 @@ mod tests {
         assert!(rx.try_recv().is_err() || !marker.exists());
 
         std::fs::write(&view, ready("abc")).unwrap();
-        let (mut ctx, rx) = merge_ctx(true);
+        let (mut ctx, rx, _cmd) = merge_ctx(true);
         let merged = ctx
             .merge_now(1, "abc", crate::tui::MergeStyle::Squash)
             .unwrap();
@@ -3343,7 +3391,7 @@ mod tests {
             "GHOST_TEST_MERGE_ERR",
             "GraphQL: Squash merges are not allowed on this repository",
         );
-        let (mut ctx, rx) = merge_ctx(true);
+        let (mut ctx, rx, _cmd) = merge_ctx(true);
         let merged = ctx
             .merge_now(1, "abc", crate::tui::MergeStyle::Squash)
             .unwrap();
@@ -3387,7 +3435,7 @@ mod tests {
         }
         std::env::set_var("PATH", &path);
 
-        let (mut ctx, rx) = merge_ctx(false);
+        let (mut ctx, rx, _cmd) = merge_ctx(false);
         ctx.spec.mode = super::RunMode::Auto;
         let state = dir.join("auto.json");
         let fetched = ctx.fetch_auto(&state);
@@ -3429,7 +3477,7 @@ mod tests {
         std::fs::create_dir_all(&main).unwrap();
         let slot = crate::workdir::slot_path(&home, "acme", "app", "issue-9");
         let held = crate::workdir::lock_slot(&slot).unwrap();
-        let (mut ctx, rx) = merge_ctx(false);
+        let (mut ctx, rx, _cmd) = merge_ctx(false);
         ctx.spec.mode = super::RunMode::Auto;
         ctx.owner = "acme".into();
         ctx.repo = "app".into();
@@ -3517,6 +3565,136 @@ mod tests {
             rows.last().map(|row| row.association.as_str()),
             Some("COLLABORATOR")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `auto_loop` with a stub `gh` and a stub agent. Issue #502's title mentions
+    /// timeout, connection, and rate limit; the missing pull request is not a GitHub blip.
+    #[test]
+    fn auto_loop_with_stub_gh_and_agent_does_not_retry_a_titled_timeout() {
+        let _lock = path_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-auto-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = dir.join("ghost-home");
+        let main = home.join("work").join("acme__app");
+        std::fs::create_dir_all(&main).unwrap();
+        let state_root = dir.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let gh = dir.join("gh");
+        write_exe(
+            &gh,
+            r#"#!/bin/sh
+case " $* " in
+  *" graphql "*)
+    case " $* " in
+      *pullRequests*)
+        printf '%s\n' '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}'
+        ;;
+      *)
+        printf '%s\n' '{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"number":502,"title":"fix timeout connection rate limit","createdAt":"2020-01-01T00:00:00Z","authorAssociation":"OWNER","author":{"__typename":"User","login":"ada"},"labels":{"nodes":[]}}]}}}}'
+        ;;
+    esac
+    exit 0
+    ;;
+  *" repo view "*)
+    printf '%s\n' '{"defaultBranchRef":{"name":"main"}}'
+    exit 0
+    ;;
+  *" closedByPullRequestsReferences "*)
+    printf '%s\n' '{}'
+    exit 0
+    ;;
+  *" issue view "*)
+    printf '%s\n' '{"number":502,"title":"fix timeout connection rate limit","body":"connection rate limit","state":"OPEN","labels":[]}'
+    exit 0
+    ;;
+esac
+printf '%s\n' '[]'
+exit 0
+"#,
+        );
+        let agent = dir.join("agent");
+        write_exe(&agent, "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+        let old_path = std::env::var("PATH").ok();
+        let _path = RestoreVar("PATH", old_path.clone());
+        let mut path = dir.display().to_string();
+        if let Some(old) = &old_path {
+            path.push(':');
+            path.push_str(old);
+        }
+        std::env::set_var("PATH", &path);
+
+        let (mut ctx, rx, cmd_tx) = merge_ctx(false);
+        ctx.spec.mode = super::RunMode::Auto;
+        ctx.spec.interval = Duration::from_secs(30);
+        ctx.spec.lang = Lang::En;
+        ctx.spec.yes = false;
+        ctx.spec.trust = crate::watch::CommentTrust::All;
+        ctx.spec.trust_issues = crate::watch::CommentTrust::Collaborators;
+        ctx.owner = "acme".into();
+        ctx.repo = "app".into();
+        ctx.slug = "acme/app".into();
+        ctx.gh = crate::github::Gh::new("acme/app");
+        ctx.main_clone = main.clone();
+        ctx.workdir = main.clone();
+        ctx.slot_dir = main;
+        ctx.state_root = state_root.clone();
+        ctx.agent.set_stub(agent);
+        let state_file = state_root.join("acme__app").join("auto.json");
+        let watch = state_file.clone();
+        let quit_tx = cmd_tx.clone();
+        let watcher = std::thread::spawn(move || {
+            for _ in 0..400 {
+                if let Ok(text) = std::fs::read_to_string(&watch) {
+                    if text.contains("502") {
+                        let _ = quit_tx.send(crate::tui::UiCmd::Quit);
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = quit_tx.send(crate::tui::UiCmd::Quit);
+        });
+        ctx.auto_loop().unwrap();
+        watcher.join().unwrap();
+        let raw = std::fs::read_to_string(&state_file).expect("auto.json records the miss");
+        let stored: crate::state::AutoState = serde_json::from_str(&raw).unwrap();
+        let row = stored
+            .failed
+            .iter()
+            .find(|row| row.number == 502)
+            .expect("issue 502 is recorded");
+        assert!(
+            !row.transient,
+            "title words and #502 must not be a transient retry: {raw}"
+        );
+        assert!(row.reason.contains("timeout"), "{raw}");
+        assert!(row.reason.contains("502"), "{raw}");
+        assert!(row.reason.contains("connection"), "{raw}");
+        assert!(
+            row.reason.contains("rate-limit") || row.reason.contains("rate limit"),
+            "{raw}"
+        );
+        let mut saw_fatal = false;
+        let mut saw_temporary = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                crate::tui::UiEvent::Fatal(_) => saw_fatal = true,
+                crate::tui::UiEvent::Exit { code, .. } => assert_eq!(code, 0),
+                crate::tui::UiEvent::Log(line) if line.text.contains("temporarily") => {
+                    saw_temporary = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(!saw_fatal, "--auto does not exit on this miss");
+        assert!(!saw_temporary, "the miss is not retried as a GitHub blip");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

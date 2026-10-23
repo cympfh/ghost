@@ -275,6 +275,15 @@ pub fn created_issues_path(root: &Path, owner: &str, repo: &str) -> PathBuf {
     root.join(format!("{owner}__{repo}")).join("created-issues")
 }
 
+/// Pull requests `gh pr create` opened during an agent turn.
+pub fn created_prs_path(root: &Path, owner: &str, repo: &str) -> PathBuf {
+    root.join(format!("{owner}__{repo}")).join("created-prs")
+}
+
+pub fn read_created_prs(path: &Path) -> Vec<u64> {
+    read_created_issues(path)
+}
+
 pub fn read_created_issues(path: &Path) -> Vec<u64> {
     let Ok(raw) = fs::read_to_string(path) else {
         return Vec::new();

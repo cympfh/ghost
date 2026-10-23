@@ -316,13 +316,20 @@ pub fn retire_broken_worktrees(main: &Path) -> Vec<String> {
         if !path.is_dir() {
             continue;
         }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if file_name.contains(".broken-") {
+            continue;
+        }
+        // Another ghost holds this slot. Do not repair or rename it out from under them.
+        let Ok(_held) = lock_slot(&path) else {
+            continue;
+        };
         let path_s = path.display().to_string();
         let _ = git(main, &["worktree".into(), "repair".into(), path_s.clone()]);
         let _ = git(&path, &["worktree".into(), "repair".into()]);
         if git_ok(&path) {
             continue;
         }
-        let file_name = entry.file_name().to_string_lossy().to_string();
         let aside = wt_root.join(format!("{file_name}.broken-{stamp}"));
         if fs::rename(&path, &aside).is_ok() {
             notes.push(format!(
@@ -1585,6 +1592,40 @@ mod tests {
             "the old checkout is kept aside"
         );
         assert!(git_ok(&slot), "repaired slot stays usable");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_locked_broken_slot_is_left_in_place() {
+        let root = std::env::temp_dir().join(format!(
+            "ghost-repair-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let main = root.join("acme__app");
+        let wt_root = root.join("acme__app.wt");
+        let orphan = wt_root.join("pr-9");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join(".git"), "gitdir: /no/such/gitdir\n").unwrap();
+        let held = lock_slot(&orphan).unwrap();
+        let notes = retire_broken_worktrees(&main);
+        assert!(
+            notes.iter().all(|note| !note.contains("pr-9")),
+            "a held lock is not moved: {notes:?}"
+        );
+        assert!(orphan.exists(), "the locked slot stays where it is");
+        assert!(orphan.join("leftover").exists() || orphan.join(".git").exists());
+        drop(held);
+        let notes = retire_broken_worktrees(&main);
+        assert!(
+            notes.iter().any(|note| note.contains("pr-9")),
+            "once the lock is gone the broken slot can be moved: {notes:?}"
+        );
+        assert!(!orphan.exists());
         let _ = fs::remove_dir_all(&root);
     }
 
