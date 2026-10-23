@@ -53,12 +53,12 @@ impl GhTarget {
                 owner,
                 repo,
                 number,
-            } => format!("github.com/{owner}/{repo}/pr/{number}"),
+            } => format!("github.com/{owner}/{repo}/pull/{number}"),
             Self::Issue {
                 owner,
                 repo,
                 number,
-            } => format!("github.com/{owner}/{repo}/issue/{number}"),
+            } => format!("github.com/{owner}/{repo}/issues/{number}"),
             Self::Issues { owner, repo } => format!("github.com/{owner}/{repo}/issues"),
         }
     }
@@ -90,7 +90,7 @@ pub fn parse_target(input: &str) -> Result<GhTarget, String> {
         (parts[0], strip_git(parts[1]), &parts[2..])
     } else {
         return Err(format!(
-                "not a github.com URL: `{input}` (expected github.com/OWNER/REPO[/pr/N|/issue/N|/issues])"
+                "not a github.com URL: `{input}` (expected github.com/OWNER/REPO[/pull/N|/issues/N|/issues])"
             ));
     };
 
@@ -101,20 +101,51 @@ pub fn parse_target(input: &str) -> Result<GhTarget, String> {
 
     match extra {
         [] => Ok(GhTarget::Repo { owner, repo }),
-        [kind, n] if matches!(*kind, "pr" | "pull" | "pulls") => Ok(GhTarget::Pull {
+        ["pull", n] => Ok(GhTarget::Pull {
             owner,
             repo,
             number: parse_number(n)?,
         }),
-        [kind, n] if matches!(*kind, "issue" | "issues") => Ok(GhTarget::Issue {
+        ["issues", n] => Ok(GhTarget::Issue {
             owner,
             repo,
             number: parse_number(n)?,
         }),
-        [kind] if matches!(*kind, "issue" | "issues") => Ok(GhTarget::Issues { owner, repo }),
+        ["issues"] => Ok(GhTarget::Issues { owner, repo }),
+        ["pr", rest @ ..] => Err(suggest_pull("pr", &owner, &repo, rest)),
+        ["pulls", rest @ ..] => Err(suggest_pull("pulls", &owner, &repo, rest)),
+        ["issue", rest @ ..] => Err(suggest_issues(&owner, &repo, rest)),
         _ => Err(format!(
-            "unsupported GitHub URL `{input}` (use /pr/N, /pull/N, /issue/N, /issues, or the repo root)"
+            "unsupported GitHub URL `{input}` (use github.com/OWNER/REPO, /pull/N, /issues/N, or /issues)"
         )),
+    }
+}
+
+/// `/pr/N` and `/pulls/N` are not the form ghost accepts. Point at `/pull/N`.
+fn suggest_pull(rejected: &str, owner: &str, repo: &str, rest: &[&str]) -> String {
+    let number = rest.first().copied().unwrap_or("N");
+    let shown = if rest.len() == 1 && number.chars().all(|c| c.is_ascii_digit()) && number != "0" {
+        number
+    } else {
+        "N"
+    };
+    format!(
+        "`/{rejected}/N` is not a GitHub URL. Use /pull/{shown}: github.com/{owner}/{repo}/pull/{shown}"
+    )
+}
+
+/// `/issue` and `/issue/N` are not the form ghost accepts. Point at `/issues`.
+fn suggest_issues(owner: &str, repo: &str, rest: &[&str]) -> String {
+    match rest {
+        [] => format!(
+            "`/issue` is not a GitHub URL. Use /issues: github.com/{owner}/{repo}/issues"
+        ),
+        [n] if n.chars().all(|c| c.is_ascii_digit()) && *n != "0" => format!(
+            "`/issue/{n}` is not a GitHub URL. Use /issues/{n}: github.com/{owner}/{repo}/issues/{n}"
+        ),
+        _ => format!(
+            "`/issue/N` is not a GitHub URL. Use /issues/N: github.com/{owner}/{repo}/issues/N"
+        ),
     }
 }
 
@@ -163,24 +194,18 @@ mod tests {
     #[test]
     fn parses_pr_issue_and_repo() {
         assert_eq!(
-            parse_target("github.com/cympfh/xxx/pr/3").unwrap(),
-            pull("cympfh", "xxx", 3)
-        );
-        assert_eq!(
             parse_target("https://github.com/cympfh/xxx/pull/3").unwrap(),
             pull("cympfh", "xxx", 3)
         );
         assert_eq!(
-            parse_target("http://www.github.com/cympfh/xxx/pulls/3/").unwrap(),
+            parse_target("http://www.github.com/cympfh/xxx/pull/3/").unwrap(),
             pull("cympfh", "xxx", 3)
         );
         assert_eq!(
-            parse_target("github.com/cympfh/xxx/issue/12").unwrap(),
-            GhTarget::Issue {
-                owner: "cympfh".into(),
-                repo: "xxx".into(),
-                number: 12,
-            }
+            parse_target("https://github.com/cympfh/xxx/pull/3")
+                .unwrap()
+                .display_url(),
+            "github.com/cympfh/xxx/pull/3"
         );
         assert_eq!(
             parse_target("https://github.com/cympfh/xxx/issues/12?tab=1").unwrap(),
@@ -189,6 +214,12 @@ mod tests {
                 repo: "xxx".into(),
                 number: 12,
             }
+        );
+        assert_eq!(
+            parse_target("github.com/cympfh/xxx/issues/12")
+                .unwrap()
+                .display_url(),
+            "github.com/cympfh/xxx/issues/12"
         );
         assert_eq!(
             parse_target("github.com/cympfh/xxx").unwrap(),
@@ -205,7 +236,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_target("cympfh/xxx/pr/9").unwrap(),
+            parse_target("cympfh/xxx/pull/9").unwrap(),
             pull("cympfh", "xxx", 9)
         );
         assert_eq!(
@@ -216,7 +247,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_target("https://github.com/cympfh/xxx/issue/").unwrap(),
+            parse_target("https://github.com/cympfh/xxx/issues/").unwrap(),
             GhTarget::Issues {
                 owner: "cympfh".into(),
                 repo: "xxx".into(),
@@ -235,9 +266,28 @@ mod tests {
         assert!(parse_target("").is_err());
         assert!(parse_target("github.com/onlyowner").is_err());
         assert!(parse_target("https://gitlab.com/a/b").is_err());
-        assert!(parse_target("github.com/a/b/pr/x").is_err());
-        assert!(parse_target("github.com/a/b/pr/0").is_err());
-        assert!(parse_target("github.com/a/b/pr/3/files").is_err());
+        assert!(parse_target("github.com/a/b/pull/x").is_err());
+        assert!(parse_target("github.com/a/b/pull/0").is_err());
+        assert!(parse_target("github.com/a/b/pull/3/files").is_err());
         assert!(parse_target("github.com/a/b/commit/abc").is_err());
+        let pr = parse_target("github.com/a/b/pr/3").unwrap_err();
+        assert!(pr.contains("/pull/3"), "{pr}");
+        assert!(pr.contains("github.com/a/b/pull/3"), "{pr}");
+        let pulls = parse_target("http://www.github.com/a/b/pulls/3/").unwrap_err();
+        assert!(pulls.contains("/pull/3"), "{pulls}");
+        let issue = parse_target("github.com/a/b/issue/12").unwrap_err();
+        assert!(issue.contains("/issues/12"), "{issue}");
+        assert!(issue.contains("github.com/a/b/issues/12"), "{issue}");
+        let list = parse_target("https://github.com/a/b/issue/").unwrap_err();
+        assert!(list.contains("/issues"), "{list}");
+        assert!(list.contains("github.com/a/b/issues"), "{list}");
+        let bare = parse_target("cympfh/xxx/pr/9").unwrap_err();
+        assert!(bare.contains("/pull/"), "{bare}");
+        let zero = parse_target("github.com/a/b/pr/0").unwrap_err();
+        assert!(zero.contains("/pull/N"), "{zero}");
+        assert!(!zero.contains("at least 1"), "{zero}");
+        let junk = parse_target("github.com/a/b/issue/x").unwrap_err();
+        assert!(junk.contains("/issues/N"), "{junk}");
+        assert!(junk.contains("github.com/a/b/issues/N"), "{junk}");
     }
 }

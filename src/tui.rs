@@ -1216,7 +1216,7 @@ mod tests {
 
     #[test]
     fn confirm_defaults_match_each_prompt() {
-        let mut app = App::new("ghost github.com/acme/app/issue/7".into());
+        let mut app = App::new("ghost github.com/acme/app/issues/7".into());
         app.view = confirm(
             12,
             "Continue as --code on PR #12?",
@@ -1373,7 +1373,7 @@ mod tests {
 
     #[test]
     fn merge_dialog_renders_enter_as_no_and_the_method() {
-        let mut app = App::new("ghost github.com/acme/app/pr/3 --code".into());
+        let mut app = App::new("ghost github.com/acme/app/pull/3 --code".into());
         app.view = confirm(
             3,
             &merge_question(3, MergeStyle::Squash, Lang::Ja),
@@ -1501,7 +1501,7 @@ mod tests {
 
     #[test]
     fn review_frame_shows_agent_stream() {
-        let mut app = App::new("ghost github.com/cympfh/xxx/pr/3 --review".into());
+        let mut app = App::new("ghost github.com/cympfh/xxx/pull/3 --review".into());
         app.status = Status {
             mode: "review".into(),
             target: "PR #3".into(),
@@ -1534,7 +1534,7 @@ mod tests {
     fn secondary_text_is_gray_and_no_color_is_plain() {
         use ratatui::style::{Color, Modifier};
 
-        let mut app = App::new("ghost github.com/cympfh/xxx/pr/3 --review".into());
+        let mut app = App::new("ghost github.com/cympfh/xxx/pull/3 --review".into());
         app.lines.push(LogLine {
             kind: LogKind::System,
             text: "reviews 1, inline 1, comments 0".into(),

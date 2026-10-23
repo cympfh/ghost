@@ -19,9 +19,9 @@ use crate::watch::CommentTrust;
     after_help = "\
 Examples:
   ghost github.com/owner/repo
-  ghost github.com/owner/repo/pr/3 -r
-  ghost github.com/owner/repo/pr/3 -c -i 20s
-  ghost github.com/owner/repo/issue/7 -y -l ja
+  ghost github.com/owner/repo/pull/3 -r
+  ghost github.com/owner/repo/pull/3 -c -i 20s
+  ghost github.com/owner/repo/issues/7 -y -l ja
   ghost github.com/owner/repo/issues --auto
   ghost -d review
 
@@ -36,7 +36,7 @@ Later polls with nothing new do not call the agent. `i` always delivers text to 
 `--auto` is only valid with /issues. It takes the oldest open issue on each check and keeps waiting when none are left."
 )]
 struct Cli {
-    /// github.com/OWNER/REPO, .../pr/N, .../issue/N, or .../issues
+    /// github.com/OWNER/REPO, .../pull/N, .../issues/N, or .../issues
     target: Option<String>,
 
     /// Review the pull request when its head SHA changes.
@@ -181,7 +181,7 @@ fn resolve(
         return Err(if auto {
             "--auto needs github.com/OWNER/REPO/issues".into()
         } else {
-            "missing GitHub URL (github.com/OWNER/REPO[/pr/N|/issue/N|/issues])".into()
+            "missing GitHub URL (github.com/OWNER/REPO[/pull/N|/issues/N|/issues])".into()
         });
     };
     if max_iterations == 0 {
@@ -240,7 +240,7 @@ fn mode_for(target: &GhTarget, review: bool, code: bool, auto: bool) -> Result<R
             }
             if review || code {
                 return Err(
-                    "a repository URL opens the picker. Pass a /pr/N URL to use --review or --code."
+                    "a repository URL opens the picker. Pass a /pull/N URL to use --review or --code."
                         .into(),
                 );
             }
@@ -249,7 +249,7 @@ fn mode_for(target: &GhTarget, review: bool, code: bool, auto: bool) -> Result<R
         GhTarget::Issues { .. } => {
             if review || code {
                 return Err(
-                    "a /issues URL lists open issues. Pass /issue/N to implement one, or add --auto."
+                    "a /issues URL lists open issues. Pass /issues/N to implement one, or add --auto."
                         .into(),
                 );
             }
@@ -290,10 +290,10 @@ fn demo_header(scene: DemoScene) -> String {
     match scene {
         DemoScene::Picker => "ghost github.com/cympfh/xxx".into(),
         DemoScene::Review | DemoScene::Preflight => {
-            "ghost github.com/cympfh/xxx/pr/3 --review".into()
+            "ghost github.com/cympfh/xxx/pull/3 --review".into()
         }
-        DemoScene::Code => "ghost github.com/cympfh/xxx/pr/3 --code".into(),
-        DemoScene::Confirm => "ghost github.com/cympfh/xxx/issue/7".into(),
+        DemoScene::Code => "ghost github.com/cympfh/xxx/pull/3 --code".into(),
+        DemoScene::Confirm => "ghost github.com/cympfh/xxx/issues/7".into(),
     }
 }
 
@@ -426,10 +426,17 @@ mod tests {
             !help.contains(", --trust-issues"),
             "--trust-issues must not have a short flag\n{help}"
         );
+        assert!(help.contains("github.com/owner/repo/pull/3"));
+        assert!(help.contains("github.com/owner/repo/issues/7"));
+        assert!(help.contains("github.com/owner/repo/issues --auto"));
+        assert!(
+            !help.contains("/pr/"),
+            "help must not advertise /pr/\n{help}"
+        );
 
         let cli = Cli::try_parse_from([
             "ghost",
-            "github.com/a/b/pr/3",
+            "github.com/a/b/pull/3",
             "-c",
             "-i",
             "30s",
@@ -455,24 +462,24 @@ mod tests {
         assert!(cli.yes);
         assert_eq!(cli.max_iterations, 4);
         assert_eq!(cli.trust_comments, Some(CommentTrust::All));
-        let default_trust = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "-c"]).unwrap();
+        let default_trust = Cli::try_parse_from(["ghost", "github.com/a/b/pull/1", "-c"]).unwrap();
         assert!(default_trust.trust_comments.is_none());
 
-        let review = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "-r"]).unwrap();
+        let review = Cli::try_parse_from(["ghost", "github.com/a/b/pull/1", "-r"]).unwrap();
         assert!(review.review);
         assert!(!review.code);
         let demo = Cli::try_parse_from(["ghost", "-d", "picker"]).unwrap();
         assert_eq!(demo.demo, Some(DemoScene::Picker));
-        assert!(Cli::try_parse_from(["ghost", "github.com/a/b/pr/3", "-r", "-c"]).is_err());
+        assert!(Cli::try_parse_from(["ghost", "github.com/a/b/pull/3", "-r", "-c"]).is_err());
     }
 
     #[test]
     fn default_interval_is_20_seconds() {
-        let cli = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "--review"]).unwrap();
+        let cli = Cli::try_parse_from(["ghost", "github.com/a/b/pull/1", "--review"]).unwrap();
         assert_eq!(cli.interval, "20s");
         assert_eq!(cli.lang, Lang::Ja);
         let action = resolve(
-            Some("github.com/a/b/pr/1"),
+            Some("github.com/a/b/pull/1"),
             true,
             false,
             false,
@@ -509,35 +516,35 @@ mod tests {
             })
         ));
         assert!(matches!(
-            go(&["github.com/a/b/pr/3", "--review"]).unwrap(),
+            go(&["github.com/a/b/pull/3", "--review"]).unwrap(),
             Action::Run(RunSpec {
                 mode: RunMode::Review,
                 ..
             })
         ));
         assert!(matches!(
-            go(&["github.com/a/b/pr/3", "--code"]).unwrap(),
+            go(&["github.com/a/b/pull/3", "--code"]).unwrap(),
             Action::Run(RunSpec {
                 mode: RunMode::Code,
                 ..
             })
         ));
         assert!(matches!(
-            go(&["github.com/a/b/pr/3"]).unwrap(),
+            go(&["github.com/a/b/pull/3"]).unwrap(),
             Action::Run(RunSpec {
                 mode: RunMode::Ask,
                 ..
             })
         ));
         assert!(matches!(
-            go(&["github.com/a/b/issue/7", "--yes"]).unwrap(),
+            go(&["github.com/a/b/issues/7", "--yes"]).unwrap(),
             Action::Run(RunSpec {
                 mode: RunMode::Issue,
                 yes: true,
                 ..
             })
         ));
-        assert!(go(&["github.com/a/b/issue/7", "--review"]).is_err());
+        assert!(go(&["github.com/a/b/issues/7", "--review"]).is_err());
         assert!(go(&["github.com/a/b", "--code"]).is_err());
         assert!(go(&[]).is_err());
     }
@@ -545,7 +552,7 @@ mod tests {
     #[test]
     fn rejects_zero_iterations_and_bad_interval() {
         assert!(resolve(
-            Some("github.com/a/b/pr/1"),
+            Some("github.com/a/b/pull/1"),
             true,
             false,
             false,
@@ -564,7 +571,7 @@ mod tests {
         )
         .is_err());
         assert!(resolve(
-            Some("github.com/a/b/pr/1"),
+            Some("github.com/a/b/pull/1"),
             true,
             false,
             false,
@@ -586,11 +593,11 @@ mod tests {
 
     #[test]
     fn merge_yes_is_only_for_code_and_issue() {
-        assert!(go(&["github.com/a/b/pr/3", "--review", "--merge-yes"]).is_err());
-        assert!(go(&["github.com/a/b/pr/3", "--merge-yes"]).is_err());
+        assert!(go(&["github.com/a/b/pull/3", "--review", "--merge-yes"]).is_err());
+        assert!(go(&["github.com/a/b/pull/3", "--merge-yes"]).is_err());
         assert!(go(&["github.com/a/b", "--merge-yes"]).is_err());
         assert!(matches!(
-            go(&["github.com/a/b/pr/3", "--code", "--merge-yes"]).unwrap(),
+            go(&["github.com/a/b/pull/3", "--code", "--merge-yes"]).unwrap(),
             Action::Run(RunSpec {
                 mode: RunMode::Code,
                 merge_yes: true,
@@ -599,7 +606,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            go(&["github.com/a/b/issue/7", "--merge-yes", "--merge-method", "squash"]).unwrap(),
+            go(&["github.com/a/b/issues/7", "--merge-yes", "--merge-method", "squash"]).unwrap(),
             Action::Run(RunSpec {
                 mode: RunMode::Issue,
                 merge_yes: true,
@@ -609,7 +616,7 @@ mod tests {
         ));
         let cli = Cli::try_parse_from([
             "ghost",
-            "github.com/a/b/pr/3",
+            "github.com/a/b/pull/3",
             "-c",
             "--merge-yes",
             "--merge-method",
@@ -629,13 +636,30 @@ mod tests {
                 ..
             })
         ));
-        assert!(matches!(
-            go(&["github.com/a/b/issue"]).unwrap(),
-            Action::Run(RunSpec {
-                mode: RunMode::IssueList,
-                ..
-            })
-        ));
+        let alias = match go(&["github.com/a/b/issue"]) {
+            Err(err) => err,
+            Ok(_) => panic!("bare /issue must be rejected"),
+        };
+        assert!(
+            alias.contains("github.com/a/b/issues"),
+            "bare /issue should name the GitHub list URL: {alias}"
+        );
+        let ghost_pr = match go(&["github.com/a/b/pr/3", "--review"]) {
+            Err(err) => err,
+            Ok(_) => panic!("/pr/N must be rejected"),
+        };
+        assert!(
+            ghost_pr.contains("github.com/a/b/pull/3"),
+            "/pr/N should suggest /pull/N: {ghost_pr}"
+        );
+        let ghost_issue = match go(&["github.com/a/b/issue/9"]) {
+            Err(err) => err,
+            Ok(_) => panic!("/issue/N must be rejected"),
+        };
+        assert!(
+            ghost_issue.contains("github.com/a/b/issues/9"),
+            "/issue/N should suggest /issues/N: {ghost_issue}"
+        );
         assert!(matches!(
             go(&[
                 "github.com/a/b/issues",
@@ -655,12 +679,12 @@ mod tests {
             }) if method == "--squash"
         ));
         assert!(go(&["github.com/a/b", "--auto"]).is_err());
-        assert!(go(&["github.com/a/b/pr/3", "--auto"]).is_err());
-        assert!(go(&["github.com/a/b/issue/7", "--auto"]).is_err());
+        assert!(go(&["github.com/a/b/pull/3", "--auto"]).is_err());
+        assert!(go(&["github.com/a/b/issues/7", "--auto"]).is_err());
         assert!(go(&["github.com/a/b/issues", "--review"]).is_err());
         assert!(go(&["github.com/a/b/issues", "--code"]).is_err());
         assert!(go(&["github.com/a/b/issues", "--merge-yes"]).is_err());
-        assert!(go(&["github.com/a/b/pr/3", "--review", "--merge-yes"]).is_err());
+        assert!(go(&["github.com/a/b/pull/3", "--review", "--merge-yes"]).is_err());
         assert!(go(&["--auto"]).is_err());
         let cli = Cli::try_parse_from(["ghost", "github.com/a/b/issues", "--auto"]).unwrap();
         assert!(cli.auto);
@@ -691,7 +715,7 @@ mod tests {
             Action::Demo { .. } => panic!("expected a run"),
         }
         match resolve(
-            Some("github.com/a/b/pr/3"),
+            Some("github.com/a/b/pull/3"),
             false,
             true,
             false,
@@ -740,7 +764,7 @@ mod tests {
             Action::Demo { .. } => panic!("expected a run"),
         }
         match resolve(
-            Some("github.com/a/b/issue/4"),
+            Some("github.com/a/b/issues/4"),
             false,
             false,
             false,

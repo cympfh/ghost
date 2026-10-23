@@ -3211,7 +3211,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let home = std::env::temp_dir();
-        let target = crate::target::parse_target("github.com/acme/app/pr/1").unwrap();
+        let target = crate::target::parse_target("github.com/acme/app/pull/1").unwrap();
         let ctx = super::Ctx {
             spec: super::RunSpec {
                 header: String::new(),
