@@ -565,6 +565,12 @@ pub struct AgentSession {
     broken_pipe: bool,
     push_plan: Option<PushPlan>,
     stub: Option<PathBuf>,
+    /// File the `gh` wrapper appends when the agent runs `gh issue create`.
+    created_issues: Option<PathBuf>,
+    /// File the wrapper appends when the agent runs `gh pr create`.
+    created_prs: Option<PathBuf>,
+    /// `owner/repo` this ghost is running. `-R` must match it before a number is recorded.
+    repo_slug: Option<String>,
 }
 
 impl AgentSession {
@@ -590,7 +596,22 @@ impl AgentSession {
             broken_pipe: false,
             push_plan: None,
             stub: None,
+            created_issues: None,
+            created_prs: None,
+            repo_slug: None,
         }
+    }
+
+    pub fn set_created_issues(&mut self, path: PathBuf) {
+        self.created_issues = Some(path);
+    }
+
+    pub fn set_created_prs(&mut self, path: PathBuf) {
+        self.created_prs = Some(path);
+    }
+
+    pub fn set_repo_slug(&mut self, slug: String) {
+        self.repo_slug = Some(slug);
     }
 
     pub fn set_workdir(&mut self, dir: PathBuf) {
@@ -823,6 +844,15 @@ impl AgentSession {
                 path.push_str(&parent_path);
             }
             cmd.env("PATH", path);
+        }
+        if let Some(path) = &self.created_issues {
+            cmd.env("GHOST_CREATED_ISSUES", path);
+        }
+        if let Some(path) = &self.created_prs {
+            cmd.env("GHOST_CREATED_PRS", path);
+        }
+        if let Some(slug) = &self.repo_slug {
+            cmd.env("GHOST_REPO", slug);
         }
         if let Some(plan) = &self.push_plan {
             if plan.readonly {
@@ -1087,6 +1117,35 @@ a1=""
 a2=""
 method=""
 merge_api=0
+repo_arg=""
+same_repo() {
+  if [ -z "$repo_arg" ]; then
+    return 0
+  fi
+  want=$(printf '%s' "${GHOST_REPO:-}" | tr '[:upper:]' '[:lower:]')
+  got=$(printf '%s' "$repo_arg" | tr '[:upper:]' '[:lower:]')
+  [ -n "$want" ] && [ "$got" = "$want" ]
+}
+remember_number() {
+  file="$1"
+  kind="$2"
+  blob="$3"
+  if [ -z "$file" ] || ! same_repo; then
+    return
+  fi
+  if [ "$kind" = "pull" ]; then
+    num=$(printf '%s\n' "$blob" | sed -n 's#.*pull/\([0-9][0-9]*\).*#\1#p' | head -n 1)
+  else
+    num=$(printf '%s\n' "$blob" | sed -n 's#.*issues/\([0-9][0-9]*\).*#\1#p' | head -n 1)
+  fi
+  if [ -z "$num" ]; then
+    num=$(printf '%s\n' "$blob" | sed -n 's/.*"number":[ ]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  fi
+  if [ -n "$num" ]; then
+    mkdir -p "$(dirname "$file")" 2>/dev/null
+    printf '%s\n' "$num" >> "$file"
+  fi
+}
 for arg in "$@"; do
   if [ -n "$expect" ]; then
     if [ "$expect" = "method" ]; then
@@ -1094,6 +1153,9 @@ for arg in "$@"; do
       if [ "$up" = "DELETE" ]; then
         method=DELETE
       fi
+    fi
+    if [ "$expect" = "repo" ]; then
+      repo_arg=$arg
     fi
     case "$arg" in
       *[Mm][Ee][Rr][Gg][Ee][Pp][Uu][Ll][Ll][Rr][Ee][Qq][Uu][Ee][Ss][Tt]*) merge_api=1 ;;
@@ -1105,7 +1167,9 @@ for arg in "$@"; do
     -X|--method) expect=method ;;
     -XDELETE|-Xdelete|-XDelete|--method=DELETE|--method=delete|--method=Delete)
       method=DELETE ;;
-    -R|--repo|--hostname|--jq|--template|--cache|-f|-F|--raw-field|--input|-H|--header|--field)
+    -R|--repo) expect=repo ;;
+    --repo=*) repo_arg=${arg#--repo=} ;;
+    --hostname|--jq|--template|--cache|-f|-F|--raw-field|--input|-H|--header|--field)
       expect=skip ;;
     --repo=*|--hostname=*|--jq=*|--field=*|--raw-field=*|--input=*|--header=*|--cache=*|--template=*|--method=*)
       case "$arg" in
@@ -1140,6 +1204,36 @@ if [ "$a1" = "api" ]; then
     echo "ghost: refusing gh api merge" >&2
     exit 99
   fi
+fi
+if [ "$a1" = "issue" ] && [ "$a2" = "create" ]; then
+  errf="${TMPDIR:-/tmp}/ghost-issue-create-$$.err"
+  out=$("$real" "$@" 2>"$errf")
+  code=$?
+  if [ -s "$errf" ]; then
+    cat "$errf" >&2
+  fi
+  printf '%s\n' "$out"
+  if [ "$code" -eq 0 ]; then
+    blob=$(printf '%s\n' "$out"; cat "$errf" 2>/dev/null)
+    remember_number "${GHOST_CREATED_ISSUES:-}" issue "$blob"
+  fi
+  rm -f "$errf"
+  exit "$code"
+fi
+if [ "$a1" = "pr" ] && [ "$a2" = "create" ]; then
+  errf="${TMPDIR:-/tmp}/ghost-pr-create-$$.err"
+  out=$("$real" "$@" 2>"$errf")
+  code=$?
+  if [ -s "$errf" ]; then
+    cat "$errf" >&2
+  fi
+  printf '%s\n' "$out"
+  if [ "$code" -eq 0 ]; then
+    blob=$(printf '%s\n' "$out"; cat "$errf" 2>/dev/null)
+    remember_number "${GHOST_CREATED_PRS:-}" pull "$blob"
+  fi
+  rm -f "$errf"
+  exit "$code"
 fi
 exec "$real" "$@"
 "#;
@@ -1876,6 +1970,174 @@ mod tests {
             ],
             "merge",
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gh_wrapper_records_issue_create_and_not_a_later_user_issue() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-gh-create-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = install_gh_guard(&dir).unwrap();
+        let real = dir.join("real-gh");
+        let created = dir.join("nest").join("created-issues");
+        std::fs::write(
+            &real,
+            "#!/bin/sh\nprintf '%s\\n' \"$GHOST_FAKE_OUT\"\nif [ -n \"$GHOST_FAKE_ERR\" ]; then printf '%s\\n' \"$GHOST_FAKE_ERR\" >&2; fi\nexit \"${GHOST_FAKE_CODE:-0}\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&real).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&real, perms).unwrap();
+        }
+        let guard = bin.join("gh");
+        let run = |args: &[&str], out: &str, err: &str, code: &str| {
+            std::process::Command::new(&guard)
+                .args(args)
+                .env("GHOST_REAL_GH", &real)
+                .env("GHOST_CREATED_ISSUES", &created)
+                .env("GHOST_REPO", "acme/app")
+                .env("GHOST_FAKE_OUT", out)
+                .env("GHOST_FAKE_ERR", err)
+                .env("GHOST_FAKE_CODE", code)
+                .output()
+                .unwrap()
+        };
+        let created_url = run(
+            &["issue", "create", "--title", "from the agent"],
+            "https://github.com/acme/app/issues/44",
+            "",
+            "0",
+        );
+        assert_eq!(created_url.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&created_url.stdout).contains("issues/44"));
+        assert_eq!(crate::state::read_created_issues(&created), vec![44]);
+
+        run(
+            &["issue", "create", "--json", "number"],
+            r#"{"number":81}"#,
+            "",
+            "0",
+        );
+        assert_eq!(crate::state::read_created_issues(&created), vec![44, 81]);
+
+        // A comment, or a pull request, can mention an issue URL. That is not `gh issue create`.
+        run(
+            &[
+                "issue",
+                "comment",
+                "44",
+                "--body",
+                "see https://github.com/acme/app/issues/99",
+            ],
+            "https://github.com/acme/app/issues/99",
+            "",
+            "0",
+        );
+        run(
+            &["pr", "create", "--title", "ship"],
+            "https://github.com/acme/app/pull/7",
+            "",
+            "0",
+        );
+        run(
+            &["issue", "create", "--title", "failed"],
+            "https://github.com/acme/app/issues/100",
+            "HTTP 502",
+            "1",
+        );
+        assert_eq!(
+            crate::state::read_created_issues(&created),
+            vec![44, 81],
+            "only a successful gh issue create is recorded"
+        );
+
+        let created_prs = dir.join("created-prs");
+        let elsewhere = run(
+            &["issue", "create", "-R", "other/repo", "--title", "not here"],
+            "https://github.com/other/repo/issues/55",
+            "",
+            "0",
+        );
+        assert_eq!(elsewhere.status.code(), Some(0));
+        assert_eq!(
+            crate::state::read_created_issues(&created),
+            vec![44, 81],
+            "-R other/repo is not this repository"
+        );
+        run(
+            &[
+                "issue",
+                "create",
+                "--repo",
+                "acme/app",
+                "--title",
+                "same repo",
+            ],
+            "https://github.com/acme/app/issues/56",
+            "",
+            "0",
+        );
+        run(
+            &["issue", "create", "--repo=Acme/App", "--title", "case"],
+            r#"{"number":57}"#,
+            "",
+            "0",
+        );
+        run(
+            &[
+                "api",
+                "--method",
+                "POST",
+                "repos/acme/app/issues",
+                "-f",
+                "title=via api",
+            ],
+            "https://github.com/acme/app/issues/77",
+            "",
+            "0",
+        );
+        run(
+            &["issue", "create", "--web", "--title", "browser"],
+            "",
+            "",
+            "0",
+        );
+        assert_eq!(
+            crate::state::read_created_issues(&created),
+            vec![44, 81, 56, 57]
+        );
+        let pr_out = std::process::Command::new(&guard)
+            .args(["pr", "create", "--repo", "acme/app", "--title", "ship"])
+            .env("GHOST_REAL_GH", &real)
+            .env("GHOST_CREATED_PRS", &created_prs)
+            .env("GHOST_REPO", "acme/app")
+            .env("GHOST_FAKE_OUT", "https://github.com/acme/app/pull/7")
+            .env("GHOST_FAKE_ERR", "")
+            .env("GHOST_FAKE_CODE", "0")
+            .output()
+            .unwrap();
+        assert_eq!(pr_out.status.code(), Some(0));
+        assert_eq!(crate::state::read_created_prs(&created_prs), vec![7]);
+        let other_pr = std::process::Command::new(&guard)
+            .args(["pr", "create", "-R", "other/repo"])
+            .env("GHOST_REAL_GH", &real)
+            .env("GHOST_CREATED_PRS", &created_prs)
+            .env("GHOST_REPO", "acme/app")
+            .env("GHOST_FAKE_OUT", "https://github.com/other/repo/pull/8")
+            .env("GHOST_FAKE_CODE", "0")
+            .output()
+            .unwrap();
+        assert_eq!(other_pr.status.code(), Some(0));
+        assert_eq!(crate::state::read_created_prs(&created_prs), vec![7]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

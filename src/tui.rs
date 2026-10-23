@@ -96,6 +96,8 @@ pub enum UiEvent {
     Log(LogLine),
     Status(Status),
     Picker(Vec<OpenItem>),
+    /// Open issues only. The empty list does not mention pull requests.
+    IssuePicker(Vec<OpenItem>),
     ChooseMode {
         number: u64,
         title: String,
@@ -244,6 +246,7 @@ pub struct App {
     pub spinner: usize,
     picker_backup: Vec<OpenItem>,
     picker_selected: usize,
+    issues_only: bool,
 }
 
 impl App {
@@ -264,6 +267,7 @@ impl App {
             spinner: 0,
             picker_backup: Vec::new(),
             picker_selected: 0,
+            issues_only: false,
         }
     }
 
@@ -375,7 +379,9 @@ where
                 }
             }
             Ok(UiEvent::Status(_)) => {}
-            Ok(UiEvent::Picker(_)) | Ok(UiEvent::ChooseMode { .. }) => {
+            Ok(UiEvent::Picker(_))
+            | Ok(UiEvent::IssuePicker(_))
+            | Ok(UiEvent::ChooseMode { .. }) => {
                 forced = true;
                 exit_code = 1;
                 exit_message = "not a TTY; pass a pull request or issue URL".into();
@@ -428,12 +434,8 @@ fn apply(app: &mut App, event: UiEvent) {
     match event {
         UiEvent::Log(line) => app.push_log(line),
         UiEvent::Status(status) => app.status = status,
-        UiEvent::Picker(items) => {
-            app.picker_backup = items.clone();
-            app.picker_selected = 0;
-            app.view = View::Picker { items, selected: 0 };
-            app.input_mode = false;
-        }
+        UiEvent::Picker(items) => show_picker(app, items, false),
+        UiEvent::IssuePicker(items) => show_picker(app, items, true),
         UiEvent::ChooseMode { number, title } => {
             app.view = View::Choose { number, title };
             app.input_mode = false;
@@ -630,6 +632,14 @@ fn move_picker(app: &mut App, delta: i32) -> Option<UiCmd> {
     None
 }
 
+fn show_picker(app: &mut App, items: Vec<OpenItem>, issues_only: bool) {
+    app.issues_only = issues_only;
+    app.picker_backup = items.clone();
+    app.picker_selected = 0;
+    app.view = View::Picker { items, selected: 0 };
+    app.input_mode = false;
+}
+
 fn picker_action(app: &mut App, side: Option<Side>) -> Option<UiCmd> {
     let View::Picker { items, selected } = &app.view else {
         return None;
@@ -786,7 +796,8 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         View::Picker { items, selected } => {
             let width = area.width.saturating_sub(2) as usize;
-            let (rows, selected_row) = picker_rows(items, *selected, width);
+            let issues_only = app.issues_only;
+            let (rows, selected_row) = picker_rows(items, *selected, width, issues_only);
             let inner_h = area.height.saturating_sub(2) as usize;
             let offset = selected_row.saturating_sub(inner_h.saturating_sub(1));
             let para = Paragraph::new(rows).block(block).scroll((offset as u16, 0));
@@ -842,15 +853,19 @@ fn log_rows(lines: &[LogLine], width: usize) -> Vec<Line<'static>> {
     rows
 }
 
-fn picker_rows(items: &[OpenItem], selected: usize, width: usize) -> (Vec<Line<'static>>, usize) {
+fn picker_rows(
+    items: &[OpenItem],
+    selected: usize,
+    width: usize,
+    issues_only: bool,
+) -> (Vec<Line<'static>>, usize) {
     if items.is_empty() {
-        return (
-            vec![Line::from(Span::styled(
-                "  no open pull requests or issues",
-                theme::secondary(),
-            ))],
-            0,
-        );
+        let text = if issues_only {
+            "  no open issues"
+        } else {
+            "  no open pull requests or issues"
+        };
+        return (vec![Line::from(Span::styled(text, theme::secondary()))], 0);
     }
     let mut rows = Vec::new();
     let mut selected_row = 0;

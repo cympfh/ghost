@@ -48,6 +48,10 @@ pub enum RunMode {
     Code,
     Issue,
     Picker,
+    /// Open issues only. No pull requests.
+    IssueList,
+    /// Take the oldest eligible issue, then check again.
+    Auto,
     Ask,
 }
 
@@ -64,7 +68,10 @@ pub struct RunSpec {
     pub max_turns: u32,
     pub lang: Lang,
     pub ssh_key: Option<String>,
+    /// Who may wake `--code`. Default `all`, including issue and `--code` review comments.
     pub trust: CommentTrust,
+    /// Which issue authors `--auto` may run. Default collaborators.
+    pub trust_issues: CommentTrust,
 }
 
 pub fn run(spec: RunSpec) -> Result<i32> {
@@ -235,7 +242,7 @@ fn prime_checkout(
             }
         }
         RunMode::Issue => prime_issue(&gh, &slug, spec, main, dest),
-        RunMode::Picker => workdir::CheckoutOutcome {
+        RunMode::Picker | RunMode::IssueList | RunMode::Auto => workdir::CheckoutOutcome {
             workdir: dest.to_path_buf(),
             note: String::new(),
             failures: Vec::new(),
@@ -363,7 +370,7 @@ struct SlotPrep {
 
 fn activate_slot(spec: &RunSpec, home: &std::path::Path, main: &std::path::Path) -> SlotPrep {
     let slot = match spec.mode {
-        RunMode::Picker | RunMode::Ask => None,
+        RunMode::Picker | RunMode::IssueList | RunMode::Auto | RunMode::Ask => None,
         RunMode::Issue => match issue_number(&spec.target) {
             Ok(number) => Some(format!("issue-{number}")),
             Err(err) => {
@@ -492,12 +499,17 @@ fn babysit(
     let slug = spec.target.slug();
     let owner = spec.target.owner().to_string();
     let repo = spec.target.repo().to_string();
+    let state_root = state::state_dir();
+    let mut agent = AgentSession::new(kind, workdir.clone(), &home, slot_name);
+    agent.set_created_issues(state::created_issues_path(&state_root, &owner, &repo));
+    agent.set_created_prs(state::created_prs_path(&state_root, &owner, &repo));
+    agent.set_repo_slug(slug.clone());
     let mut ctx = Ctx {
         gh: Gh::new(slug.clone()),
         slug,
         owner,
         repo,
-        agent: AgentSession::new(kind, workdir.clone(), &home, slot_name),
+        agent,
         workdir,
         slot_dir,
         main_clone,
@@ -524,7 +536,9 @@ fn babysit(
         code_path: None,
         code_seen: BTreeSet::new(),
         code_agent_ids: BTreeSet::new(),
-        state_root: state::state_dir(),
+        state_root,
+        auto_issue: None,
+        auto_release: None,
     };
 
     match ctx.spec.mode {
@@ -544,7 +558,9 @@ fn babysit(
             let n = pull_number(&ctx.spec.target)?;
             ctx.ask_mode(n)?;
         }
-        RunMode::Picker => ctx.picker_flow()?,
+        RunMode::Picker => ctx.picker_flow(false)?,
+        RunMode::IssueList => ctx.picker_flow(true)?,
+        RunMode::Auto => ctx.auto_loop()?,
     }
     Ok(())
 }
@@ -587,6 +603,9 @@ struct Ctx {
     code_seen: BTreeSet<String>,
     code_agent_ids: BTreeSet<String>,
     state_root: PathBuf,
+    /// Set while `--auto` is inside one issue, so `stop` returns to the loop.
+    auto_issue: Option<u64>,
+    auto_release: Option<AutoRelease>,
 }
 
 impl Ctx {
@@ -1219,6 +1238,8 @@ impl Ctx {
             }
             Err(err) => {
                 let detail = format!("{err:#}");
+                let transient =
+                    crate::github::failure_is_transient(&err) && !merge_method_rejected(&detail);
                 let flag = method.flag();
                 let message = if merge_method_rejected(&detail) {
                     self.say(
@@ -1236,7 +1257,7 @@ impl Ctx {
                     )
                 };
                 if self.spec.merge_yes {
-                    self.stop(1, message);
+                    self.stop_with(1, message, transient);
                     return Ok(true);
                 }
                 self.log_kind(LogKind::Error, message);
@@ -1620,14 +1641,23 @@ impl Ctx {
         }
     }
 
-    fn picker_flow(&mut self) -> Result<()> {
-        self.status.mode = "picker".into();
+    fn picker_flow(&mut self, issues_only: bool) -> Result<()> {
+        self.status.mode = if issues_only { "issues" } else { "picker" }.into();
         self.status.target = self.spec.target.display_url();
         self.status.phase = "loading".into();
         self.push_status();
-        self.log("loading open pull requests and issues");
-        let items = self.gh.open_items()?;
-        let _ = self.tx.send(UiEvent::Picker(items));
+        let items = if issues_only {
+            self.log("loading open issues");
+            self.gh.open_issues()?
+        } else {
+            self.log("loading open pull requests and issues");
+            self.gh.open_items()?
+        };
+        let _ = self.tx.send(if issues_only {
+            UiEvent::IssuePicker(items)
+        } else {
+            UiEvent::Picker(items)
+        });
         self.status.phase = "choose".into();
         self.push_status();
         let choice = loop {
@@ -1673,6 +1703,320 @@ impl Ctx {
             (crate::github::ItemKind::Issue, _) => self.issue_flow(number),
             (crate::github::ItemKind::Pull, None) => self.ask_mode(number),
         }
+    }
+
+    /// Refetch open issues on each check. One issue runs at a time.
+    /// An empty list, or a failed `gh` call, waits for the next interval instead of exiting.
+    fn auto_loop(&mut self) -> Result<()> {
+        self.status.mode = "auto".into();
+        self.status.target = self.spec.target.display_url();
+        self.push_status();
+        let path = state::auto_state_path(&self.state_root, &self.owner, &self.repo);
+        loop {
+            if self.quit {
+                self.stop(0, "quit".into());
+                return Ok(());
+            }
+            self.status.phase = "checking".into();
+            self.push_status();
+            let fetched = self.fetch_auto(&path);
+            let (issues, prs, mut stored) = match fetched {
+                AutoFetch::Wait(message) => {
+                    self.note_auto_wait(message);
+                    if self.wait_interval()? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                AutoFetch::Ready {
+                    issues,
+                    prs,
+                    stored,
+                    warning,
+                } => {
+                    if let Some(warning) = warning {
+                        self.log_kind(LogKind::Error, warning);
+                    }
+                    (issues, prs, stored)
+                }
+            };
+            let created_path =
+                state::created_issues_path(&self.state_root, &self.owner, &self.repo);
+            let created_prs_path =
+                state::created_prs_path(&self.state_root, &self.owner, &self.repo);
+            let mut busy = Vec::new();
+            loop {
+                let now = crate::auto::now_rfc3339();
+                let created = state::read_created_issues(&created_path);
+                let created_prs = state::read_created_prs(&created_prs_path);
+                let choice = crate::auto::poll(&crate::auto::PollIn {
+                    issues: &issues,
+                    failed: &stored.failed,
+                    prs: &prs,
+                    trust: self.spec.trust_issues,
+                    created: &created,
+                    created_prs: &created_prs,
+                    now: &now,
+                    busy: &busy,
+                });
+                let mut changed = false;
+                for skip in &choice.skipped {
+                    if Self::remember_skip(&mut stored, skip) {
+                        changed = true;
+                    }
+                    self.log(self.skip_line(skip));
+                }
+                if changed {
+                    if let Err(err) = stored.save(&path) {
+                        self.log_kind(LogKind::Error, format!("auto state: {err:#}"));
+                    }
+                }
+                match choice.action {
+                    crate::auto::AutoAction::Idle => {
+                        self.log(self.say(
+                            "未処理のオープンな issue はありません。次の確認まで待ちます。",
+                            "No open issue is waiting. Checking again after the interval.",
+                        ));
+                        if self.wait_interval()? {
+                            return Ok(());
+                        }
+                        break;
+                    }
+                    crate::auto::AutoAction::Run(number) => {
+                        let head = issues
+                            .iter()
+                            .find(|row| row.number == number)
+                            .map(|row| crate::auto::current_head(row, &prs))
+                            .unwrap_or_default();
+                        self.log(self.say(
+                            &format!("issue #{number} を始めます。"),
+                            &format!("Taking issue #{number}."),
+                        ));
+                        if !self.begin_auto_issue(number, &path, &head)? {
+                            busy.push(number);
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A failed list is a wait, never a fatal error.
+    fn fetch_auto(&self, path: &std::path::Path) -> AutoFetch {
+        let issues = match self.gh.auto_issues() {
+            Ok(rows) => rows,
+            Err(err) => return AutoFetch::Wait(format!("gh issue list: {err:#}")),
+        };
+        let prs = match self.gh.auto_pr_links() {
+            Ok(rows) => rows,
+            Err(err) => return AutoFetch::Wait(format!("gh pr list: {err:#}")),
+        };
+        match state::AutoState::load(path) {
+            Ok(loaded) => AutoFetch::Ready {
+                issues,
+                prs,
+                stored: loaded.state,
+                warning: loaded.warning,
+            },
+            Err(err) => AutoFetch::Wait(format!("auto state: {err:#}")),
+        }
+    }
+
+    fn note_auto_wait(&mut self, message: String) {
+        self.log_kind(LogKind::Error, message);
+    }
+
+    /// `false` when another ghost holds `issue-N`. That issue is skipped this round.
+    fn begin_auto_issue(
+        &mut self,
+        number: u64,
+        path: &std::path::Path,
+        head: &str,
+    ) -> Result<bool> {
+        let slot = format!("issue-{number}");
+        if !self.use_slot_inner(&slot, false) {
+            return Ok(false);
+        }
+        self.auto_issue = Some(number);
+        self.auto_release = None;
+        let result = self.issue_flow(number);
+        let release = self.auto_release.take();
+        let user_quit = self.quit && release.is_none();
+        self.auto_issue = None;
+        if user_quit {
+            return Ok(true);
+        }
+        if let Err(err) = result {
+            let transient = crate::github::failure_is_transient(&err);
+            let reason = format!("{err:#}");
+            self.log_kind(LogKind::Error, reason.clone());
+            if let Err(save_err) = self.record_auto_failure(number, &reason, path, head, transient)
+            {
+                self.log_kind(LogKind::Error, format!("auto state: {save_err:#}"));
+            }
+        } else if let Some(release) = release {
+            if release.code != 0 {
+                if let Err(save_err) = self.record_auto_failure(
+                    number,
+                    &release.message,
+                    path,
+                    head,
+                    release.transient,
+                ) {
+                    self.log_kind(LogKind::Error, format!("auto state: {save_err:#}"));
+                }
+            }
+        }
+        self.prepare_next_issue();
+        Ok(true)
+    }
+
+    fn remember_skip(stored: &mut state::AutoState, skip: &crate::auto::Skip) -> bool {
+        match skip {
+            crate::auto::Skip::Closed { number, pr } if !stored.has_permanent(*number) => {
+                stored.record(
+                    *number,
+                    &format!("pull request #{pr} was closed; not redoing this issue"),
+                    false,
+                    "",
+                    "",
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn skip_line(&self, skip: &crate::auto::Skip) -> String {
+        match skip {
+            crate::auto::Skip::Failed { number, reason } => self.say(
+                &format!("issue #{number} は以前失敗したので飛ばします: {reason}"),
+                &format!("skipping issue #{number}; it failed earlier: {reason}"),
+            ),
+            crate::auto::Skip::OpenPr { number, pr } => self.say(
+                &format!("issue #{number} は開いている PR #{pr} があるので飛ばします。"),
+                &format!("skipping issue #{number}; open PR #{pr} already covers it."),
+            ),
+            crate::auto::Skip::Closed { number, pr } => self.say(
+                &format!("issue #{number} は PR #{pr} が閉じられているのでやり直しません。"),
+                &format!("skipping issue #{number}; pull request #{pr} is closed."),
+            ),
+            crate::auto::Skip::Untrusted {
+                number,
+                author,
+                association,
+            } => self.say(
+                &format!(
+                    "issue #{number} の投稿者 {author}（{association}）は --trust-issues の対象外なので飛ばします。"
+                ),
+                &format!(
+                    "skipping issue #{number}; {author} ({association}) is outside --trust-issues."
+                ),
+            ),
+            crate::auto::Skip::AgentCreated { number } => self.say(
+                &format!(
+                    "issue #{number} はエージェントが gh issue create で開いたので飛ばします。"
+                ),
+                &format!("skipping issue #{number}; the agent created it with gh issue create."),
+            ),
+            crate::auto::Skip::Backoff { number, retry_at } => self.say(
+                &format!(
+                    "issue #{number} は一時的な失敗のあとなので、{retry_at} まで待つか先端が変わるまで飛ばします。"
+                ),
+                &format!(
+                    "skipping issue #{number} until {retry_at}, or until its pull request head changes."
+                ),
+            ),
+            crate::auto::Skip::Busy { number } => self.say(
+                &format!("issue #{number} は別の ghost が作業中なので、この回は飛ばします。"),
+                &format!("another ghost is using issue #{number}; skipping it this round."),
+            ),
+        }
+    }
+
+    fn record_auto_failure(
+        &mut self,
+        number: u64,
+        reason: &str,
+        path: &std::path::Path,
+        head: &str,
+        transient: bool,
+    ) -> Result<()> {
+        let loaded = state::AutoState::load(path)?;
+        if let Some(warning) = loaded.warning {
+            self.log_kind(LogKind::Error, warning);
+        }
+        let mut stored = loaded.state;
+        let attempts = stored.attempts(number).saturating_add(1);
+        let transient = crate::auto::keep_transient(transient, attempts);
+        let retry_at = if transient {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let wait = agent_backoff(attempts).as_secs();
+            crate::auto::format_rfc3339(now.saturating_add(wait))
+        } else {
+            String::new()
+        };
+        let head = if transient { head } else { "" };
+        stored.record(number, reason, transient, &retry_at, head);
+        stored.save(path)?;
+        if transient {
+            self.log(self.say(
+                &format!(
+                    "issue #{number} は一時的な失敗です（{attempts}/{}）。待つか、プルリクエストの先端が変わったらやり直します。",
+                    crate::auto::MAX_TRANSIENT_ATTEMPTS
+                ),
+                &format!(
+                    "issue #{number} failed temporarily ({attempts}/{}). Retrying after a wait, or when the pull request head changes.",
+                    crate::auto::MAX_TRANSIENT_ATTEMPTS
+                ),
+            ));
+        } else if attempts >= crate::auto::MAX_TRANSIENT_ATTEMPTS {
+            self.log(self.say(
+                &format!(
+                    "issue #{number} は {attempts} 回失敗したので、やり直さず記録します。"
+                ),
+                &format!(
+                    "issue #{number} failed {attempts} times, so it stays recorded and is not retried."
+                ),
+            ));
+        } else {
+            self.log(self.say(
+                &format!("issue #{number} を失敗として記録しました。"),
+                &format!("Recorded issue #{number} as failed."),
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_next_issue(&mut self) {
+        self.quit = false;
+        self.turns = 0;
+        self.fail_streak = 0;
+        self.queued.clear();
+        self.delivering_queue = false;
+        self.turn_signal.clear();
+        self.interrupted = false;
+        self.last_idle_sha = None;
+        self.merge_streak = MergeReadyStreak::with_gap(self.spec.interval);
+        self.merge_hold = None;
+        self.code_pr = None;
+        self.code_path = None;
+        self.code_seen.clear();
+        self.code_agent_ids.clear();
+        self.slot_lock = None;
+        self.agent.forget_session();
+        self.status.turns = format!("0/{}", self.spec.max_turns);
+        self.status.session = "—".into();
+        self.push_status();
+    }
+
+    fn handing_off(&self) -> bool {
+        self.spec.mode == RunMode::Auto && self.auto_issue.is_some()
     }
 
     fn poll_pr(&mut self, number: u64) -> Result<Option<PrSnap>> {
@@ -2248,8 +2592,19 @@ impl Ctx {
 
     fn find_pr_after(&mut self, issue: u64, branch: &str) -> Result<Option<u64>> {
         for attempt in 0..3 {
-            if let Some(number) = self.gh.find_issue_pr(issue, branch)? {
-                return Ok(Some(number));
+            match self.gh.find_issue_pr(issue, branch) {
+                Ok(Some(number)) => return Ok(Some(number)),
+                Ok(None) => {}
+                Err(err) if self.handing_off() => {
+                    let transient = crate::github::failure_is_transient(&err);
+                    self.stop_with(
+                        1,
+                        format!("could not look up a pull request for issue #{issue}: {err:#}"),
+                        transient,
+                    );
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
             }
             if attempt == 2 {
                 break;
@@ -2260,9 +2615,14 @@ impl Ctx {
                 return Ok(None);
             }
         }
-        Err(anyhow!(
+        let reason = format!(
             "the agent finished but no pull request for issue #{issue} was found. Expected branch {branch} or a body containing Closes #{issue}."
-        ))
+        );
+        if self.handing_off() {
+            self.stop(1, reason);
+            return Ok(None);
+        }
+        Err(anyhow!(reason))
     }
 
     fn pause(&mut self, dur: Duration) -> bool {
@@ -2296,6 +2656,23 @@ impl Ctx {
     }
 
     fn stop(&mut self, code: i32, message: String) {
+        self.stop_with(code, message, false);
+    }
+
+    fn stop_with(&mut self, code: i32, message: String, transient: bool) {
+        if self.handing_off() && message != "quit" {
+            if !message.is_empty() {
+                self.log(message.clone());
+            }
+            self.auto_release = Some(AutoRelease {
+                code,
+                message,
+                transient,
+            });
+            self.agent.stop();
+            self.quit = true;
+            return;
+        }
         if !message.is_empty() && message != "quit" {
             self.log(message.clone());
         }
@@ -2325,6 +2702,11 @@ impl Ctx {
     }
 
     fn use_slot(&mut self, slot: &str) -> bool {
+        self.use_slot_inner(slot, true)
+    }
+
+    /// `announce` reports a busy lock as a setup failure. `--auto` passes false and skips the issue.
+    fn use_slot_inner(&mut self, slot: &str, announce: bool) -> bool {
         if self.slot_lock.is_some()
             && self.slot_dir.file_name().and_then(|name| name.to_str()) == Some(slot)
         {
@@ -2336,12 +2718,14 @@ impl Ctx {
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf())
         else {
-            self.push_setup_failure(plain_failure(
-                format!("{slot} の作業ディレクトリを決めるため"),
-                "resolve ghost home",
-                format!("{slot} の worktree パスが分かっている状態にしてから作業して"),
-                &anyhow!("work directory has no home"),
-            ));
+            if announce {
+                self.push_setup_failure(plain_failure(
+                    format!("{slot} の作業ディレクトリを決めるため"),
+                    "resolve ghost home",
+                    format!("{slot} の worktree パスが分かっている状態にしてから作業して"),
+                    &anyhow!("work directory has no home"),
+                ));
+            }
             return false;
         };
         let dest = workdir::slot_path(&ghost_home, &self.owner, &self.repo, slot);
@@ -2355,15 +2739,17 @@ impl Ctx {
                 true
             }
             Err(err) => {
-                self.push_setup_failure(plain_failure(
-                    format!("{slot} の作業ディレクトリを排他で使うため"),
-                    format!("flock {}", dest.display()),
-                    format!(
-                        "{} をこのプロセスだけで使える状態にしてから作業して",
-                        dest.display()
-                    ),
-                    &err,
-                ));
+                if announce {
+                    self.push_setup_failure(plain_failure(
+                        format!("{slot} の作業ディレクトリを排他で使うため"),
+                        format!("flock {}", dest.display()),
+                        format!(
+                            "{} をこのプロセスだけで使える状態にしてから作業して",
+                            dest.display()
+                        ),
+                        &err,
+                    ));
+                }
                 false
             }
         }
@@ -2523,7 +2909,9 @@ fn pr_purpose(mode: RunMode, number: u64) -> String {
         RunMode::Code => format!("修正対象の PR #{number}"),
         RunMode::Issue => format!("issue から続く PR #{number}"),
         RunMode::Ask => format!("対象の PR #{number}"),
-        RunMode::Picker => format!("選択された PR #{number}"),
+        RunMode::Picker | RunMode::IssueList | RunMode::Auto => {
+            format!("選択された PR #{number}")
+        }
     }
 }
 
@@ -2599,6 +2987,8 @@ fn mode_name(mode: RunMode) -> &'static str {
         RunMode::Code => "code",
         RunMode::Issue => "issue",
         RunMode::Picker => "picker",
+        RunMode::IssueList => "issues",
+        RunMode::Auto => "auto",
         RunMode::Ask => "pr",
     }
 }
@@ -2618,6 +3008,23 @@ pub fn stop_after_failures(streak: u32) -> bool {
 
 fn label_refs(labels: &[String]) -> Vec<&str> {
     labels.iter().map(String::as_str).collect()
+}
+
+struct AutoRelease {
+    code: i32,
+    message: String,
+    /// Set at the `gh` failure. A reason that merely mentions a branch or an issue number stays false.
+    transient: bool,
+}
+
+enum AutoFetch {
+    Wait(String),
+    Ready {
+        issues: Vec<crate::auto::IssueRow>,
+        prs: Vec<crate::auto::PrLink>,
+        stored: state::AutoState,
+        warning: Option<String>,
+    },
 }
 
 fn short_id(id: &str) -> &str {
@@ -2794,9 +3201,15 @@ mod tests {
         }
     }
 
-    fn merge_ctx(merge_yes: bool) -> (super::Ctx, std::sync::mpsc::Receiver<crate::tui::UiEvent>) {
+    fn merge_ctx(
+        merge_yes: bool,
+    ) -> (
+        super::Ctx,
+        std::sync::mpsc::Receiver<crate::tui::UiEvent>,
+        std::sync::mpsc::Sender<crate::tui::UiCmd>,
+    ) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let home = std::env::temp_dir();
         let target = crate::target::parse_target("github.com/acme/app/pr/1").unwrap();
         let ctx = super::Ctx {
@@ -2813,6 +3226,7 @@ mod tests {
                 lang: Lang::Ja,
                 ssh_key: None,
                 trust: crate::watch::CommentTrust::All,
+                trust_issues: crate::watch::CommentTrust::Collaborators,
             },
             tx,
             rx: cmd_rx,
@@ -2850,8 +3264,10 @@ mod tests {
             code_seen: std::collections::BTreeSet::new(),
             code_agent_ids: std::collections::BTreeSet::new(),
             state_root: home,
+            auto_issue: None,
+            auto_release: None,
         };
-        (ctx, rx)
+        (ctx, rx, cmd_tx)
     }
 
     fn write_exe(path: &std::path::Path, body: &str) {
@@ -2863,6 +3279,34 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).unwrap();
         }
+    }
+
+    #[test]
+    fn auto_moves_on_without_leaving_the_process() {
+        let (mut ctx, rx, _cmd) = merge_ctx(false);
+        ctx.spec.mode = super::RunMode::Auto;
+        ctx.auto_issue = Some(4);
+        ctx.stop(0, "Exiting without merging PR #9.".into());
+        assert!(ctx.quit);
+        assert_eq!(ctx.auto_release.as_ref().map(|row| row.code), Some(0));
+        let mut saw_exit = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, crate::tui::UiEvent::Exit { .. }) {
+                saw_exit = true;
+            }
+        }
+        assert!(!saw_exit, "a finished issue returns to --auto");
+        ctx.auto_issue = None;
+        ctx.prepare_next_issue();
+        assert!(!ctx.quit);
+        ctx.stop(0, "quit".into());
+        saw_exit = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, crate::tui::UiEvent::Exit { .. }) {
+                saw_exit = true;
+            }
+        }
+        assert!(saw_exit, "q still leaves ghost");
     }
 
     /// `merge_now` re-reads the head. A moved SHA must not call `gh pr merge`.
@@ -2915,7 +3359,7 @@ mod tests {
         };
         std::fs::write(&view, ready("def")).unwrap();
         let _ = std::fs::remove_file(&marker);
-        let (mut ctx, rx) = merge_ctx(true);
+        let (mut ctx, rx, _cmd) = merge_ctx(true);
         let merged = ctx
             .merge_now(1, "abc", crate::tui::MergeStyle::Squash)
             .unwrap();
@@ -2927,7 +3371,7 @@ mod tests {
         assert!(rx.try_recv().is_err() || !marker.exists());
 
         std::fs::write(&view, ready("abc")).unwrap();
-        let (mut ctx, rx) = merge_ctx(true);
+        let (mut ctx, rx, _cmd) = merge_ctx(true);
         let merged = ctx
             .merge_now(1, "abc", crate::tui::MergeStyle::Squash)
             .unwrap();
@@ -2947,7 +3391,7 @@ mod tests {
             "GHOST_TEST_MERGE_ERR",
             "GraphQL: Squash merges are not allowed on this repository",
         );
-        let (mut ctx, rx) = merge_ctx(true);
+        let (mut ctx, rx, _cmd) = merge_ctx(true);
         let merged = ctx
             .merge_now(1, "abc", crate::tui::MergeStyle::Squash)
             .unwrap();
@@ -2966,6 +3410,291 @@ mod tests {
             "method rejection must name the flag and not guess another method: {message}"
         );
         assert!(message.contains("--merge-method") || message.contains("m "));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_fetch_logs_a_502_and_does_not_exit() {
+        let _lock = path_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-auto-502-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_exe(&dir.join("gh"), "#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n");
+        let old_path = std::env::var("PATH").ok();
+        let _path = RestoreVar("PATH", old_path.clone());
+        let mut path = dir.display().to_string();
+        if let Some(old) = &old_path {
+            path.push(':');
+            path.push_str(old);
+        }
+        std::env::set_var("PATH", &path);
+
+        let (mut ctx, rx, _cmd) = merge_ctx(false);
+        ctx.spec.mode = super::RunMode::Auto;
+        let state = dir.join("auto.json");
+        let fetched = ctx.fetch_auto(&state);
+        let message = match fetched {
+            super::AutoFetch::Wait(message) => message,
+            super::AutoFetch::Ready { .. } => panic!("a failing gh must wait, not stop"),
+        };
+        assert!(message.contains("502"), "{message}");
+        ctx.note_auto_wait(message);
+        assert!(!ctx.quit, "one 502 does not end --auto");
+        let mut saw_exit = false;
+        let mut saw_502 = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                crate::tui::UiEvent::Exit { .. } | crate::tui::UiEvent::Fatal(_) => {
+                    saw_exit = true;
+                }
+                crate::tui::UiEvent::Log(line) if line.text.contains("502") => saw_502 = true,
+                _ => {}
+            }
+        }
+        assert!(saw_502, "the 502 is logged");
+        assert!(!saw_exit, "the 502 is not fatal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_auto_instances_do_not_take_the_same_issue() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-auto-slot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = dir.join("ghost-home");
+        let main = home.join("work").join("acme__app");
+        std::fs::create_dir_all(&main).unwrap();
+        let slot = crate::workdir::slot_path(&home, "acme", "app", "issue-9");
+        let held = crate::workdir::lock_slot(&slot).unwrap();
+        let (mut ctx, rx, _cmd) = merge_ctx(false);
+        ctx.spec.mode = super::RunMode::Auto;
+        ctx.owner = "acme".into();
+        ctx.repo = "app".into();
+        ctx.main_clone = main.clone();
+        ctx.workdir = main.clone();
+        ctx.slot_dir = main;
+        let state = dir.join("auto.json");
+        let started = ctx.begin_auto_issue(9, &state, "").unwrap();
+        assert!(!started, "a held issue-9 lock is skipped this round");
+        assert!(ctx.auto_issue.is_none());
+        assert!(
+            ctx.setup_failures.is_empty(),
+            "a busy lock is not a failure"
+        );
+        assert!(!state.exists(), "skipping does not record a failure");
+        assert!(!ctx.quit);
+        assert!(rx.try_recv().is_err() || !ctx.quit);
+        drop(held);
+        assert!(
+            ctx.use_slot_inner("issue-9", false),
+            "the issue is free once the other ghost leaves"
+        );
+        assert!(ctx.slot_lock.is_some());
+        assert_ne!(ctx.workdir, ctx.main_clone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_issues_page_past_one_hundred() {
+        let _lock = path_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-auto-page-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page1 = dir.join("page1.json");
+        let page2 = dir.join("page2.json");
+        let mut nodes = Vec::new();
+        for number in 1..=100 {
+            nodes.push(format!(
+                r#"{{"number":{number},"title":"t{number}","createdAt":"2020-01-01T00:00:00Z","authorAssociation":"OWNER","author":{{"__typename":"User","login":"ada"}},"labels":{{"nodes":[]}}}}"#
+            ));
+        }
+        std::fs::write(
+            &page1,
+            format!(
+                r#"{{"data":{{"repository":{{"issues":{{"pageInfo":{{"hasNextPage":true,"endCursor":"PAGE2"}},"nodes":[{}]}}}}}}}}"#,
+                nodes.join(",")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &page2,
+            r#"{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"number":250,"title":"later","createdAt":"2024-01-01T00:00:00Z","authorAssociation":"COLLABORATOR","author":{"__typename":"User","login":"bea"},"labels":{"nodes":[]}}]}}}}"#,
+        )
+        .unwrap();
+        write_exe(
+            &dir.join("gh"),
+            "#!/bin/sh\ncase \" $* \" in\n  *cursor=PAGE2*) cat \"$GHOST_TEST_PAGE2\"; exit 0 ;;\nesac\ncat \"$GHOST_TEST_PAGE1\"\nexit 0\n",
+        );
+        let old_path = std::env::var("PATH").ok();
+        let _path = RestoreVar("PATH", old_path.clone());
+        let mut path = dir.display().to_string();
+        if let Some(old) = &old_path {
+            path.push(':');
+            path.push_str(old);
+        }
+        std::env::set_var("PATH", &path);
+        let _page1 = RestoreVar("GHOST_TEST_PAGE1", std::env::var("GHOST_TEST_PAGE1").ok());
+        let _page2 = RestoreVar("GHOST_TEST_PAGE2", std::env::var("GHOST_TEST_PAGE2").ok());
+        std::env::set_var("GHOST_TEST_PAGE1", &page1);
+        std::env::set_var("GHOST_TEST_PAGE2", &page2);
+        let rows = crate::github::Gh::new("acme/app").auto_issues().unwrap();
+        assert!(
+            rows.len() > 100,
+            "the second page is fetched, got {}",
+            rows.len()
+        );
+        assert_eq!(rows.last().map(|row| row.number), Some(250));
+        assert_eq!(
+            rows.last().map(|row| row.association.as_str()),
+            Some("COLLABORATOR")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `auto_loop` with a stub `gh` and a stub agent. Issue #502's title mentions
+    /// timeout, connection, and rate limit; the missing pull request is not a GitHub blip.
+    #[test]
+    fn auto_loop_with_stub_gh_and_agent_does_not_retry_a_titled_timeout() {
+        let _lock = path_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-auto-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = dir.join("ghost-home");
+        let main = home.join("work").join("acme__app");
+        std::fs::create_dir_all(&main).unwrap();
+        let state_root = dir.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let gh = dir.join("gh");
+        write_exe(
+            &gh,
+            r#"#!/bin/sh
+case " $* " in
+  *" graphql "*)
+    case " $* " in
+      *pullRequests*)
+        printf '%s\n' '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}'
+        ;;
+      *)
+        printf '%s\n' '{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"number":502,"title":"fix timeout connection rate limit","createdAt":"2020-01-01T00:00:00Z","authorAssociation":"OWNER","author":{"__typename":"User","login":"ada"},"labels":{"nodes":[]}}]}}}}'
+        ;;
+    esac
+    exit 0
+    ;;
+  *" repo view "*)
+    printf '%s\n' '{"defaultBranchRef":{"name":"main"}}'
+    exit 0
+    ;;
+  *" closedByPullRequestsReferences "*)
+    printf '%s\n' '{}'
+    exit 0
+    ;;
+  *" issue view "*)
+    printf '%s\n' '{"number":502,"title":"fix timeout connection rate limit","body":"connection rate limit","state":"OPEN","labels":[]}'
+    exit 0
+    ;;
+esac
+printf '%s\n' '[]'
+exit 0
+"#,
+        );
+        let agent = dir.join("agent");
+        write_exe(&agent, "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+        let old_path = std::env::var("PATH").ok();
+        let _path = RestoreVar("PATH", old_path.clone());
+        let mut path = dir.display().to_string();
+        if let Some(old) = &old_path {
+            path.push(':');
+            path.push_str(old);
+        }
+        std::env::set_var("PATH", &path);
+
+        let (mut ctx, rx, cmd_tx) = merge_ctx(false);
+        ctx.spec.mode = super::RunMode::Auto;
+        ctx.spec.interval = Duration::from_secs(30);
+        ctx.spec.lang = Lang::En;
+        ctx.spec.yes = false;
+        ctx.spec.trust = crate::watch::CommentTrust::All;
+        ctx.spec.trust_issues = crate::watch::CommentTrust::Collaborators;
+        ctx.owner = "acme".into();
+        ctx.repo = "app".into();
+        ctx.slug = "acme/app".into();
+        ctx.gh = crate::github::Gh::new("acme/app");
+        ctx.main_clone = main.clone();
+        ctx.workdir = main.clone();
+        ctx.slot_dir = main;
+        ctx.state_root = state_root.clone();
+        ctx.agent.set_stub(agent);
+        let state_file = state_root.join("acme__app").join("auto.json");
+        let watch = state_file.clone();
+        let quit_tx = cmd_tx.clone();
+        let watcher = std::thread::spawn(move || {
+            for _ in 0..400 {
+                if let Ok(text) = std::fs::read_to_string(&watch) {
+                    if text.contains("502") {
+                        let _ = quit_tx.send(crate::tui::UiCmd::Quit);
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = quit_tx.send(crate::tui::UiCmd::Quit);
+        });
+        ctx.auto_loop().unwrap();
+        watcher.join().unwrap();
+        let raw = std::fs::read_to_string(&state_file).expect("auto.json records the miss");
+        let stored: crate::state::AutoState = serde_json::from_str(&raw).unwrap();
+        let row = stored
+            .failed
+            .iter()
+            .find(|row| row.number == 502)
+            .expect("issue 502 is recorded");
+        assert!(
+            !row.transient,
+            "title words and #502 must not be a transient retry: {raw}"
+        );
+        assert!(row.reason.contains("timeout"), "{raw}");
+        assert!(row.reason.contains("502"), "{raw}");
+        assert!(row.reason.contains("connection"), "{raw}");
+        assert!(
+            row.reason.contains("rate-limit") || row.reason.contains("rate limit"),
+            "{raw}"
+        );
+        let mut saw_fatal = false;
+        let mut saw_temporary = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                crate::tui::UiEvent::Fatal(_) => saw_fatal = true,
+                crate::tui::UiEvent::Exit { code, .. } => assert_eq!(code, 0),
+                crate::tui::UiEvent::Log(line) if line.text.contains("temporarily") => {
+                    saw_temporary = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(!saw_fatal, "--auto does not exit on this miss");
+        assert!(!saw_temporary, "the miss is not retried as a GitHub blip");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

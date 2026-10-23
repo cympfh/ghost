@@ -4,6 +4,7 @@
 //! updates are follow-ups in that same session (`--resume` / `exec resume`).
 
 pub mod agent;
+pub mod auto;
 pub mod cli;
 pub mod demo;
 pub mod engine;

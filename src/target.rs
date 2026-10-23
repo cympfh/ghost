@@ -15,20 +15,29 @@ pub enum GhTarget {
         repo: String,
         number: u64,
     },
+    /// `github.com/OWNER/REPO/issues` with no number. Open issues only.
+    Issues {
+        owner: String,
+        repo: String,
+    },
 }
 
 impl GhTarget {
     pub fn owner(&self) -> &str {
         match self {
-            Self::Repo { owner, .. } | Self::Pull { owner, .. } | Self::Issue { owner, .. } => {
-                owner
-            }
+            Self::Repo { owner, .. }
+            | Self::Pull { owner, .. }
+            | Self::Issue { owner, .. }
+            | Self::Issues { owner, .. } => owner,
         }
     }
 
     pub fn repo(&self) -> &str {
         match self {
-            Self::Repo { repo, .. } | Self::Pull { repo, .. } | Self::Issue { repo, .. } => repo,
+            Self::Repo { repo, .. }
+            | Self::Pull { repo, .. }
+            | Self::Issue { repo, .. }
+            | Self::Issues { repo, .. } => repo,
         }
     }
 
@@ -50,6 +59,7 @@ impl GhTarget {
                 repo,
                 number,
             } => format!("github.com/{owner}/{repo}/issue/{number}"),
+            Self::Issues { owner, repo } => format!("github.com/{owner}/{repo}/issues"),
         }
     }
 }
@@ -69,19 +79,20 @@ pub fn parse_target(input: &str) -> Result<GhTarget, String> {
     let rest = rest.strip_prefix("www.").unwrap_or(rest);
     let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
 
-    let (owner, repo, extra): (&str, &str, &[&str]) =
-        if parts.first().copied() == Some("github.com") {
-            if parts.len() < 3 {
-                return Err(format!("expected github.com/OWNER/REPO, got `{input}`"));
-            }
-            (parts[1], strip_git(parts[2]), &parts[3..])
-        } else if parts.len() >= 2 && !parts[0].contains('.') {
-            (parts[0], strip_git(parts[1]), &parts[2..])
-        } else {
-            return Err(format!(
-                "not a github.com URL: `{input}` (expected github.com/OWNER/REPO[/pr/N|/issue/N])"
+    let (owner, repo, extra): (&str, &str, &[&str]) = if parts.first().copied()
+        == Some("github.com")
+    {
+        if parts.len() < 3 {
+            return Err(format!("expected github.com/OWNER/REPO, got `{input}`"));
+        }
+        (parts[1], strip_git(parts[2]), &parts[3..])
+    } else if parts.len() >= 2 && !parts[0].contains('.') {
+        (parts[0], strip_git(parts[1]), &parts[2..])
+    } else {
+        return Err(format!(
+                "not a github.com URL: `{input}` (expected github.com/OWNER/REPO[/pr/N|/issue/N|/issues])"
             ));
-        };
+    };
 
     validate_name("owner", owner)?;
     validate_name("repo", repo)?;
@@ -100,8 +111,9 @@ pub fn parse_target(input: &str) -> Result<GhTarget, String> {
             repo,
             number: parse_number(n)?,
         }),
+        [kind] if matches!(*kind, "issue" | "issues") => Ok(GhTarget::Issues { owner, repo }),
         _ => Err(format!(
-            "unsupported GitHub URL `{input}` (use /pr/N, /pull/N, /issue/N, or the repo root)"
+            "unsupported GitHub URL `{input}` (use /pr/N, /pull/N, /issue/N, /issues, or the repo root)"
         )),
     }
 }
@@ -195,6 +207,26 @@ mod tests {
         assert_eq!(
             parse_target("cympfh/xxx/pr/9").unwrap(),
             pull("cympfh", "xxx", 9)
+        );
+        assert_eq!(
+            parse_target("github.com/cympfh/xxx/issues").unwrap(),
+            GhTarget::Issues {
+                owner: "cympfh".into(),
+                repo: "xxx".into(),
+            }
+        );
+        assert_eq!(
+            parse_target("https://github.com/cympfh/xxx/issue/").unwrap(),
+            GhTarget::Issues {
+                owner: "cympfh".into(),
+                repo: "xxx".into(),
+            }
+        );
+        assert_eq!(
+            parse_target("github.com/cympfh/xxx/issues")
+                .unwrap()
+                .display_url(),
+            "github.com/cympfh/xxx/issues"
         );
     }
 

@@ -406,7 +406,7 @@ pub fn issue_initial(
              まだ PR が無ければ `gh` で開く:\n\
              `gh pr create --repo {slug} --base {base} --head {branch} --title \"...\" --body-file <file>`\n\
              PR 本文には、マージで issue が自動クローズされるよう、必ず次の行を入れる: `Closes #{number}`\n\
-             その PR が既にあるなら重複して開かない。マージしない。\n\
+             その PR が既にあるなら重複して開かない。マージしない。新しい issue は開かない。\n\
              詳細が要るときは `gh issue view {number} --repo {slug}` を読む。\n"
         ),
         Lang::En => format!(
@@ -421,7 +421,7 @@ pub fn issue_initial(
              Open a pull request with `gh` if one does not already exist:\n\
              `gh pr create --repo {slug} --base {base} --head {branch} --title \"...\" --body-file <file>`\n\
              The pull request body must include a GitHub closing keyword line `Closes #{number}` so merging auto-closes the issue.\n\
-             Do not open a duplicate if that pull request already exists. Do not merge.\n\
+             Do not open a duplicate if that pull request already exists. Do not merge. Do not open a new issue.\n\
              Read the issue with `gh issue view {number} --repo {slug}` if you need more detail.\n"
         ),
     };
@@ -456,7 +456,7 @@ pub fn issue_situation(
              Issue body:\n{body}\n\n\
              ブランチ `{branch}`（base `{base}`）の今の状態、PR の説明、diff、CI、レビューコメントを `gh` で読む。\
              要約し、残作業があれば続ける。無ければその旨を報告して終わる。\n\
-             マージしない。`Closes #{number}` が PR 本文に無ければ足す。\n"
+             マージしない。新しい issue は開かない。`Closes #{number}` が PR 本文に無ければ足す。\n"
         ),
         Lang::En => format!(
             "This is the launch situation check. Do not rely on saved state about what is new since last time.\n\
@@ -465,7 +465,7 @@ pub fn issue_situation(
              Issue body:\n{body}\n\n\
              Use `gh` to read branch `{branch}` (base `{base}`) as it is now, plus the pull request description, diff, CI, and review comments.\
              Summarize. Continue any remaining work, or report that nothing remains and stop.\n\
-             Do not merge. Add `Closes #{number}` to the pull request body if it is missing.\n"
+             Do not merge. Do not open a new issue. Add `Closes #{number}` to the pull request body if it is missing.\n"
         ),
     };
     format!(
@@ -549,10 +549,10 @@ pub fn user_nudge(lang: Lang, text: &str, during_turn: bool) -> String {
 pub fn issue_resume_prefix(lang: Lang, number: u64, branch: &str) -> String {
     match lang {
         Lang::Ja => format!(
-            "同じセッションの follow-up です。issue #{number} の実装をブランチ `{branch}` で続ける。`Closes #{number}` を本文に含むプルリクエストがあることを確認する。重複して開かない。マージしない。\n\n"
+            "同じセッションの follow-up です。issue #{number} の実装をブランチ `{branch}` で続ける。`Closes #{number}` を本文に含むプルリクエストがあることを確認する。重複して開かない。マージしない。新しい issue は開かない。\n\n"
         ),
         Lang::En => format!(
-            "Follow-up in this same session. Continue implementing issue #{number} on `{branch}` and make sure a pull request whose body contains `Closes #{number}` exists. Do not open a duplicate. Do not merge.\n\n"
+            "Follow-up in this same session. Continue implementing issue #{number} on `{branch}` and make sure a pull request whose body contains `Closes #{number}` exists. Do not open a duplicate. Do not merge. Do not open a new issue.\n\n"
         ),
     }
 }
@@ -777,6 +777,7 @@ mod tests {
             Lang::En,
         );
         assert!(issue.contains("Closes #7"));
+        assert!(issue.contains("Do not open a new issue"));
         assert!(issue.contains("gh pr create"));
         assert!(issue.contains("gh issue view"));
         assert!(issue.contains("fix/12-crash-on-empty-config"));
@@ -802,6 +803,7 @@ mod tests {
         assert!(issue.contains("Closes #7"));
         assert!(issue.contains("fix/12-crash-on-empty-config"));
         assert!(issue.contains("マージしない"));
+        assert!(issue.contains("新しい issue は開かない"));
         assert!(!issue.contains("ghost/issue"));
         assert!(issue.contains("コーディング担当"));
         let survey = code_survey(

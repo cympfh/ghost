@@ -22,6 +22,7 @@ Examples:
   ghost github.com/owner/repo/pr/3 -r
   ghost github.com/owner/repo/pr/3 -c -i 20s
   ghost github.com/owner/repo/issue/7 -y -l ja
+  ghost github.com/owner/repo/issues --auto
   ghost -d review
 
 GitHub access is only through the `gh` CLI. One agent session is started for the
@@ -31,10 +32,11 @@ The default poll interval is 20s (`-i`). `-l` / `--lang` defaults to ja.
 `-h` prints help and `-V` prints the version.
 Launch always starts the agent for a situation check, even when nothing is new.
 Later polls with nothing new do not call the agent. `i` always delivers text to the agent.
-`--merge-yes` (no short flag) merges in --code or issue mode after a re-check. `-y` does not merge."
+`--merge-yes` (no short flag) merges in --code, issue, or --auto mode after a re-check. `-y` does not merge.
+`--auto` is only valid with /issues. It takes the oldest open issue on each check and keeps waiting when none are left."
 )]
 struct Cli {
-    /// github.com/OWNER/REPO, .../pr/N, or .../issue/N
+    /// github.com/OWNER/REPO, .../pr/N, .../issue/N, or .../issues
     target: Option<String>,
 
     /// Review the pull request when its head SHA changes.
@@ -44,6 +46,10 @@ struct Cli {
     /// Update the pull request when CI fails or new review comments appear.
     #[arg(long, short = 'c', conflicts_with = "review")]
     code: bool,
+
+    /// With /issues, take the oldest open issue on each check. No picker.
+    #[arg(long)]
+    auto: bool,
 
     /// How often to poll `gh`. Default 20s. First check is immediate.
     /// Examples: 20s, 30s, 2m, 1h30m, or a bare number of seconds.
@@ -59,7 +65,7 @@ struct Cli {
     #[arg(long, short = 'y')]
     yes: bool,
 
-    /// Merge when --code or issue mode is merge-ready, after a fresh re-check.
+    /// Merge when --code, issue, or --auto is merge-ready, after a fresh re-check.
     /// No short flag. Does not apply to --review, the picker, or ask-without---code.
     #[arg(long)]
     merge_yes: bool,
@@ -85,11 +91,15 @@ struct Cli {
     #[arg(long, short = 'k')]
     ssh_key: Option<String>,
 
-    /// Who may wake --code, besides the PR author and repo owner.
-    /// Default: all authors (humans, Copilot, other bots, outsiders).
-    /// `collaborators` or `contributors` still restricts.
-    #[arg(long, short = 't', value_enum, default_value_t = CommentTrust::All)]
-    trust_comments: CommentTrust,
+    /// Who may wake --code, including review comments during an issue and during --code.
+    /// Default: all.
+    #[arg(long, short = 't', value_enum)]
+    trust_comments: Option<CommentTrust>,
+
+    /// Which issue authors --auto may run.
+    /// Default: collaborators (OWNER, MEMBER, COLLABORATOR).
+    #[arg(long, value_enum)]
+    trust_issues: Option<CommentTrust>,
 }
 
 pub fn run() -> Result<i32> {
@@ -105,6 +115,7 @@ pub fn run() -> Result<i32> {
         cli.target.as_deref(),
         cli.review,
         cli.code,
+        cli.auto,
         &cli.interval,
         cli.agent,
         cli.yes,
@@ -114,6 +125,7 @@ pub fn run() -> Result<i32> {
         lang,
         ssh_key,
         cli.trust_comments,
+        cli.trust_issues,
         cli.merge_yes,
         cli.merge_method
             .map(MergeMethod::gh_flag)
@@ -139,6 +151,7 @@ fn resolve(
     target: Option<&str>,
     review: bool,
     code: bool,
+    auto: bool,
     interval: &str,
     agent: Option<AgentKind>,
     yes: bool,
@@ -147,11 +160,15 @@ fn resolve(
     header: String,
     lang: Lang,
     ssh_key: Option<String>,
-    trust: CommentTrust,
+    trust: Option<CommentTrust>,
+    trust_issues: Option<CommentTrust>,
     merge_yes: bool,
     merge_method: Option<String>,
 ) -> Result<Action, String> {
     if let Some(scene) = demo {
+        if auto {
+            return Err("--auto cannot be combined with --demo".into());
+        }
         if target.is_some() || review || code {
             return Err("pass either a GitHub URL or --demo, not both".into());
         }
@@ -161,17 +178,24 @@ fn resolve(
         });
     }
     let Some(target_raw) = target else {
-        return Err("missing GitHub URL (github.com/OWNER/REPO[/pr/N|/issue/N])".into());
+        return Err(if auto {
+            "--auto needs github.com/OWNER/REPO/issues".into()
+        } else {
+            "missing GitHub URL (github.com/OWNER/REPO[/pr/N|/issue/N|/issues])".into()
+        });
     };
     if max_iterations == 0 {
         return Err("--max-iterations must be at least 1".into());
     }
     let interval = parse_interval(interval)?;
     let target = parse_target(target_raw)?;
-    let mode = mode_for(&target, review, code)?;
-    if (merge_yes || merge_method.is_some()) && !matches!(mode, RunMode::Code | RunMode::Issue) {
+    let mode = mode_for(&target, review, code, auto)?;
+    if (merge_yes || merge_method.is_some())
+        && !matches!(mode, RunMode::Code | RunMode::Issue | RunMode::Auto)
+    {
         return Err(
-            "--merge-yes and --merge-method are only valid with --code or an issue URL".into(),
+            "--merge-yes and --merge-method are only valid with --code, an issue URL, or --auto"
+                .into(),
         );
     }
     Ok(Action::Run(RunSpec {
@@ -186,7 +210,8 @@ fn resolve(
         max_turns: max_iterations,
         lang,
         ssh_key,
-        trust,
+        trust: trust.unwrap_or(CommentTrust::All),
+        trust_issues: trust_issues.unwrap_or(CommentTrust::Collaborators),
     }))
 }
 
@@ -207,9 +232,12 @@ impl MergeMethod {
     }
 }
 
-fn mode_for(target: &GhTarget, review: bool, code: bool) -> Result<RunMode, String> {
+fn mode_for(target: &GhTarget, review: bool, code: bool, auto: bool) -> Result<RunMode, String> {
     match target {
         GhTarget::Repo { .. } => {
+            if auto {
+                return Err("--auto is only valid with github.com/OWNER/REPO/issues".into());
+            }
             if review || code {
                 return Err(
                     "a repository URL opens the picker. Pass a /pr/N URL to use --review or --code."
@@ -218,7 +246,23 @@ fn mode_for(target: &GhTarget, review: bool, code: bool) -> Result<RunMode, Stri
             }
             Ok(RunMode::Picker)
         }
+        GhTarget::Issues { .. } => {
+            if review || code {
+                return Err(
+                    "a /issues URL lists open issues. Pass /issue/N to implement one, or add --auto."
+                        .into(),
+                );
+            }
+            if auto {
+                Ok(RunMode::Auto)
+            } else {
+                Ok(RunMode::IssueList)
+            }
+        }
         GhTarget::Issue { .. } => {
+            if auto {
+                return Err("--auto is only valid with github.com/OWNER/REPO/issues".into());
+            }
             if review {
                 return Err(
                     "--review applies to a pull request. An issue is implemented, then ghost can continue as --code."
@@ -228,6 +272,9 @@ fn mode_for(target: &GhTarget, review: bool, code: bool) -> Result<RunMode, Stri
             Ok(RunMode::Issue)
         }
         GhTarget::Pull { .. } => {
+            if auto {
+                return Err("--auto is only valid with github.com/OWNER/REPO/issues".into());
+            }
             if review {
                 Ok(RunMode::Review)
             } else if code {
@@ -302,6 +349,7 @@ mod tests {
         // Skip argv0-style; resolve is what we test.
         let review = args.contains(&"--review");
         let code = args.contains(&"--code");
+        let auto = args.contains(&"--auto");
         let yes = args.contains(&"--yes") || args.contains(&"-y");
         let merge_yes = args.contains(&"--merge-yes");
         let merge_method = args
@@ -322,6 +370,7 @@ mod tests {
             target,
             review,
             code,
+            auto,
             "5m",
             None,
             yes,
@@ -330,7 +379,8 @@ mod tests {
             "ghost".into(),
             Lang::Ja,
             None,
-            CommentTrust::Collaborators,
+            None,
+            None,
             merge_yes,
             merge_method,
         )
@@ -355,6 +405,8 @@ mod tests {
             "--merge-method",
             "-n, --max-iterations",
             "-t, --trust-comments",
+            "--trust-issues",
+            "--auto",
             "-d, --demo",
             "-h, --help",
             "-V, --version",
@@ -365,7 +417,15 @@ mod tests {
             !help.contains(", --merge-yes"),
             "--merge-yes must not have a short flag\n{help}"
         );
+        assert!(
+            !help.contains(", --auto"),
+            "--auto must not have a short flag\n{help}"
+        );
         assert!(!help.contains(", --merge-method"));
+        assert!(
+            !help.contains(", --trust-issues"),
+            "--trust-issues must not have a short flag\n{help}"
+        );
 
         let cli = Cli::try_parse_from([
             "ghost",
@@ -394,9 +454,9 @@ mod tests {
         assert_eq!(cli.lang, Lang::En);
         assert!(cli.yes);
         assert_eq!(cli.max_iterations, 4);
-        assert_eq!(cli.trust_comments, CommentTrust::All);
+        assert_eq!(cli.trust_comments, Some(CommentTrust::All));
         let default_trust = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "-c"]).unwrap();
-        assert_eq!(default_trust.trust_comments, CommentTrust::All);
+        assert!(default_trust.trust_comments.is_none());
 
         let review = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "-r"]).unwrap();
         assert!(review.review);
@@ -415,6 +475,7 @@ mod tests {
             Some("github.com/a/b/pr/1"),
             true,
             false,
+            false,
             &cli.interval,
             None,
             false,
@@ -423,7 +484,8 @@ mod tests {
             "ghost".into(),
             cli.lang,
             None,
-            CommentTrust::Collaborators,
+            None,
+            None,
             false,
             None,
         )
@@ -486,6 +548,7 @@ mod tests {
             Some("github.com/a/b/pr/1"),
             true,
             false,
+            false,
             "5m",
             None,
             false,
@@ -494,7 +557,8 @@ mod tests {
             "ghost".into(),
             Lang::Ja,
             None,
-            CommentTrust::Collaborators,
+            None,
+            None,
             false,
             None,
         )
@@ -502,6 +566,7 @@ mod tests {
         assert!(resolve(
             Some("github.com/a/b/pr/1"),
             true,
+            false,
             false,
             "nope",
             None,
@@ -511,7 +576,8 @@ mod tests {
             "ghost".into(),
             Lang::En,
             None,
-            CommentTrust::Collaborators,
+            None,
+            None,
             false,
             None,
         )
@@ -552,5 +618,175 @@ mod tests {
         .unwrap();
         assert!(cli.merge_yes);
         assert!(matches!(cli.merge_method, Some(MergeMethod::Rebase)));
+    }
+
+    #[test]
+    fn auto_is_only_for_the_issues_list() {
+        assert!(matches!(
+            go(&["github.com/a/b/issues"]).unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::IssueList,
+                ..
+            })
+        ));
+        assert!(matches!(
+            go(&["github.com/a/b/issue"]).unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::IssueList,
+                ..
+            })
+        ));
+        assert!(matches!(
+            go(&[
+                "github.com/a/b/issues",
+                "--auto",
+                "--yes",
+                "--merge-yes",
+                "--merge-method",
+                "squash"
+            ])
+            .unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::Auto,
+                yes: true,
+                merge_yes: true,
+                merge_method: Some(method),
+                ..
+            }) if method == "--squash"
+        ));
+        assert!(go(&["github.com/a/b", "--auto"]).is_err());
+        assert!(go(&["github.com/a/b/pr/3", "--auto"]).is_err());
+        assert!(go(&["github.com/a/b/issue/7", "--auto"]).is_err());
+        assert!(go(&["github.com/a/b/issues", "--review"]).is_err());
+        assert!(go(&["github.com/a/b/issues", "--code"]).is_err());
+        assert!(go(&["github.com/a/b/issues", "--merge-yes"]).is_err());
+        assert!(go(&["github.com/a/b/pr/3", "--review", "--merge-yes"]).is_err());
+        assert!(go(&["--auto"]).is_err());
+        let cli = Cli::try_parse_from(["ghost", "github.com/a/b/issues", "--auto"]).unwrap();
+        assert!(cli.auto);
+        match resolve(
+            Some("github.com/a/b/issues"),
+            false,
+            false,
+            true,
+            "20s",
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+        {
+            Action::Run(spec) => {
+                assert_eq!(spec.trust, CommentTrust::All);
+                assert_eq!(spec.trust_issues, CommentTrust::Collaborators);
+            }
+            Action::Demo { .. } => panic!("expected a run"),
+        }
+        match resolve(
+            Some("github.com/a/b/pr/3"),
+            false,
+            true,
+            false,
+            "20s",
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+        {
+            Action::Run(spec) => assert_eq!(spec.trust, CommentTrust::All),
+            Action::Demo { .. } => panic!("expected a run"),
+        }
+        match resolve(
+            Some("github.com/a/b/issues"),
+            false,
+            false,
+            true,
+            "20s",
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            Some(CommentTrust::All),
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+        {
+            Action::Run(spec) => {
+                assert_eq!(spec.trust, CommentTrust::All);
+                assert_eq!(spec.trust_issues, CommentTrust::Collaborators);
+            }
+            Action::Demo { .. } => panic!("expected a run"),
+        }
+        match resolve(
+            Some("github.com/a/b/issue/4"),
+            false,
+            false,
+            false,
+            "20s",
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+        {
+            Action::Run(spec) => assert_eq!(spec.trust, CommentTrust::All),
+            Action::Demo { .. } => panic!("expected a run"),
+        }
+        match resolve(
+            Some("github.com/a/b/issues"),
+            false,
+            false,
+            true,
+            "20s",
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            None,
+            Some(CommentTrust::All),
+            false,
+            None,
+        )
+        .unwrap()
+        {
+            Action::Run(spec) => {
+                assert_eq!(spec.trust, CommentTrust::All);
+                assert_eq!(spec.trust_issues, CommentTrust::All);
+            }
+            Action::Demo { .. } => panic!("expected a run"),
+        }
     }
 }
