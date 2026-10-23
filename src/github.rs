@@ -157,7 +157,8 @@ impl Gh {
             "--limit".into(),
             "50".into(),
             "--json".into(),
-            "number,title,author,labels,reviewDecision,statusCheckRollup,headRefName,url".into(),
+            "number,title,author,labels,reviewDecision,statusCheckRollup,headRefName,url,state"
+                .into(),
         ])?;
         ensure_ok("gh pr list", &out)?;
         parse_pr_list(&out.stdout).map_err(|e| anyhow!(e))
@@ -942,7 +943,7 @@ pub fn parse_pr_list(json: &str) -> Result<Vec<OpenItem>, String> {
     let mut items = Vec::new();
     for v in arr {
         let number = v.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
-        if number == 0 {
+        if number == 0 || !listed_open(&v) {
             continue;
         }
         let rollup = v
@@ -971,6 +972,14 @@ pub fn parse_pr_list(json: &str) -> Result<Vec<OpenItem>, String> {
         });
     }
     Ok(items)
+}
+
+/// Missing `state` stays (callers already asked `gh` for open). Anything else must say open.
+fn listed_open(v: &Value) -> bool {
+    match v.get("state").and_then(|s| s.as_str()) {
+        None => true,
+        Some(state) => state.eq_ignore_ascii_case("open"),
+    }
 }
 
 pub fn parse_issue_list(json: &str) -> Result<Vec<OpenItem>, String> {
@@ -1289,6 +1298,23 @@ mod tests {
         let issues = parse_issue_list(issues).unwrap();
         assert_eq!(issues[0].kind, ItemKind::Issue);
         assert!(issues[0].ci.is_none());
+    }
+
+    #[test]
+    fn pull_picker_keeps_open_pull_requests_only() {
+        let json = r#"[
+            {"number":1,"title":"Open","state":"OPEN","author":{"login":"a"}},
+            {"number":2,"title":"Closed","state":"CLOSED","author":{"login":"b"}},
+            {"number":3,"title":"Merged","state":"MERGED","author":{"login":"c"}},
+            {"number":4,"title":"open lower","state":"open"},
+            {"number":5,"title":"Draft","state":"OPEN","isDraft":true},
+            {"number":0,"title":"Zero","state":"OPEN"},
+            {"number":6,"title":"No state field"}
+        ]"#;
+        let items = parse_pr_list(json).unwrap();
+        let numbers: Vec<u64> = items.iter().map(|item| item.number).collect();
+        assert_eq!(numbers, vec![1, 4, 5, 6]);
+        assert!(items.iter().all(|item| item.kind == ItemKind::Pull));
     }
 
     #[test]

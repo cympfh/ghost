@@ -5,7 +5,7 @@ use clap::{Parser, ValueEnum};
 
 use crate::agent::AgentKind;
 use crate::demo::{self, DemoScene};
-use crate::engine::{self, RunMode, RunSpec};
+use crate::engine::{self, ListedPull, RunMode, RunSpec};
 use crate::interval::parse_interval;
 use crate::lang::Lang;
 use crate::target::{parse_target, GhTarget};
@@ -21,6 +21,8 @@ Examples:
   ghost github.com/owner/repo
   ghost github.com/owner/repo/pull/3 -r
   ghost github.com/owner/repo/pull/3 -c -i 20s
+  ghost github.com/owner/repo/pulls -r
+  ghost github.com/owner/repo/pulls -c
   ghost github.com/owner/repo/issues/7 -y -l ja
   ghost github.com/owner/repo/issues --auto
   ghost -d review
@@ -33,10 +35,11 @@ The default poll interval is 20s (`-i`). `-l` / `--lang` defaults to ja.
 Launch always starts the agent for a situation check, even when nothing is new.
 Later polls with nothing new do not call the agent. `i` always delivers text to the agent.
 `--merge-yes` (no short flag) merges in --code, issue, or --auto mode after a re-check. `-y` does not merge.
-`--auto` is only valid with /issues. It takes the oldest open issue on each check and keeps waiting when none are left."
+`--auto` is only valid with /issues. It takes the oldest open issue on each check and keeps waiting when none are left.
+`/pulls` lists open pull requests and requires --code or --review."
 )]
 struct Cli {
-    /// github.com/OWNER/REPO, .../pull/N, .../issues/N, or .../issues
+    /// github.com/OWNER/REPO, .../pull/N, .../pulls, .../issues/N, or .../issues
     target: Option<String>,
 
     /// Review the pull request when its head SHA changes.
@@ -181,7 +184,7 @@ fn resolve(
         return Err(if auto {
             "--auto needs github.com/OWNER/REPO/issues".into()
         } else {
-            "missing GitHub URL (github.com/OWNER/REPO[/pull/N|/issues/N|/issues])".into()
+            "missing GitHub URL (github.com/OWNER/REPO[/pull/N|/pulls|/issues/N|/issues])".into()
         });
     };
     if max_iterations == 0 {
@@ -191,7 +194,10 @@ fn resolve(
     let target = parse_target(target_raw)?;
     let mode = mode_for(&target, review, code, auto)?;
     if (merge_yes || merge_method.is_some())
-        && !matches!(mode, RunMode::Code | RunMode::Issue | RunMode::Auto)
+        && !matches!(
+            mode,
+            RunMode::Code | RunMode::Issue | RunMode::Auto | RunMode::PullList(ListedPull::Code)
+        )
     {
         return Err(
             "--merge-yes and --merge-method are only valid with --code, an issue URL, or --auto"
@@ -257,6 +263,21 @@ fn mode_for(target: &GhTarget, review: bool, code: bool, auto: bool) -> Result<R
                 Ok(RunMode::Auto)
             } else {
                 Ok(RunMode::IssueList)
+            }
+        }
+        GhTarget::Pulls { .. } => {
+            if auto {
+                return Err("--auto is only valid with github.com/OWNER/REPO/issues".into());
+            }
+            if review && code {
+                return Err("--review and --code cannot be combined".into());
+            }
+            if review {
+                Ok(RunMode::PullList(ListedPull::Review))
+            } else if code {
+                Ok(RunMode::PullList(ListedPull::Code))
+            } else {
+                Err("/pulls requires --code or --review".into())
             }
         }
         GhTarget::Issue { .. } => {
@@ -427,6 +448,9 @@ mod tests {
             "--trust-issues must not have a short flag\n{help}"
         );
         assert!(help.contains("github.com/owner/repo/pull/3"));
+        assert!(help.contains("github.com/owner/repo/pulls -r"));
+        assert!(help.contains("github.com/owner/repo/pulls -c"));
+        assert!(help.contains("requires --code or --review"));
         assert!(help.contains("github.com/owner/repo/issues/7"));
         assert!(help.contains("github.com/owner/repo/issues --auto"));
         assert!(
@@ -547,6 +571,45 @@ mod tests {
         assert!(go(&["github.com/a/b/issues/7", "--review"]).is_err());
         assert!(go(&["github.com/a/b", "--code"]).is_err());
         assert!(go(&[]).is_err());
+    }
+
+    #[test]
+    fn pulls_requires_code_or_review() {
+        let missing = match go(&["github.com/a/b/pulls"]) {
+            Err(err) => err,
+            Ok(_) => panic!("/pulls without a mode must be rejected before any run"),
+        };
+        assert!(
+            missing.contains("/pulls requires --code or --review"),
+            "{missing}"
+        );
+        assert!(matches!(
+            go(&["github.com/a/b/pulls", "--review"]).unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::PullList(ListedPull::Review),
+                ..
+            })
+        ));
+        assert!(matches!(
+            go(&["github.com/a/b/pulls", "--code"]).unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::PullList(ListedPull::Code),
+                ..
+            })
+        ));
+        assert!(go(&["github.com/a/b/pulls", "--review", "--code"]).is_err());
+        assert!(Cli::try_parse_from(["ghost", "github.com/a/b/pulls", "-r", "-c"]).is_err());
+        assert!(go(&["github.com/a/b/pulls", "--auto"]).is_err());
+        assert!(go(&["github.com/a/b/pulls", "--merge-yes"]).is_err());
+        assert!(go(&["github.com/a/b/pulls", "--review", "--merge-yes"]).is_err());
+        assert!(matches!(
+            go(&["github.com/a/b/pulls", "--code", "--merge-yes"]).unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::PullList(ListedPull::Code),
+                merge_yes: true,
+                ..
+            })
+        ));
     }
 
     #[test]

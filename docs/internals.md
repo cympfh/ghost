@@ -2,7 +2,7 @@
 
 Behavior that the user guide does not spell out. ghost talks to GitHub only through `gh`.
 
-A target is `github.com/OWNER/REPO`, `.../pull/N`, `.../issues/N`, or `.../issues`. `/pr/N` and `/issue/N` are rejected, and the error names `/pull/N` or `/issues/N`. The local ref `refs/remotes/origin/pr/N` is where a fetched `pull/N/head` is stored. It is not a URL ghost accepts.
+A target is `github.com/OWNER/REPO`, `.../pull/N`, `.../pulls`, `.../issues/N`, or `.../issues`. `/pulls` lists open pull requests and requires `--code` or `--review` before any network call; the error is `/pulls requires --code or --review`. `/pulls/N` is rejected, and the error names `/pull/N`. `/pr/N` and `/issue/N` are rejected, and the error names `/pull/N` or `/issues/N`. The local ref `refs/remotes/origin/pr/N` is where a fetched `pull/N/head` is stored. It is not a URL ghost accepts.
 
 ## What each check logs
 
