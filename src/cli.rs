@@ -91,11 +91,11 @@ struct Cli {
     #[arg(long, short = 'k')]
     ssh_key: Option<String>,
 
-    /// Who may wake --code, besides the PR author and repo owner.
-    /// Default: all authors (humans, Copilot, other bots, outsiders).
-    /// `collaborators` or `contributors` still restricts.
-    #[arg(long, short = 't', value_enum, default_value_t = CommentTrust::All)]
-    trust_comments: CommentTrust,
+    /// Who may wake --code, and which issue authors --auto may run.
+    /// Pull requests default to all authors.
+    /// Issues and --auto default to collaborators (OWNER, MEMBER, COLLABORATOR).
+    #[arg(long, short = 't', value_enum)]
+    trust_comments: Option<CommentTrust>,
 }
 
 pub fn run() -> Result<i32> {
@@ -155,7 +155,7 @@ fn resolve(
     header: String,
     lang: Lang,
     ssh_key: Option<String>,
-    trust: CommentTrust,
+    trust: Option<CommentTrust>,
     merge_yes: bool,
     merge_method: Option<String>,
 ) -> Result<Action, String> {
@@ -204,7 +204,10 @@ fn resolve(
         max_turns: max_iterations,
         lang,
         ssh_key,
-        trust,
+        trust: trust.unwrap_or(match mode {
+            RunMode::Issue | RunMode::IssueList | RunMode::Auto => CommentTrust::Collaborators,
+            _ => CommentTrust::All,
+        }),
     }))
 }
 
@@ -372,7 +375,7 @@ mod tests {
             "ghost".into(),
             Lang::Ja,
             None,
-            CommentTrust::Collaborators,
+            None,
             merge_yes,
             merge_method,
         )
@@ -441,9 +444,9 @@ mod tests {
         assert_eq!(cli.lang, Lang::En);
         assert!(cli.yes);
         assert_eq!(cli.max_iterations, 4);
-        assert_eq!(cli.trust_comments, CommentTrust::All);
+        assert_eq!(cli.trust_comments, Some(CommentTrust::All));
         let default_trust = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "-c"]).unwrap();
-        assert_eq!(default_trust.trust_comments, CommentTrust::All);
+        assert!(default_trust.trust_comments.is_none());
 
         let review = Cli::try_parse_from(["ghost", "github.com/a/b/pr/1", "-r"]).unwrap();
         assert!(review.review);
@@ -471,7 +474,7 @@ mod tests {
             "ghost".into(),
             cli.lang,
             None,
-            CommentTrust::Collaborators,
+            None,
             false,
             None,
         )
@@ -543,7 +546,7 @@ mod tests {
             "ghost".into(),
             Lang::Ja,
             None,
-            CommentTrust::Collaborators,
+            None,
             false,
             None,
         )
@@ -561,7 +564,7 @@ mod tests {
             "ghost".into(),
             Lang::En,
             None,
-            CommentTrust::Collaborators,
+            None,
             false,
             None,
         )
@@ -648,5 +651,71 @@ mod tests {
         assert!(go(&["--auto"]).is_err());
         let cli = Cli::try_parse_from(["ghost", "github.com/a/b/issues", "--auto"]).unwrap();
         assert!(cli.auto);
+        match resolve(
+            Some("github.com/a/b/issues"),
+            false,
+            false,
+            true,
+            "20s",
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+        {
+            Action::Run(spec) => assert_eq!(spec.trust, CommentTrust::Collaborators),
+            Action::Demo { .. } => panic!("expected a run"),
+        }
+        match resolve(
+            Some("github.com/a/b/pr/3"),
+            false,
+            true,
+            false,
+            "20s",
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+        {
+            Action::Run(spec) => assert_eq!(spec.trust, CommentTrust::All),
+            Action::Demo { .. } => panic!("expected a run"),
+        }
+        match resolve(
+            Some("github.com/a/b/issues"),
+            false,
+            false,
+            true,
+            "20s",
+            None,
+            false,
+            20,
+            None,
+            "ghost".into(),
+            Lang::Ja,
+            None,
+            Some(CommentTrust::All),
+            false,
+            None,
+        )
+        .unwrap()
+        {
+            Action::Run(spec) => assert_eq!(spec.trust, CommentTrust::All),
+            Action::Demo { .. } => panic!("expected a run"),
+        }
     }
 }

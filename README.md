@@ -35,9 +35,11 @@ A repository URL with `--review` or `--code` is an error. `--review` on an issue
 
 `github.com/OWNER/REPO/issues` (and `/issue`) lists only open issues.
 
-`--auto` skips that list. Each time ghost checks GitHub, it takes the oldest open issue it has not handled and runs the usual issue flow: implement, open a pull request, then keep up with review. It skips an issue that already has an open pull request, or that failed earlier, and writes the failure reason to the log and the state file. When nothing is left, it waits for the next check instead of exiting. `q` or Ctrl-C ends the loop.
+`--auto` skips that list. Each time ghost checks GitHub, it takes the oldest open issue it has not handled and runs the usual issue flow: implement, open a pull request, then keep up with review. By default it only takes issues opened by an OWNER, MEMBER, or COLLABORATOR. `--trust-comments` widens that. When nothing is left, it waits for the next check instead of exiting. `q` or Ctrl-C ends the loop.
 
-Without `--merge-yes`, a merge-ready pull request uses the usual confirm. A terminal asks. Without a terminal, ghost reports the pull request and takes the next issue. `y` merges and continues, `c` stays on this pull request, and `n` or Enter leaves it unmerged and continues. `--auto --yes --merge-yes` opens the pull request, handles review, merges, and then takes the next issue.
+An issue that already has an open pull request is skipped for that round. An issue whose pull request was closed is recorded and is not done again. A temporary GitHub error is retried after a wait, or sooner when the pull request head changes. Issues ghost will not retry stay in `OWNER__REPO/auto.json` under the state directory; delete that file to take them again. Issues opened by ghost, or by the logged-in user, after `--auto` starts are skipped so the loop does not feed itself.
+
+Without `--merge-yes`, a merge-ready pull request uses the usual confirm. A terminal asks. Without a terminal, ghost reports the pull request and takes the next issue. `y` merges and continues, `c` stays on this pull request, and `n` or Enter leaves it unmerged and takes the next issue. `--auto --yes --merge-yes` opens the pull request, handles review, merges, and then takes the next issue.
 
 A pull request is mergeable when it is open, not a draft, free of conflicts, has no outstanding change requests, and every listed check has passed. When no checks are listed, CI is not part of that decision. ghost confirms with you before merging, and `--merge-yes` merges without that confirmation.
 
@@ -54,7 +56,7 @@ A pull request is mergeable when it is open, not a draft, free of conflicts, has
 | | `--auto` | | With `/issues`, take the oldest open issue on each check. No picker. |
 | | `--merge-method` | `squash` | `merge`, `squash`, or `rebase`. |
 | `-n` | `--max-iterations` | `20` | Stop after this many agent turns. |
-| `-t` | `--trust-comments` | `all` | Who may wake `--code`: `all`, `collaborators`, or `contributors`. |
+| `-t` | `--trust-comments` | `all`; `collaborators` for issues and `--auto` | Who may wake `--code`, and whose issues `--auto` runs: `all`, `collaborators`, or `contributors`. |
 | `-d` | `--demo` | | Draw a sample screen: `picker`, `review`, `code`, `confirm`, or `preflight`. |
 | `-h` | `--help` | | Help. |
 | `-V` | `--version` | | Version. |
@@ -76,6 +78,7 @@ A pull request is mergeable when it is open, not a draft, free of conflicts, has
 | Screen | `y` | `n` / Esc | Enter | `c` | `m` |
 | --- | --- | --- | --- | --- | --- |
 | Merge confirm | Merge | Exit ghost without merging | Exit ghost without merging | Stay in the session | Cycle the method |
+| Merge confirm (`--auto`) | Merge, then take the next issue | Leave it unmerged and take the next issue | Leave it unmerged and take the next issue | Stay on this pull request | Cycle the method |
 | Review-end confirm | Exit ghost | Exit ghost | Exit ghost | Stay in the session | — |
 | Issue-to-code handoff | Continue fixing | Exit ghost without continuing | Continue fixing | — | — |
 
@@ -89,6 +92,8 @@ The agent runs with its permission prompts turned off (`--dangerously-skip-permi
 
 The `gh` and `git` commands placed in front of the agent only stop accidents, such as an unintended merge. To block merges for real, use a token that does not have permission to merge.
 
+`--auto` runs that agent on each chosen issue without asking first. By default those issues were opened by an OWNER, MEMBER, or COLLABORATOR. Text in such an issue can still tell the agent what to do, so use `--auto` only on a repository you trust. `--trust-comments all` also takes issues opened by other people.
+
 ## Troubleshooting
 
 An ssh passphrase is asked before the screen starts. After that, ssh runs without another prompt.
@@ -98,5 +103,7 @@ If the key is locked, unlock it with `ssh-add`, pass `--ssh-key`, or switch the 
 Clones stay at `~/.ghost/work/OWNER__REPO`. Set `GHOST_HOME` to replace `~/.ghost`.
 
 The last review, seen comments, and the session id are stored in `$GHOST_STATE_DIR`, or `$XDG_STATE_HOME/ghost`, or `~/.local/state/ghost`.
+
+`--auto` stores issues it will not take again in `OWNER__REPO/auto.json` under that directory. Delete the file to take them again. A temporary GitHub error is retried after a wait, or when the pull request head changes, and is not kept there for good. An issue whose pull request was closed stays recorded so ghost does not redo it.
 
 The interval for checking GitHub, the working copies, and the merge steps are in [docs/internals.md](docs/internals.md).

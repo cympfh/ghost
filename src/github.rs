@@ -180,42 +180,42 @@ impl Gh {
         parse_issue_list(&out.stdout).map_err(|e| anyhow!(e))
     }
 
-    /// Open issues, oldest first, for `--auto`.
+    /// Open issues, oldest first, for `--auto`. Pages past the first 100.
     pub fn auto_issues(&self) -> Result<Vec<crate::auto::IssueRow>> {
-        let out = self.call(vec![
-            "issue".into(),
-            "list".into(),
-            "--repo".into(),
-            self.slug.clone(),
-            "--state".into(),
-            "open".into(),
-            "--limit".into(),
-            "100".into(),
-            "--search".into(),
-            "is:open sort:created-asc".into(),
-            "--json".into(),
-            "number,title,labels,createdAt".into(),
-        ])?;
-        ensure_ok("gh issue list", &out)?;
-        crate::auto::parse_issues(&out.stdout).map_err(|e| anyhow!(e))
+        let (owner, name) = split_slug(&self.slug)?;
+        let mut rows = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..AUTO_PAGE_CAP {
+            let out = self.call(graphql_args(ISSUE_QUERY, owner, name, cursor.as_deref()))?;
+            ensure_ok("gh issue list", &out)?;
+            let page = crate::auto::parse_issue_page(&out.stdout).map_err(|e| anyhow!(e))?;
+            let next = crate::auto::next_cursor(page.has_next, page.cursor);
+            rows.extend(page.rows);
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(rows)
     }
 
-    /// Open pull requests that may already cover an issue.
-    pub fn open_pr_links(&self) -> Result<Vec<crate::auto::PrLink>> {
-        let out = self.call(vec![
-            "pr".into(),
-            "list".into(),
-            "--repo".into(),
-            self.slug.clone(),
-            "--state".into(),
-            "open".into(),
-            "--limit".into(),
-            "100".into(),
-            "--json".into(),
-            "number,headRefName,body,closingIssuesReferences".into(),
-        ])?;
-        ensure_ok("gh pr list", &out)?;
-        crate::auto::parse_pr_links(&out.stdout).map_err(|e| anyhow!(e))
+    /// Pull requests that may already cover an issue, including closed and merged ones.
+    pub fn auto_pr_links(&self) -> Result<Vec<crate::auto::PrLink>> {
+        let (owner, name) = split_slug(&self.slug)?;
+        let mut rows = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..AUTO_PAGE_CAP {
+            let out = self.call(graphql_args(PR_QUERY, owner, name, cursor.as_deref()))?;
+            ensure_ok("gh pr list", &out)?;
+            let page = crate::auto::parse_pr_page(&out.stdout).map_err(|e| anyhow!(e))?;
+            let next = crate::auto::next_cursor(page.has_next, page.cursor);
+            rows.extend(page.rows);
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(rows)
     }
 
     pub fn issue(&self, number: u64) -> Result<IssueDetails> {
@@ -473,6 +473,40 @@ pub fn merge_args(slug: &str, number: u64, method: Option<&str>, head_sha: &str)
         "--match-head-commit".into(),
         head_sha.to_string(),
     ]
+}
+
+const AUTO_PAGE_CAP: usize = 20;
+
+const ISSUE_QUERY: &str = "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(states:OPEN,first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){pageInfo{hasNextPage endCursor}nodes{number title createdAt authorAssociation author{__typename login}labels(first:20){nodes{name}}}}}}";
+
+const PR_QUERY: &str = "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(states:[OPEN,CLOSED,MERGED],first:100,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage endCursor}nodes{number state headRefName headRefOid body closingIssuesReferences(first:50){nodes{number}}}}}}";
+
+fn split_slug(slug: &str) -> Result<(&str, &str)> {
+    let (owner, name) = slug
+        .split_once('/')
+        .ok_or_else(|| anyhow!("bad repo slug {slug}"))?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        anyhow::bail!("bad repo slug {slug}");
+    }
+    Ok((owner, name))
+}
+
+fn graphql_args(query: &str, owner: &str, name: &str, cursor: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "api".into(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={query}"),
+        "-f".into(),
+        format!("owner={owner}"),
+        "-f".into(),
+        format!("name={name}"),
+    ];
+    if let Some(cursor) = cursor {
+        args.push("-f".into());
+        args.push(format!("cursor={cursor}"));
+    }
+    args
 }
 
 fn ensure_ok(what: &str, out: &CmdOut) -> Result<()> {
