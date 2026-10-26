@@ -109,6 +109,25 @@ pub fn skip_approval_rule(lang: Lang) -> String {
     )
 }
 
+/// Make the merge-status rules internally consistent when approval is optional.
+pub fn apply_skip_approval(task: String, lang: Lang) -> String {
+    let (required, optional) = match lang {
+        Lang::Ja => (
+            "- approve が1件以上あるか、approve と判断できるコメントが1件以上あればレビューは通る。未解決の changes requested や修正依頼があれば needs_work。",
+            "- approval や approval 相当のコメントがなくてもレビューは通る。未解決の changes requested や修正依頼があれば needs_work。",
+        ),
+        Lang::En => (
+            "- Reviews pass with at least one approval or at least one comment you judge to be an approval equivalent. Outstanding changes requested or fix requests mean `needs_work`.",
+            "- Reviews pass without an approval or approval-equivalent comment. Outstanding changes requested or fix requests mean `needs_work`.",
+        ),
+    };
+    format!(
+        "{}\n{}",
+        task.replace(required, optional),
+        skip_approval_rule(lang)
+    )
+}
+
 fn review_verdict_rules(lang: Lang, slug: &str, number: u64) -> String {
     match lang {
         Lang::Ja => format!(
@@ -929,6 +948,19 @@ mod tests {
         let ja = skip_approval_rule(Lang::Ja);
         assert!(ja.contains("approval 相当のコメントがなくても"));
         assert!(ja.contains("CI の条件は変更せず"));
+    }
+
+    #[test]
+    fn skip_approval_replaces_the_conflicting_status_rule() {
+        let en = apply_skip_approval(ci_status_rule(Lang::En).into(), Lang::En);
+        assert!(en.contains("Reviews pass without an approval"));
+        assert!(!en.contains("Reviews pass with at least one approval"));
+        assert!(en.contains("Outstanding changes requested"));
+
+        let ja = apply_skip_approval(ci_status_rule(Lang::Ja).into(), Lang::Ja);
+        assert!(ja.contains("approval 相当のコメントがなくてもレビューは通る"));
+        assert!(!ja.contains("approve が1件以上"));
+        assert!(ja.contains("未解決の changes requested"));
     }
 
     #[test]

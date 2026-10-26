@@ -2190,7 +2190,7 @@ impl Ctx {
 
     fn decorate(&mut self, task: String) -> String {
         let task = if self.spec.skip_approval {
-            format!("{task}\n{}", prompt::skip_approval_rule(self.spec.lang))
+            prompt::apply_skip_approval(task, self.spec.lang)
         } else {
             task
         };
@@ -3395,9 +3395,25 @@ exit 0
     fn skip_approval_is_added_to_agent_tasks() {
         let (mut ctx, _events, _commands) = merge_ctx(false);
         ctx.spec.skip_approval = true;
-        let task = ctx.decorate("task".into());
+        let task = ctx.decorate(format!(
+            "task\n{}",
+            crate::prompt::code_survey(
+                "acme/app",
+                1,
+                "feature",
+                "abc",
+                std::path::Path::new("/tmp/work"),
+                false,
+                &[],
+                &[],
+                &[],
+                crate::lang::Lang::Ja,
+                "push",
+            )
+        ));
         assert!(task.contains("approval 相当のコメントがなくても"));
         assert!(task.contains("CI の条件は変更せず"));
+        assert!(!task.contains("approve が1件以上"));
     }
 
     #[test]
