@@ -110,10 +110,8 @@ pub enum Delivery {
     StreamJson,
     /// Prompt bytes, then close stdin so the CLI starts.
     StdinClose,
-    /// Prompt already written to `--prompt-file`.
+    /// Prompt was written to a file; close stdin.
     PromptFile,
-    /// Prompt appended to argv, then close stdin.
-    PromptArg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +119,13 @@ pub struct AgentCommand {
     pub program: &'static str,
     pub args: Vec<String>,
     pub delivery: Delivery,
+}
+
+fn kimi_prompt_instruction(prompt_file: &Path) -> String {
+    format!(
+        "Read the file at {} with your file-reading tool. Its complete contents are your task for this turn. Follow those contents; do not ask for the task to be pasted into chat.",
+        prompt_file.display()
+    )
 }
 
 pub fn command_for(
@@ -246,8 +251,9 @@ pub fn command_for(
                 "--output-format".into(),
                 "stream-json".into(),
                 "--prompt".into(),
+                kimi_prompt_instruction(prompt_file),
             ],
-            delivery: Delivery::PromptArg,
+            delivery: Delivery::PromptFile,
         },
         (AgentKind::Kimi, Launch::Resume { session_id }) => AgentCommand {
             program: "kimi",
@@ -257,8 +263,9 @@ pub fn command_for(
                 "--output-format".into(),
                 "stream-json".into(),
                 "--prompt".into(),
+                kimi_prompt_instruction(prompt_file),
             ],
-            delivery: Delivery::PromptArg,
+            delivery: Delivery::PromptFile,
         },
         _ => return Err(format!("internal: {kind} start is missing a session id")),
     };
@@ -299,6 +306,30 @@ pub fn extract_session_id(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn kimi_session_from_list(output: &str, started_at: u128) -> Option<String> {
+    let v: Value = serde_json::from_str(output).ok()?;
+    let sessions = match v.as_array() {
+        Some(sessions) => sessions,
+        None => v.get("sessions")?.as_array()?,
+    };
+    sessions
+        .iter()
+        .rev()
+        .filter(|session| {
+            session
+                .get("createdAt")
+                .and_then(|time| time.as_u64())
+                .is_some_and(|time| u128::from(time) >= started_at)
+        })
+        .find_map(|session| {
+            session
+                .get("id")
+                .and_then(|id| id.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
 }
 
 pub fn event_is_error(kind: AgentKind, line: &str) -> bool {
@@ -624,6 +655,7 @@ pub struct AgentSession {
     fallback_dir: PathBuf,
     prompt_dir: PathBuf,
     session_id: Option<String>,
+    kimi_started_at: Option<u128>,
     child: Option<Child>,
     stdin: Option<std::process::ChildStdin>,
     rx: Option<Receiver<String>>,
@@ -657,6 +689,7 @@ impl AgentSession {
             fallback_dir: ghost_home.join("work"),
             prompt_dir: prompt_directory(ghost_home, slot),
             session_id: None,
+            kimi_started_at: None,
             child: None,
             stdin: None,
             rx: None,
@@ -784,6 +817,14 @@ impl AgentSession {
             self.exited = false;
             return Ok(launch);
         }
+        if self.kind == AgentKind::Kimi && matches!(&launch, Launch::Start { .. }) {
+            self.kimi_started_at = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            );
+        }
         self.kill_child(9);
         self.spawn(&launch, prompt)?;
         if let Launch::Start {
@@ -830,6 +871,7 @@ impl AgentSession {
         let _ = self.poll_lines();
         self.reap();
         if self.exited && self.readers.load(Ordering::SeqCst) == 0 && self.rx_empty() {
+            self.recover_kimi_session();
             self.turn_open = false;
             return true;
         }
@@ -840,6 +882,32 @@ impl AgentSession {
             return true;
         }
         false
+    }
+
+    fn recover_kimi_session(&mut self) {
+        if self.kind != AgentKind::Kimi || self.session_id.is_some() {
+            return;
+        }
+        let Some(started_at) = self.kimi_started_at else {
+            return;
+        };
+        let program = self.stub.clone().unwrap_or_else(|| PathBuf::from("kimi"));
+        let output = Command::new(program)
+            .args(["session", "list", "--cwd"])
+            .arg(&self.workdir)
+            .arg("--json")
+            .output();
+        let Ok(output) = output else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        if let Some(id) =
+            kimi_session_from_list(&String::from_utf8_lossy(&output.stdout), started_at)
+        {
+            self.session_id = Some(id);
+        }
     }
 
     pub fn interrupt(&mut self) {
@@ -885,9 +953,6 @@ impl AgentSession {
             .unwrap_or_else(|| PathBuf::from(spec.program));
         let mut cmd = Command::new(&program);
         cmd.args(&spec.args);
-        if spec.delivery == Delivery::PromptArg {
-            cmd.arg(prompt);
-        }
         cmd.current_dir(&self.workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -979,7 +1044,7 @@ impl AgentSession {
                 drop(stdin);
                 self.stdin = None;
             }
-            Delivery::PromptFile | Delivery::PromptArg => {
+            Delivery::PromptFile => {
                 drop(stdin);
                 self.stdin = None;
             }
@@ -1719,9 +1784,14 @@ mod tests {
         assert_eq!(kimi_start.program, "kimi");
         assert_eq!(
             kimi_start.args,
-            vec!["--output-format", "stream-json", "--prompt"]
+            vec![
+                "--output-format".into(),
+                "stream-json".into(),
+                "--prompt".into(),
+                kimi_prompt_instruction(file),
+            ]
         );
-        assert_eq!(kimi_start.delivery, Delivery::PromptArg);
+        assert_eq!(kimi_start.delivery, Delivery::PromptFile);
         assert!(!kimi_start.args.iter().any(|a| a == "--yolo"));
         assert!(!kimi_start.args.iter().any(|a| a == "--session"));
 
@@ -1737,14 +1807,15 @@ mod tests {
         assert_eq!(
             kimi_resume.args,
             vec![
-                "--session",
-                "session-kimi-1",
-                "--output-format",
-                "stream-json",
-                "--prompt",
+                "--session".into(),
+                "session-kimi-1".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--prompt".into(),
+                kimi_prompt_instruction(file),
             ]
         );
-        assert_eq!(kimi_resume.delivery, Delivery::PromptArg);
+        assert_eq!(kimi_resume.delivery, Delivery::PromptFile);
         assert!(!kimi_resume.args.iter().any(|a| a == "--yolo"));
     }
 
@@ -2364,7 +2435,7 @@ mod tests {
     }
 
     #[test]
-    fn kimi_prompt_is_one_argv_value_and_follow_up_uses_emitted_session() {
+    fn kimi_large_prompt_stays_in_file_and_follow_up_uses_emitted_session() {
         let dir = std::env::temp_dir().join(format!(
             "ghost-kimi-{}-{}",
             std::process::id(),
@@ -2385,19 +2456,27 @@ mod tests {
                 argv_out.display()
             ),
         );
-        let mut session = AgentSession::new(AgentKind::Kimi, work, &dir.join("home"), "main");
+        let home = dir.join("home");
+        let mut session = AgentSession::new(AgentKind::Kimi, work, &home, "main");
         session.set_stub(stub);
-        let prompt = "fix this\nwithout a shell";
-        session.dispatch(prompt).unwrap();
+        let prompt = "あ".repeat(50_000);
+        assert!(prompt.len() > 131_072);
+        session.dispatch(&prompt).unwrap();
         let start = std::time::Instant::now();
         while !session.turn_finished() {
             assert!(start.elapsed() < std::time::Duration::from_secs(5));
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(session.session_id(), Some("session-kimi-1"));
+        let prompt_dir = prompt_directory(&home, "main");
+        let prompt_file = prompt_dir.join("kimi.md");
+        assert_eq!(std::fs::read_to_string(&prompt_file).unwrap(), prompt);
         assert_eq!(
             std::fs::read_to_string(&argv_out).unwrap(),
-            format!("--output-format\nstream-json\n--prompt\n{prompt}\n")
+            format!(
+                "--output-format\nstream-json\n--prompt\n{}\n",
+                kimi_prompt_instruction(&prompt_file)
+            )
         );
 
         session.dispatch("follow up").unwrap();
@@ -2406,10 +2485,69 @@ mod tests {
             assert!(start.elapsed() < std::time::Duration::from_secs(5));
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        let resume_file = prompt_dir.join("session-kimi-1.md");
         assert_eq!(
             std::fs::read_to_string(&argv_out).unwrap(),
-            "--session\nsession-kimi-1\n--output-format\nstream-json\n--prompt\nfollow up\n"
+            format!(
+                "--session\nsession-kimi-1\n--output-format\nstream-json\n--prompt\n{}\n",
+                kimi_prompt_instruction(&resume_file)
+            )
         );
+        session.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kimi_failed_first_turn_recovers_created_session_for_follow_up() {
+        let sessions = r#"[
+            {"id":"later","createdAt":1200},
+            {"id":"mine","createdAt":1000},
+            {"id":"older","createdAt":999}
+        ]"#;
+        assert_eq!(
+            kimi_session_from_list(sessions, 1000).as_deref(),
+            Some("mine")
+        );
+        assert_eq!(kimi_session_from_list("[]", 1000), None);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-kimi-recover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let argv_out = dir.join("argv");
+        let stub = dir.join("stub-kimi");
+        write_exe(
+            &stub,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = session ]; then\n  echo '[{{\"id\":\"session-recovered\",\"createdAt\":9999999999999}}]'\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > '{}'\ncase \" $* \" in\n  *\" --session \"*)\n    echo '{{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session-recovered\"}}'\n    exit 0\n    ;;\nesac\nexit 1\n",
+                argv_out.display()
+            ),
+        );
+        let mut session = AgentSession::new(AgentKind::Kimi, work, &dir.join("home"), "main");
+        session.set_stub(stub);
+        session.dispatch("first try").unwrap();
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(session.last_exit_code(), Some(1));
+        assert_eq!(session.session_id(), Some("session-recovered"));
+
+        session.dispatch("follow up").unwrap();
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let args = std::fs::read_to_string(&argv_out).unwrap();
+        assert!(args.starts_with("--session\nsession-recovered\n"));
         session.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }

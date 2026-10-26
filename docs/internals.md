@@ -127,7 +127,7 @@ Prompts tell the agent to use `gh` for GitHub, to reply in the selected language
 - Claude: `claude --print --dangerously-skip-permissions --input-format stream-json --output-format stream-json --verbose --session-id <uuid>`. Later prompts are JSON on stdin. If the process exits, the same flags use `--resume <uuid>`.
 - Codex: `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <dir> -`, then `codex --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check resume <thread_id>`. Resume has no `-C` and no `-s`.
 - Grok: `grok --prompt-file <file> --session-id <uuid> --output-format streaming-json --yolo --cwd <dir>`, then `--resume <uuid>` without `--session-id`.
-- Kimi: `kimi --output-format stream-json --prompt <prompt>`, then `kimi --session <id> --output-format stream-json --prompt <prompt>`. Kimi allocates the session id and reports it in the final `session.resume_hint` event. Print mode uses automatic permissions, so ghost does not pass `--yolo`.
+- Kimi: `kimi --output-format stream-json --prompt <instruction>`, then `kimi --session <id> --output-format stream-json --prompt <instruction>`. The short instruction tells Kimi to read the complete task from the prompt file, keeping large prompts out of argv. Kimi normally reports its session id in the final `session.resume_hint` event. If a failed or interrupted turn emits no hint, ghost recovers the session created after launch with `kimi session list --cwd <dir> --json`. Print mode uses automatic permissions, so ghost does not pass `--yolo`.
 
 Prompt files are `~/.ghost/prompts/pid<pid>-<slot>/`, one directory per process and per mode.
 
