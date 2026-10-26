@@ -62,7 +62,7 @@ Install the binary directly from the repository as documented:
 cargo install --git https://github.com/cympfh/ghost
 ```
 
-There is no repository CI workflow, container definition, release script, or other deployment automation. Do not assume that a separate publishing or deployment step exists.
+GitHub Actions runs `cargo fmt --all -- --check`, `cargo test --locked`, and `cargo build --locked` on pushes and pull requests. There is no container definition, release script, or other deployment automation. Do not assume that a separate publishing or deployment step exists.
 
 ## Runtime architecture
 
