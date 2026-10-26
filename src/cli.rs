@@ -35,6 +35,7 @@ The default poll interval is 20s (`-i`). `-l` / `--lang` defaults to ja.
 Launch always starts the agent for a situation check, even when nothing is new.
 Later polls with nothing new do not call the agent. `i` always delivers text to the agent.
 `--merge-yes` (no short flag) merges in --code, issue, or --auto mode after a re-check.
+`--merge-no` exits successfully without merging or asking when merge-ready.
 `--auto` is only valid with /issues. It takes the oldest open issue on each check and keeps waiting when none are left.
 `/pulls` lists open pull requests and requires --code or --review."
 )]
@@ -65,8 +66,12 @@ struct Cli {
 
     /// Merge when --code, issue, or --auto is merge-ready, after a fresh re-check.
     /// No short flag. Does not apply to --review, the picker, or ask-without---code.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "merge_no")]
     merge_yes: bool,
+
+    /// Exit successfully without merging when --code, issue, or --auto is merge-ready.
+    #[arg(long)]
+    merge_no: bool,
 
     /// `gh pr merge` method. Default is squash (`--squash`).
     #[arg(long, value_enum)]
@@ -124,6 +129,7 @@ pub fn run() -> Result<i32> {
         cli.trust_comments,
         cli.trust_issues,
         cli.merge_yes,
+        cli.merge_no,
         cli.merge_method
             .map(MergeMethod::gh_flag)
             .map(str::to_string),
@@ -159,8 +165,12 @@ fn resolve(
     trust: Option<CommentTrust>,
     trust_issues: Option<CommentTrust>,
     merge_yes: bool,
+    merge_no: bool,
     merge_method: Option<String>,
 ) -> Result<Action, String> {
+    if merge_yes && merge_no {
+        return Err("--merge-yes cannot be combined with --merge-no".into());
+    }
     if let Some(scene) = demo {
         if auto {
             return Err("--auto cannot be combined with --demo".into());
@@ -186,14 +196,14 @@ fn resolve(
     let interval = parse_interval(interval)?;
     let target = parse_target(target_raw)?;
     let mode = mode_for(&target, review, code, auto)?;
-    if (merge_yes || merge_method.is_some())
+    if (merge_yes || merge_no || merge_method.is_some())
         && !matches!(
             mode,
             RunMode::Code | RunMode::Issue | RunMode::Auto | RunMode::PullList(ListedPull::Code)
         )
     {
         return Err(
-            "--merge-yes and --merge-method are only valid with --code, an issue URL, or --auto"
+            "--merge-yes, --merge-no, and --merge-method are only valid with --code, an issue URL, or --auto"
                 .into(),
         );
     }
@@ -204,6 +214,7 @@ fn resolve(
         interval,
         agent,
         merge_yes,
+        merge_no,
         merge_method,
         max_turns: max_iterations,
         lang,
@@ -364,6 +375,7 @@ mod tests {
         let code = args.contains(&"--code");
         let auto = args.contains(&"--auto");
         let merge_yes = args.contains(&"--merge-yes");
+        let merge_no = args.contains(&"--merge-no");
         let merge_method = args
             .windows(2)
             .find(|pair| pair[0] == "--merge-method")
@@ -393,6 +405,7 @@ mod tests {
             None,
             None,
             merge_yes,
+            merge_no,
             merge_method,
         )
     }
@@ -412,6 +425,7 @@ mod tests {
             "-k, --ssh-key",
             "-l, --lang",
             "--merge-yes",
+            "--merge-no",
             "--merge-method",
             "-n, --max-iterations",
             "-t, --trust-comments",
@@ -509,6 +523,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             None,
         )
@@ -620,6 +635,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             None,
         )
         .is_err());
@@ -638,13 +654,14 @@ mod tests {
             None,
             None,
             false,
+            false,
             None,
         )
         .is_err());
     }
 
     #[test]
-    fn merge_yes_is_only_for_code_and_issue() {
+    fn merge_flags_are_only_for_code_and_issue() {
         assert!(go(&["github.com/a/b/pull/3", "--review", "--merge-yes"]).is_err());
         assert!(go(&["github.com/a/b/pull/3", "--merge-yes"]).is_err());
         assert!(go(&["github.com/a/b", "--merge-yes"]).is_err());
@@ -676,6 +693,42 @@ mod tests {
         .unwrap();
         assert!(cli.merge_yes);
         assert!(matches!(cli.merge_method, Some(MergeMethod::Rebase)));
+
+        assert!(go(&["github.com/a/b/pull/3", "--review", "--merge-no"]).is_err());
+        assert!(go(&["github.com/a/b/pull/3", "--merge-no"]).is_err());
+        assert!(go(&["github.com/a/b", "--merge-no"]).is_err());
+        assert!(matches!(
+            go(&["github.com/a/b/pull/3", "--code", "--merge-no"]).unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::Code,
+                merge_no: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            go(&["github.com/a/b/issues/7", "--merge-no"]).unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::Issue,
+                merge_no: true,
+                ..
+            })
+        ));
+        assert!(go(&["github.com/a/b/issues", "--auto", "--merge-no"]).is_ok());
+        assert!(go(&[
+            "github.com/a/b/pull/3",
+            "--code",
+            "--merge-yes",
+            "--merge-no"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ghost",
+            "github.com/a/b/pull/3",
+            "--code",
+            "--merge-yes",
+            "--merge-no",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -752,6 +805,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             None,
         )
         .unwrap()
@@ -777,6 +831,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             None,
         )
         .unwrap()
@@ -798,6 +853,7 @@ mod tests {
             None,
             Some(CommentTrust::All),
             None,
+            false,
             false,
             None,
         )
@@ -824,6 +880,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             None,
         )
         .unwrap()
@@ -845,6 +902,7 @@ mod tests {
             None,
             None,
             Some(CommentTrust::All),
+            false,
             false,
             None,
         )

@@ -16,7 +16,8 @@ You need `gh` (`gh auth login`) and one of `codex`, `claude`, `grok`, or `kimi` 
 | `-a` | `--agent` | first on `PATH` | `codex`, `claude`, `grok`, or `kimi`. |
 | `-k` | `--ssh-key` | ssh config, or `GHOST_SSH_KEY` | Private key passed to ssh. |
 | `-l` | `--lang` | `ja` (`GHOST_LANG` if the flag is omitted) | `ja` or `en`. |
-| | `--merge-yes` | | Merge without confirming. Only with `--code`, an issue, or `--auto`. |
+| | `--merge-yes` | | Merge without confirming. Only with `--code`, an issue, or `--auto`. Conflicts with `--merge-no`. |
+| | `--merge-no` | | Exit successfully without merging or confirming. Only with `--code`, an issue, or `--auto`. Conflicts with `--merge-yes`. |
 | | `--auto` | | With `/issues`, take the oldest open issue on each check. No picker. |
 | | `--merge-method` | `squash` | `merge`, `squash`, or `rebase`. |
 | `-n` | `--max-iterations` | `20` | Stop after this many agent turns. |
@@ -49,7 +50,7 @@ On the merge confirm screen, Tab and the left and right arrows cycle the method 
 
 An issue that already has an open pull request is skipped for that round. Issues filed after `--auto` starts are picked up on a later check. Which authors it runs is `--trust-issues` (default OWNER, MEMBER, or COLLABORATOR). An issue the agent creates with `gh issue create` in this repository is listed in `OWNER__REPO/created-issues` and skipped. See below for closed pull requests ghost opened, and for which GitHub errors are retried.
 
-After the pull request exists, ghost continues into code without asking, including in a non-terminal session. On a terminal, `y` merges and continues, `c` stays on this pull request, and `n` or Enter leaves it unmerged and takes the next issue. `--auto --merge-yes` opens the pull request, handles review, merges, and then takes the next issue.
+After the pull request exists, ghost continues into code without asking, including in a non-terminal session. On a terminal, `y` merges and continues, `c` stays on this pull request, and `n` or Enter leaves it unmerged and takes the next issue. `--auto --merge-yes` opens the pull request, handles review, merges, and then takes the next issue. `--auto --merge-no` leaves it unmerged and takes the next issue without asking.
 
 Issues `--auto` will not take again are stored in `OWNER__REPO/auto.json` under the state directory below. Delete that file to take them again.
 
@@ -105,9 +106,9 @@ A review turn that ends with `GHOST_VERDICT: approve` exits automatically. On yo
 
 Mergeable means open, not a draft, `mergeStateStatus` CLEAN, not conflicting, and no outstanding changes requested. Every check listed by `gh pr checks` must have passed, and at least one approval is required. A pending check or an empty check list waits. A later `COMMENTED` review does not clear an earlier approval from the same reviewer.
 
-ghost offers merge only after the same commit has been mergeable on two checks at least one interval apart. The refetch at the end of the opening turn is not one of those checks. `--merge-yes` waits for the second check too. `y` re-reads the commit and runs `gh pr merge` with exactly one of `--merge`, `--squash`, or `--rebase`, plus `--match-head-commit`. The method on screen starts as `--merge-method`, or squash when the flag is omitted. `c` asks again only after the commit, a review or comment, or an agent turn changes.
+ghost handles merge readiness only after the same commit has been mergeable on two checks at least one interval apart. The refetch at the end of the opening turn is not one of those checks. `--merge-yes` and `--merge-no` wait for the second check too. `y` re-reads the commit and runs `gh pr merge` with exactly one of `--merge`, `--squash`, or `--rebase`, plus `--match-head-commit`. The method on screen starts as `--merge-method`, or squash when the flag is omitted. `c` asks again only after the commit, a review or comment, or an agent turn changes.
 
-`--merge-yes` merges without asking and exits 1 if `gh pr merge` fails, instead of trying again on every check. If the repository rejects the method, the log says so and points at `--merge-method` or the `m` key. ghost does not pick another method.
+`--merge-yes` merges without asking and exits 1 if `gh pr merge` fails, instead of trying again on every check. If the repository rejects the method, the log says so and points at `--merge-method` or the `m` key. ghost does not pick another method. `--merge-no` exits 0 without merging or opening the confirmation screen. The two flags cannot be combined.
 
 When stdin or stdout is not a terminal, ghost does not open `/dev/tty`. Opening that device with no controlling terminal fails with ENXIO (os error 6). Review exits and issue mode continues into code without asking. A merge happens only with `--merge-yes`.
 

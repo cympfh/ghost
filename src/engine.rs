@@ -72,6 +72,8 @@ pub struct RunSpec {
     pub agent: Option<AgentKind>,
     /// Auto-answer yes on the merge prompt. Ignored by `--review`.
     pub merge_yes: bool,
+    /// Exit successfully instead of asking on the merge prompt.
+    pub merge_no: bool,
     pub merge_method: Option<String>,
     pub max_turns: u32,
     pub lang: Lang,
@@ -1100,10 +1102,10 @@ impl Ctx {
         let secs = self.spec.interval.as_secs();
         self.log(self.say(
             &format!(
-                "merge-ready を一度確認しました（{short}）。{secs}秒以上あとに同じ head なら merge を尋ねます。"
+                "merge-ready を一度確認しました（{short}）。{secs}秒以上あとに同じ head なら merge 処理を行います。"
             ),
             &format!(
-                "Saw merge-ready once ({short}). The same head at least {secs}s later will ask to merge."
+                "Saw merge-ready once ({short}). The same head at least {secs}s later will run the merge action."
             ),
         ));
     }
@@ -1126,35 +1128,38 @@ impl Ctx {
         }
         let initial = MergeStyle::from_flag(self.spec.merge_method.as_deref());
         let message = merge_question(number, initial, self.spec.lang);
-        let (answer, method) = match auto_merge_answer(self.spec.merge_yes, stdin_is_tty()) {
-            Some(answer) => {
-                let why = if self.spec.merge_yes {
-                    "y (--merge-yes)"
-                } else if stdin_is_tty() {
-                    "n"
-                } else {
-                    "n (not a TTY)"
-                };
-                self.log(format!("{message} {why}"));
-                (answer, initial)
-            }
-            None => {
-                let _ = self.tx.send(UiEvent::Confirm {
-                    number,
-                    message,
-                    kind: ConfirmKind::Merge(initial),
-                    lang: self.spec.lang,
-                });
-                self.status.phase = "confirm".into();
-                self.push_status();
-                match self.wait_confirm()? {
-                    None => return Ok(true),
-                    Some((answer, chosen)) => {
-                        (confirm_merge_answer(answer), chosen.unwrap_or(initial))
+        let (answer, method) =
+            match auto_merge_answer(self.spec.merge_yes, self.spec.merge_no, stdin_is_tty()) {
+                Some(answer) => {
+                    let why = if self.spec.merge_yes {
+                        "y (--merge-yes)"
+                    } else if self.spec.merge_no {
+                        "n (--merge-no)"
+                    } else if stdin_is_tty() {
+                        "n"
+                    } else {
+                        "n (not a TTY)"
+                    };
+                    self.log(format!("{message} {why}"));
+                    (answer, initial)
+                }
+                None => {
+                    let _ = self.tx.send(UiEvent::Confirm {
+                        number,
+                        message,
+                        kind: ConfirmKind::Merge(initial),
+                        lang: self.spec.lang,
+                    });
+                    self.status.phase = "confirm".into();
+                    self.push_status();
+                    match self.wait_confirm()? {
+                        None => return Ok(true),
+                        Some((answer, chosen)) => {
+                            (confirm_merge_answer(answer), chosen.unwrap_or(initial))
+                        }
                     }
                 }
-            }
-        };
+            };
         match answer {
             MergeAnswer::Continue => {
                 self.merge_hold = Some(MergeHold {
@@ -3201,6 +3206,7 @@ mod tests {
                 interval: Duration::from_secs(20),
                 agent: None,
                 merge_yes,
+                merge_no: false,
                 merge_method: None,
                 max_turns: 20,
                 lang: Lang::Ja,
@@ -3248,6 +3254,55 @@ mod tests {
             auto_release: None,
         };
         (ctx, rx, cmd_tx)
+    }
+
+    #[test]
+    fn merge_no_exits_successfully_without_a_confirmation() {
+        let (mut ctx, rx, _cmd) = merge_ctx(false);
+        ctx.spec.merge_no = true;
+        let snap = crate::watch::PrSnap {
+            number: 1,
+            title: "title".into(),
+            life: crate::merge::PrLife::Open,
+            draft: false,
+            head_sha: "abc".into(),
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            merge: crate::merge::MergeInput {
+                life: crate::merge::PrLife::Open,
+                draft: false,
+                mergeable: crate::merge::Mergeability::Mergeable,
+                merge_state: crate::merge::MergeState::Clean,
+                checks: crate::merge::ChecksVerdict::AllGreen,
+                approvals: 1,
+                changes_requested: false,
+            },
+            failing_checks: Vec::new(),
+            notes: Vec::new(),
+            ci_label: String::new(),
+            author: "me".into(),
+            created_at: String::new(),
+            feedback: crate::watch::FeedbackCounts::default(),
+            feedback_warnings: Vec::new(),
+            comments_unavailable: false,
+            is_cross: false,
+            head_owner: "acme".into(),
+            head_repo: "app".into(),
+            head_url: String::new(),
+            maintainer_can_modify: true,
+        };
+
+        assert!(ctx.offer_merge(1, &snap).unwrap());
+        assert!(ctx.quit);
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, crate::tui::UiEvent::Confirm { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::tui::UiEvent::Exit { code: 0, message }
+                if message == "PR #1 はマージせずに終了します。"
+        )));
     }
 
     fn write_exe(path: &std::path::Path, body: &str) {
