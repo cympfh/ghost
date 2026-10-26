@@ -75,6 +75,8 @@ pub struct RunSpec {
     pub merge_yes: bool,
     /// Exit successfully instead of asking on the merge prompt.
     pub merge_no: bool,
+    /// Do not require approval in the agent's merge-readiness judgment.
+    pub skip_approval: bool,
     pub merge_method: Option<String>,
     pub max_turns: u32,
     pub lang: Lang,
@@ -2187,6 +2189,11 @@ impl Ctx {
     }
 
     fn decorate(&mut self, task: String) -> String {
+        let task = if self.spec.skip_approval {
+            format!("{task}\n{}", prompt::skip_approval_rule(self.spec.lang))
+        } else {
+            task
+        };
         if self.setup_failures.is_empty() {
             return task;
         }
@@ -3234,6 +3241,7 @@ mod tests {
                 agent: None,
                 merge_yes,
                 merge_no: false,
+                skip_approval: false,
                 merge_method: None,
                 max_turns: 20,
                 lang: Lang::Ja,
@@ -3381,6 +3389,15 @@ exit 0
         ctx.turn_signal = "GHOST_STATUS: merge_ready".into();
         ctx.record_merge_signal("abc");
         assert!(ctx.agent_merge_ready("abc"));
+    }
+
+    #[test]
+    fn skip_approval_is_added_to_agent_tasks() {
+        let (mut ctx, _events, _commands) = merge_ctx(false);
+        ctx.spec.skip_approval = true;
+        let task = ctx.decorate("task".into());
+        assert!(task.contains("approval 相当のコメントがなくても"));
+        assert!(task.contains("CI の条件は変更せず"));
     }
 
     #[test]

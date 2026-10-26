@@ -102,6 +102,13 @@ ghost re-checks mergeStateStatus and conflicts for the same head.
     }
 }
 
+pub fn skip_approval_rule(lang: Lang) -> String {
+    lang.say(
+        "`--skip-approval` が指定されている。approval や approval 相当のコメントがなくてもレビュー条件を満たしたものとして扱う。未解決の changes requested や修正依頼には対応する。CI の条件は変更せず、必ず満たす。\n",
+        "`--skip-approval` is set. Treat the review condition as satisfied without an approval or approval-equivalent comment. Still handle outstanding changes requested or fix requests. The CI condition is unchanged and must pass.\n",
+    )
+}
+
 fn review_verdict_rules(lang: Lang, slug: &str, number: u64) -> String {
     match lang {
         Lang::Ja => format!(
@@ -910,6 +917,18 @@ mod tests {
             true,
         );
         assert!(created.contains("あなたが今このプルリクエストを作ったばかりです"));
+    }
+
+    #[test]
+    fn skip_approval_keeps_ci_and_fix_requests_required() {
+        let en = skip_approval_rule(Lang::En);
+        assert!(en.contains("without an approval"));
+        assert!(en.contains("fix requests"));
+        assert!(en.contains("CI condition is unchanged"));
+
+        let ja = skip_approval_rule(Lang::Ja);
+        assert!(ja.contains("approval 相当のコメントがなくても"));
+        assert!(ja.contains("CI の条件は変更せず"));
     }
 
     #[test]
