@@ -28,7 +28,7 @@ Examples:
   ghost -d review
 
 GitHub access is only through the `gh` CLI. One agent session is started for the
-run; later updates resume it (claude --resume, codex exec resume, grok --resume).
+run; later updates resume it (claude --resume, codex exec resume, grok --resume, kimi --session).
 The default poll interval is 20s (`-i`). `-l` / `--lang` defaults to ja.
 `-k` / `--ssh-key` selects an ssh identity (or set GHOST_SSH_KEY).
 `-h` prints help and `-V` prints the version.
@@ -59,7 +59,7 @@ struct Cli {
     #[arg(long, short = 'i', default_value = "20s")]
     interval: String,
 
-    /// Coding agent. Default: first of codex, claude, grok on PATH.
+    /// Coding agent. Default: first of codex, claude, grok, kimi on PATH.
     #[arg(long, short = 'a', value_enum)]
     agent: Option<AgentKind>,
 
@@ -492,6 +492,9 @@ mod tests {
         let review = Cli::try_parse_from(["ghost", "github.com/a/b/pull/1", "-r"]).unwrap();
         assert!(review.review);
         assert!(!review.code);
+        let kimi =
+            Cli::try_parse_from(["ghost", "github.com/a/b/pull/1", "--agent", "kimi"]).unwrap();
+        assert_eq!(kimi.agent, Some(AgentKind::Kimi));
         let demo = Cli::try_parse_from(["ghost", "-d", "picker"]).unwrap();
         assert_eq!(demo.demo, Some(DemoScene::Picker));
         assert!(Cli::try_parse_from(["ghost", "github.com/a/b/pull/3", "-r", "-c"]).is_err());

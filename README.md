@@ -8,7 +8,7 @@ ghost has a local coding agent review a pull request, implement an issue, or fix
 
 ## Requirements
 
-You need the [GitHub CLI](https://cli.github.com/) and one of `codex`, `claude`, or `grok` on `PATH`. Log in with `gh auth login`.
+You need the [GitHub CLI](https://cli.github.com/) and one of `codex`, `claude`, `grok`, or `kimi` on `PATH`. Log in with `gh auth login`.
 
 ```sh
 cargo install --git https://github.com/cympfh/ghost

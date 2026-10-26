@@ -4,7 +4,7 @@ Details behind the short READMEs. ghost talks to GitHub only through `gh`.
 
 A target is `github.com/OWNER/REPO`, `.../pull/N`, `.../pulls`, `.../issues/N`, or `.../issues`. `/pulls` lists open pull requests and requires `--code` or `--review` before any network call; the error is `/pulls requires --code or --review`. `/pulls/N` is rejected, and the error names `/pull/N`. `/pr/N` and `/issue/N` are rejected, and the error names `/pull/N` or `/issues/N`. The local ref `refs/remotes/origin/pr/N` is where a fetched `pull/N/head` is stored. It is not a URL ghost accepts.
 
-You need `gh` (`gh auth login`) and one of `codex`, `claude`, or `grok` on `PATH`. Install with `cargo install --git https://github.com/cympfh/ghost`. If `gh` is missing, not logged in, or cannot read the repository, ghost explains the fix and exits. It also stops when no coding agent is on `PATH`.
+You need `gh` (`gh auth login`) and one of `codex`, `claude`, `grok`, or `kimi` on `PATH`. Install with `cargo install --git https://github.com/cympfh/ghost`. If `gh` is missing, not logged in, or cannot read the repository, ghost explains the fix and exits. It also stops when no coding agent is on `PATH`.
 
 ## Flags
 
@@ -13,7 +13,7 @@ You need `gh` (`gh auth login`) and one of `codex`, `claude`, or `grok` on `PATH
 | `-r` | `--review` | | Review the pull request. Cannot be combined with `-c`. |
 | `-c` | `--code` | | Fix failing CI and new review comments. Cannot be combined with `-r`. |
 | `-i` | `--interval` | `20s` | How often to check GitHub (`30s`, `2m`, `1h30m`, or a number of seconds). |
-| `-a` | `--agent` | first on `PATH` | `codex`, `claude`, or `grok`. |
+| `-a` | `--agent` | first on `PATH` | `codex`, `claude`, `grok`, or `kimi`. |
 | `-k` | `--ssh-key` | ssh config, or `GHOST_SSH_KEY` | Private key passed to ssh. |
 | `-l` | `--lang` | `ja` (`GHOST_LANG` if the flag is omitted) | `ja` or `en`. |
 | `-y` | `--yes` | | Accept the continue prompt and the review-exit prompt. Does not merge. |
@@ -127,6 +127,7 @@ Prompts tell the agent to use `gh` for GitHub, to reply in the selected language
 - Claude: `claude --print --dangerously-skip-permissions --input-format stream-json --output-format stream-json --verbose --session-id <uuid>`. Later prompts are JSON on stdin. If the process exits, the same flags use `--resume <uuid>`.
 - Codex: `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <dir> -`, then `codex --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check resume <thread_id>`. Resume has no `-C` and no `-s`.
 - Grok: `grok --prompt-file <file> --session-id <uuid> --output-format streaming-json --yolo --cwd <dir>`, then `--resume <uuid>` without `--session-id`.
+- Kimi: `kimi --output-format stream-json --prompt <instruction>`, then `kimi --session <id> --output-format stream-json --prompt <instruction>`. The short instruction tells Kimi to read the complete task from the prompt file, keeping large prompts out of argv. Kimi normally reports its session id in the final `session.resume_hint` event. If a failed or interrupted turn emits no hint, ghost recovers the session created after launch with `kimi session list --cwd <dir> --json`. Print mode uses automatic permissions, so ghost does not pass `--yolo`.
 
 Prompt files are `~/.ghost/prompts/pid<pid>-<slot>/`, one directory per process and per mode.
 

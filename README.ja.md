@@ -8,7 +8,7 @@ ghost はローカルのコーディングエージェントにプルリクエ�
 
 ## 必要なもの
 
-[GitHub CLI](https://cli.github.com/) と、`PATH` 上の `codex`、`claude`、`grok` のいずれかが必要です。ログインには `gh auth login` を使います。
+[GitHub CLI](https://cli.github.com/) と、`PATH` 上の `codex`、`claude`、`grok`、`kimi` のいずれかが必要です。ログインには `gh auth login` を使います。
 
 ```sh
 cargo install --git https://github.com/cympfh/ghost

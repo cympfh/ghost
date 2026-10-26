@@ -1,10 +1,10 @@
 //! One coding-agent session for the whole ghost run.
 //!
 //! The first task starts the session. Every later task is a follow-up in that
-//! same session: Claude and Grok `--resume <id>`, Codex `exec resume <id>`.
-//! A follow-up never starts a second conversation. Claude stays as one process
-//! and takes further prompts on stdin when that process is still alive; if it
-//! exits, ghost resumes the same session id.
+//! same session: Claude and Grok `--resume <id>`, Codex `exec resume <id>`, and
+//! Kimi `--session <id>`. A follow-up never starts a second conversation. Claude
+//! stays as one process and takes further prompts on stdin when that process is
+//! still alive; if it exits, ghost resumes the same session id.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -29,6 +29,7 @@ pub enum AgentKind {
     Codex,
     Claude,
     Grok,
+    Kimi,
 }
 
 impl AgentKind {
@@ -37,6 +38,7 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Grok => "grok",
+            Self::Kimi => "kimi",
         }
     }
 
@@ -45,6 +47,7 @@ impl AgentKind {
             Self::Codex => "codex exec resume <id>",
             Self::Claude => "claude --resume <id>",
             Self::Grok => "grok --resume <id>",
+            Self::Kimi => "kimi --session <id>",
         }
     }
 }
@@ -58,7 +61,7 @@ impl std::fmt::Display for AgentKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
     /// First turn. Claude and Grok are pinned to `preset_session_id`.
-    /// Codex reports its own thread id on stdout.
+    /// Codex and Kimi report their own session id on stdout.
     Start { preset_session_id: Option<String> },
     /// Continue the session that is already running. Not a new agent.
     Resume { session_id: String },
@@ -77,7 +80,7 @@ pub fn plan_launch(kind: AgentKind, existing: Option<&str>, new_uuid: &str) -> L
         }
     }
     match kind {
-        AgentKind::Codex => Launch::Start {
+        AgentKind::Codex | AgentKind::Kimi => Launch::Start {
             preset_session_id: None,
         },
         AgentKind::Claude | AgentKind::Grok => Launch::Start {
@@ -107,7 +110,7 @@ pub enum Delivery {
     StreamJson,
     /// Prompt bytes, then close stdin so the CLI starts.
     StdinClose,
-    /// Prompt already written to `--prompt-file`.
+    /// Prompt was written to a file; close stdin.
     PromptFile,
 }
 
@@ -116,6 +119,13 @@ pub struct AgentCommand {
     pub program: &'static str,
     pub args: Vec<String>,
     pub delivery: Delivery,
+}
+
+fn kimi_prompt_instruction(prompt_file: &Path) -> String {
+    format!(
+        "Read the file at {} with your file-reading tool. Its complete contents are your task for this turn. Follow those contents; do not ask for the task to be pasted into chat.",
+        prompt_file.display()
+    )
 }
 
 pub fn command_for(
@@ -235,6 +245,28 @@ pub fn command_for(
             ],
             delivery: Delivery::PromptFile,
         },
+        (AgentKind::Kimi, Launch::Start { .. }) => AgentCommand {
+            program: "kimi",
+            args: vec![
+                "--output-format".into(),
+                "stream-json".into(),
+                "--prompt".into(),
+                kimi_prompt_instruction(prompt_file),
+            ],
+            delivery: Delivery::PromptFile,
+        },
+        (AgentKind::Kimi, Launch::Resume { session_id }) => AgentCommand {
+            program: "kimi",
+            args: vec![
+                "--session".into(),
+                session_id.clone(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--prompt".into(),
+                kimi_prompt_instruction(prompt_file),
+            ],
+            delivery: Delivery::PromptFile,
+        },
         _ => return Err(format!("internal: {kind} start is missing a session id")),
     };
     Ok(cmd)
@@ -276,6 +308,30 @@ pub fn extract_session_id(line: &str) -> Option<String> {
     None
 }
 
+fn kimi_session_from_list(output: &str, started_at: u128) -> Option<String> {
+    let v: Value = serde_json::from_str(output).ok()?;
+    let sessions = match v.as_array() {
+        Some(sessions) => sessions,
+        None => v.get("sessions")?.as_array()?,
+    };
+    sessions
+        .iter()
+        .rev()
+        .filter(|session| {
+            session
+                .get("createdAt")
+                .and_then(|time| time.as_u64())
+                .is_some_and(|time| u128::from(time) >= started_at)
+        })
+        .find_map(|session| {
+            session
+                .get("id")
+                .and_then(|id| id.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+}
+
 pub fn event_is_error(kind: AgentKind, line: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
         return false;
@@ -284,8 +340,10 @@ pub fn event_is_error(kind: AgentKind, line: &str) -> bool {
     match kind {
         AgentKind::Claude => v.get("is_error").and_then(|b| b.as_bool()) == Some(true),
         AgentKind::Codex => ty == "turn.failed",
-        AgentKind::Grok => {
-            ty == "error" || v.get("is_error").and_then(|b| b.as_bool()) == Some(true)
+        AgentKind::Grok | AgentKind::Kimi => {
+            ty == "error"
+                || v.get("role").and_then(|r| r.as_str()) == Some("error")
+                || v.get("is_error").and_then(|b| b.as_bool()) == Some(true)
         }
     }
 }
@@ -331,6 +389,7 @@ fn has_agent_result_event(output: &str) -> bool {
         || compact.contains("\"type\":\"turn.failed\"")
         || compact.contains("\"type\":\"result\"")
         || compact.contains("\"type\":\"end\"")
+        || compact.contains("\"type\":\"session.resume_hint\"")
 }
 
 /// Record a review SHA or seen comments only after a finished successful turn.
@@ -355,6 +414,7 @@ pub fn is_turn_end(kind: AgentKind, line: &str) -> bool {
         AgentKind::Claude => ty == "result",
         AgentKind::Codex => ty == "turn.completed" || ty == "turn.failed",
         AgentKind::Grok => ty == "end" || ty == "result",
+        AgentKind::Kimi => ty == "session.resume_hint",
     }
 }
 
@@ -373,6 +433,15 @@ pub fn present_line(line: &str) -> Vec<String> {
 
 fn present_event(v: &Value) -> Vec<String> {
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role == "assistant" {
+        let mut out = texts_from_message(v);
+        out.extend(kimi_tool_calls(v));
+        return out;
+    }
+    if role == "meta" || role == "tool" {
+        return Vec::new();
+    }
     match ty {
         "system" | "thread.started" | "turn.started" | "turn.completed" | "turn.failed" | "end"
         | "result" => Vec::new(),
@@ -387,6 +456,7 @@ fn present_event(v: &Value) -> Vec<String> {
             .get("message")
             .and_then(|t| t.as_str())
             .or_else(|| v.get("error").and_then(|t| t.as_str()))
+            .or_else(|| v.get("content").and_then(|t| t.as_str()))
             .filter(|s| !s.is_empty())
             .map(|s| vec![s.to_string()])
             .unwrap_or_default(),
@@ -402,6 +472,34 @@ fn present_event(v: &Value) -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+fn kimi_tool_calls(msg: &Value) -> Vec<String> {
+    let Some(calls) = msg.get("tool_calls").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for call in calls {
+        let name = call
+            .pointer("/function/name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("tool");
+        let args = call
+            .pointer("/function/arguments")
+            .and_then(|a| a.as_str())
+            .and_then(|a| serde_json::from_str::<Value>(a).ok());
+        let cmd = args.as_ref().and_then(|args| {
+            args.get("command")
+                .and_then(|c| c.as_str())
+                .or_else(|| args.get("cmd").and_then(|c| c.as_str()))
+        });
+        if let Some(cmd) = cmd {
+            out.push(format!("$ {cmd}"));
+        } else {
+            out.push(format!("tool {name}"));
+        }
+    }
+    out
 }
 
 fn texts_from_message(msg: &Value) -> Vec<String> {
@@ -492,12 +590,20 @@ pub fn pick_agent(
             ))
         }
     } else {
-        for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Grok] {
+        for kind in [
+            AgentKind::Codex,
+            AgentKind::Claude,
+            AgentKind::Grok,
+            AgentKind::Kimi,
+        ] {
             if available(kind) {
                 return Ok(kind);
             }
         }
-        Err("no coding agent on PATH. Install codex, claude, or grok (tried in that order).".into())
+        Err(
+            "no coding agent on PATH. Install codex, claude, grok, or kimi (tried in that order)."
+                .into(),
+        )
     }
 }
 
@@ -549,6 +655,7 @@ pub struct AgentSession {
     fallback_dir: PathBuf,
     prompt_dir: PathBuf,
     session_id: Option<String>,
+    kimi_started_at: Option<u128>,
     child: Option<Child>,
     stdin: Option<std::process::ChildStdin>,
     rx: Option<Receiver<String>>,
@@ -582,6 +689,7 @@ impl AgentSession {
             fallback_dir: ghost_home.join("work"),
             prompt_dir: prompt_directory(ghost_home, slot),
             session_id: None,
+            kimi_started_at: None,
             child: None,
             stdin: None,
             rx: None,
@@ -639,7 +747,7 @@ impl AgentSession {
         self.broken_pipe
     }
 
-    /// Test hook: run this program instead of codex/claude/grok.
+    /// Test hook: run this program instead of the selected agent.
     pub fn set_stub(&mut self, program: PathBuf) {
         self.stub = Some(program);
     }
@@ -709,6 +817,14 @@ impl AgentSession {
             self.exited = false;
             return Ok(launch);
         }
+        if self.kind == AgentKind::Kimi && matches!(&launch, Launch::Start { .. }) {
+            self.kimi_started_at = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            );
+        }
         self.kill_child(9);
         self.spawn(&launch, prompt)?;
         if let Launch::Start {
@@ -722,8 +838,8 @@ impl AgentSession {
         Ok(launch)
     }
 
-    /// User text while Claude is still up. Codex and Grok cannot take stdin
-    /// mid-turn; the caller queues those and dispatches a follow-up later.
+    /// User text while Claude is still up. Codex, Grok, and Kimi cannot take
+    /// stdin mid-turn; the caller queues those and dispatches a follow-up later.
     pub fn push_live(&mut self, prompt: &str) -> Result<()> {
         if !self.accepts_live_input() {
             anyhow::bail!("agent is not accepting live input");
@@ -755,16 +871,43 @@ impl AgentSession {
         let _ = self.poll_lines();
         self.reap();
         if self.exited && self.readers.load(Ordering::SeqCst) == 0 && self.rx_empty() {
+            self.recover_kimi_session();
             self.turn_open = false;
             return true;
         }
-        // Claude stays up after a result event. Codex and Grok exit; their
-        // status is recorded above once the pipes drain.
+        // Claude stays up after a result event. Codex, Grok, and Kimi exit;
+        // their status is recorded above once the pipes drain.
         if self.kind == AgentKind::Claude && !self.turn_open && !self.exited && self.child.is_some()
         {
             return true;
         }
         false
+    }
+
+    fn recover_kimi_session(&mut self) {
+        if self.kind != AgentKind::Kimi || self.session_id.is_some() {
+            return;
+        }
+        let Some(started_at) = self.kimi_started_at else {
+            return;
+        };
+        let program = self.stub.clone().unwrap_or_else(|| PathBuf::from("kimi"));
+        let output = Command::new(program)
+            .args(["session", "list", "--cwd"])
+            .arg(&self.workdir)
+            .arg("--json")
+            .output();
+        let Ok(output) = output else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        if let Some(id) =
+            kimi_session_from_list(&String::from_utf8_lossy(&output.stdout), started_at)
+        {
+            self.session_id = Some(id);
+        }
     }
 
     pub fn interrupt(&mut self) {
@@ -797,7 +940,7 @@ impl AgentSession {
             Launch::Start {
                 preset_session_id: Some(id),
             } => id.clone(),
-            Launch::Start { .. } => "codex".into(),
+            Launch::Start { .. } => self.kind.as_str().into(),
         };
         let prompt_file = self.prompt_dir.join(format!("{file_key}.md"));
         fs::write(&prompt_file, prompt).context("write agent prompt")?;
@@ -1339,12 +1482,25 @@ mod tests {
         );
         assert!(pick_agent(None, |_| false).is_err());
 
-        let order = [AgentKind::Codex, AgentKind::Claude, AgentKind::Grok];
+        let order = [
+            AgentKind::Codex,
+            AgentKind::Claude,
+            AgentKind::Grok,
+            AgentKind::Kimi,
+        ];
         assert_eq!(
             pick_agent(None, |k| k == AgentKind::Claude || k == AgentKind::Grok).unwrap(),
             AgentKind::Claude
         );
         assert_eq!(order[0], AgentKind::Codex);
+        assert_eq!(
+            pick_agent(None, |k| k == AgentKind::Kimi).unwrap(),
+            AgentKind::Kimi
+        );
+        assert_eq!(
+            pick_agent(Some(AgentKind::Kimi), |k| k == AgentKind::Kimi).unwrap(),
+            AgentKind::Kimi
+        );
     }
 
     #[test]
@@ -1380,6 +1536,18 @@ mod tests {
             plan_launch(AgentKind::Codex, Some(thread), id),
             Launch::Resume {
                 session_id: thread.into()
+            }
+        );
+        assert_eq!(
+            plan_launch(AgentKind::Kimi, None, id),
+            Launch::Start {
+                preset_session_id: None
+            }
+        );
+        assert_eq!(
+            plan_launch(AgentKind::Kimi, Some("session-kimi-1"), id),
+            Launch::Resume {
+                session_id: "session-kimi-1".into()
             }
         );
     }
@@ -1603,6 +1771,52 @@ mod tests {
         assert!(!grok_resume
             .iter()
             .any(|a| a == "--session-id" || a == "--fork-session"));
+
+        let kimi_start = command_for(
+            AgentKind::Kimi,
+            &Launch::Start {
+                preset_session_id: None,
+            },
+            dir,
+            file,
+        )
+        .unwrap();
+        assert_eq!(kimi_start.program, "kimi");
+        assert_eq!(
+            kimi_start.args,
+            vec![
+                "--output-format".into(),
+                "stream-json".into(),
+                "--prompt".into(),
+                kimi_prompt_instruction(file),
+            ]
+        );
+        assert_eq!(kimi_start.delivery, Delivery::PromptFile);
+        assert!(!kimi_start.args.iter().any(|a| a == "--yolo"));
+        assert!(!kimi_start.args.iter().any(|a| a == "--session"));
+
+        let kimi_resume = command_for(
+            AgentKind::Kimi,
+            &Launch::Resume {
+                session_id: "session-kimi-1".into(),
+            },
+            dir,
+            file,
+        )
+        .unwrap();
+        assert_eq!(
+            kimi_resume.args,
+            vec![
+                "--session".into(),
+                "session-kimi-1".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--prompt".into(),
+                kimi_prompt_instruction(file),
+            ]
+        );
+        assert_eq!(kimi_resume.delivery, Delivery::PromptFile);
+        assert!(!kimi_resume.args.iter().any(|a| a == "--yolo"));
     }
 
     #[test]
@@ -1701,6 +1915,24 @@ mod tests {
             present_line("plain agent line"),
             vec!["plain agent line".to_string()]
         );
+
+        let kimi_assistant = r#"{"role":"assistant","content":"checking","tool_calls":[{"type":"function","id":"tc_1","function":{"name":"Shell","arguments":"{\"command\":\"git status\"}"}}]}"#;
+        assert_eq!(
+            present_line(kimi_assistant),
+            vec!["checking".to_string(), "$ git status".to_string()]
+        );
+        let kimi_end = r#"{"role":"meta","type":"session.resume_hint","session_id":"session-kimi-1","content":"kimi --session session-kimi-1"}"#;
+        assert_eq!(
+            extract_session_id(kimi_end).as_deref(),
+            Some("session-kimi-1")
+        );
+        assert!(is_turn_end(AgentKind::Kimi, kimi_end));
+        assert!(present_line(kimi_end).is_empty());
+        assert!(present_line(r#"{"role":"tool","content":"tool output"}"#).is_empty());
+        assert!(event_is_error(
+            AgentKind::Kimi,
+            r#"{"role":"error","content":"failed"}"#
+        ));
     }
 
     #[test]
@@ -2198,6 +2430,124 @@ mod tests {
         assert!(prompt_directory(&home, "pr-2-code")
             .join("codex.md")
             .is_file());
+        session.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kimi_large_prompt_stays_in_file_and_follow_up_uses_emitted_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-kimi-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let argv_out = dir.join("argv");
+        let stub = dir.join("stub-kimi");
+        write_exe(
+            &stub,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '{{\"role\":\"assistant\",\"content\":\"done\"}}'\necho '{{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session-kimi-1\"}}'\n",
+                argv_out.display()
+            ),
+        );
+        let home = dir.join("home");
+        let mut session = AgentSession::new(AgentKind::Kimi, work, &home, "main");
+        session.set_stub(stub);
+        let prompt = "あ".repeat(50_000);
+        assert!(prompt.len() > 131_072);
+        session.dispatch(&prompt).unwrap();
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(session.session_id(), Some("session-kimi-1"));
+        let prompt_dir = prompt_directory(&home, "main");
+        let prompt_file = prompt_dir.join("kimi.md");
+        assert_eq!(std::fs::read_to_string(&prompt_file).unwrap(), prompt);
+        assert_eq!(
+            std::fs::read_to_string(&argv_out).unwrap(),
+            format!(
+                "--output-format\nstream-json\n--prompt\n{}\n",
+                kimi_prompt_instruction(&prompt_file)
+            )
+        );
+
+        session.dispatch("follow up").unwrap();
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let resume_file = prompt_dir.join("session-kimi-1.md");
+        assert_eq!(
+            std::fs::read_to_string(&argv_out).unwrap(),
+            format!(
+                "--session\nsession-kimi-1\n--output-format\nstream-json\n--prompt\n{}\n",
+                kimi_prompt_instruction(&resume_file)
+            )
+        );
+        session.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kimi_failed_first_turn_recovers_created_session_for_follow_up() {
+        let sessions = r#"[
+            {"id":"later","createdAt":1200},
+            {"id":"mine","createdAt":1000},
+            {"id":"older","createdAt":999}
+        ]"#;
+        assert_eq!(
+            kimi_session_from_list(sessions, 1000).as_deref(),
+            Some("mine")
+        );
+        assert_eq!(kimi_session_from_list("[]", 1000), None);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-kimi-recover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let argv_out = dir.join("argv");
+        let stub = dir.join("stub-kimi");
+        write_exe(
+            &stub,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = session ]; then\n  echo '[{{\"id\":\"session-recovered\",\"createdAt\":9999999999999}}]'\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > '{}'\ncase \" $* \" in\n  *\" --session \"*)\n    echo '{{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session-recovered\"}}'\n    exit 0\n    ;;\nesac\nexit 1\n",
+                argv_out.display()
+            ),
+        );
+        let mut session = AgentSession::new(AgentKind::Kimi, work, &dir.join("home"), "main");
+        session.set_stub(stub);
+        session.dispatch("first try").unwrap();
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(session.last_exit_code(), Some(1));
+        assert_eq!(session.session_id(), Some("session-recovered"));
+
+        session.dispatch("follow up").unwrap();
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let args = std::fs::read_to_string(&argv_out).unwrap();
+        assert!(args.starts_with("--session\nsession-recovered\n"));
         session.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
