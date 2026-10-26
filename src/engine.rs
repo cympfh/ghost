@@ -764,9 +764,7 @@ impl Ctx {
         });
         let ok = self.dispatch_task(&task)?;
         self.note_setup_result(ok);
-        if !ok {
-            self.requeue_after_failed_send(notes);
-        }
+        self.note_user_input_result(ok, notes);
         if self.quit {
             return Ok((true, false));
         }
@@ -954,9 +952,7 @@ impl Ctx {
         ));
         let ok = self.dispatch_task(&task)?;
         self.note_setup_result(ok);
-        if !ok {
-            self.requeue_after_failed_send(user_notes);
-        }
+        self.note_user_input_result(ok, user_notes);
         if self.quit {
             return Ok((true, false));
         }
@@ -1055,9 +1051,7 @@ impl Ctx {
         let prompted: BTreeSet<String> = new_notes.iter().map(|n| n.id.clone()).collect();
         let ok = self.dispatch_task(&task)?;
         self.note_setup_result(ok);
-        if !ok {
-            self.requeue_after_failed_send(user_notes);
-        }
+        self.note_user_input_result(ok, user_notes);
         if self.quit {
             return Ok(());
         }
@@ -1366,11 +1360,18 @@ impl Ctx {
 
     /// Notes folded into the prompt that is about to be sent.
     fn take_queued_for_prompt(&mut self) -> Vec<String> {
-        let notes = std::mem::take(&mut self.queued);
-        if !notes.is_empty() {
-            self.log(input_delivery_log(InputPlan::SendNow, self.spec.lang));
+        std::mem::take(&mut self.queued)
+    }
+
+    fn note_user_input_result(&mut self, ok: bool, notes: Vec<String>) {
+        if notes.is_empty() {
+            return;
         }
-        notes
+        if ok {
+            self.log(input_delivery_log(InputPlan::SendNow, self.spec.lang));
+        } else {
+            self.requeue_after_failed_send(notes);
+        }
     }
 
     fn requeue_after_failed_send(&mut self, notes: Vec<String>) {
@@ -1492,9 +1493,7 @@ impl Ctx {
         self.arm_issue_push(&branch);
         let ok = self.dispatch_task(&task)?;
         self.note_setup_result(ok);
-        if !ok {
-            self.requeue_after_failed_send(user_notes);
-        }
+        self.note_user_input_result(ok, user_notes);
         if self.quit {
             return Ok(());
         }
@@ -2576,7 +2575,6 @@ impl Ctx {
             return Ok(());
         }
         let notes = std::mem::take(&mut self.queued);
-        self.log(input_delivery_log(InputPlan::SendNow, self.spec.lang));
         let prompt = self.decorate(prompt::user_nudge(
             self.spec.lang,
             &notes.join("\n\n"),
@@ -2585,10 +2583,9 @@ impl Ctx {
         let before = self.comment_ids_now();
         let ok = self.dispatch_task(&prompt)?;
         self.note_setup_result(ok);
+        self.note_user_input_result(ok, notes);
         if ok {
             self.absorb_queued_replies(&before);
-        } else {
-            self.requeue_after_failed_send(notes);
         }
         Ok(())
     }
@@ -3285,6 +3282,86 @@ mod tests {
             auto_release: None,
         };
         (ctx, rx, cmd_tx)
+    }
+
+    #[test]
+    fn user_input_reaches_the_agent_during_and_between_turns() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-user-input-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("agent");
+        let script = r#"#!/bin/sh
+count=$(cat '@DIR@/count' 2>/dev/null || printf '0')
+printf '%s' "$((count + 1))" > '@DIR@/count'
+cat > "@DIR@/prompt-$count"
+: > "@DIR@/started-$count"
+if [ "$count" -eq 0 ]; then
+  while [ ! -e '@DIR@/release' ]; do sleep 0.02; done
+fi
+printf '%s\n' '{"type":"thread.started","thread_id":"session-15"}' '{"type":"turn.completed"}'
+exit 0
+"#
+        .replace("@DIR@", &dir.display().to_string());
+        write_exe(&stub, &script);
+
+        let (mut ctx, rx, cmd_tx) = merge_ctx(false);
+        ctx.agent.set_workdir(dir.clone());
+        ctx.agent.set_stub(stub);
+        let worker = std::thread::spawn(move || {
+            let ok = ctx.dispatch_task("initial task").unwrap();
+            (ctx, ok)
+        });
+        let started = dir.join("started-0");
+        let start = std::time::Instant::now();
+        while !started.exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "stub did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cmd_tx
+            .send(crate::tui::UiCmd::Input("queued question".into()))
+            .unwrap();
+        std::fs::write(dir.join("release"), "").unwrap();
+        let (mut ctx, ok) = worker.join().unwrap();
+        assert!(ok);
+        ctx.on_input("idle question".into(), false).unwrap();
+
+        let queued = std::fs::read_to_string(dir.join("prompt-1")).unwrap();
+        let idle = std::fs::read_to_string(dir.join("prompt-2")).unwrap();
+        assert!(queued.contains("queued question"), "{queued}");
+        assert!(idle.contains("idle question"), "{idle}");
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    crate::tui::UiEvent::Log(line)
+                        if line.text == "→ エージェントに送信"
+                ))
+                .count(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_user_input_stays_queued_without_a_sent_log() {
+        let (mut ctx, rx, _cmd) = merge_ctx(false);
+        ctx.note_user_input_result(false, vec!["question".into()]);
+        assert_eq!(ctx.queued, vec!["question"]);
+        assert!(rx.try_iter().all(|event| !matches!(
+            event,
+            crate::tui::UiEvent::Log(line) if line.text == "→ エージェントに送信"
+        )));
     }
 
     #[test]

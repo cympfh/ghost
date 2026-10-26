@@ -1435,7 +1435,8 @@ mod tests {
     #[test]
     fn input_edits_by_character() {
         let mut app = App::new("ghost".into());
-        app.input_mode = true;
+        assert!(on_key(&mut app, key(KeyCode::Char('i'))).is_none());
+        assert!(app.input_mode);
         for ch in "あい".chars() {
             on_input_key(&mut app, key(KeyCode::Char(ch)));
         }
@@ -1444,6 +1445,12 @@ mod tests {
         on_input_key(&mut app, key(KeyCode::Backspace));
         assert_eq!(app.input, "あい");
         assert_eq!(app.cursor, 1);
+        assert_eq!(
+            on_input_key(&mut app, key(KeyCode::Enter)),
+            Some(UiCmd::Input("あい".into()))
+        );
+        assert!(!app.input_mode);
+        assert!(app.input.is_empty());
     }
 
     #[test]
