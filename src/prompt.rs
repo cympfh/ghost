@@ -64,15 +64,27 @@ fn role_code(lang: Lang) -> &'static str {
 }
 
 /// The agent judges CI and review sentiment; ghost re-checks the structural GitHub state.
-fn ci_status_rule(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ja => "\
+fn ci_status_rule(lang: Lang, skip_approval: bool) -> &'static str {
+    match (lang, skip_approval) {
+        (Lang::Ja, true) => "\
+CI とレビューの判断（`GHOST_STATUS` もこれと同じ）:
+- `gh pr checks` の一覧（statusCheckRollup）が空なら CI 未設定として扱う。一覧が空でないなら、今の head のチェックがすべて成功しているときだけ CI は通る。pending や失敗は needs_work。
+- approval や approval 相当のコメントがなくてもレビューは通る。未解決の changes requested や修正依頼があれば needs_work。
+- mergeStateStatus が CLEAN、コンフリクトなし、CI とレビューの条件を満たすときだけ `GHOST_STATUS: merge_ready`。
+",
+        (Lang::En, true) => "\
+CI and review rule (judge `GHOST_STATUS` the same way):
+- An empty `gh pr checks` list (statusCheckRollup) means CI is not configured and is acceptable. If the list is not empty, CI passes only when every check on the current head has passed. Pending or failed checks mean `needs_work`.
+- Reviews pass without an approval or approval-equivalent comment. Outstanding changes requested or fix requests mean `needs_work`.
+- Use `GHOST_STATUS: merge_ready` only when mergeStateStatus is CLEAN, there is no conflict, and both the CI and review conditions pass.
+",
+        (Lang::Ja, false) => "\
 CI とレビューの判断（`GHOST_STATUS` もこれと同じ）:
 - `gh pr checks` の一覧（statusCheckRollup）が空なら CI 未設定として扱う。一覧が空でないなら、今の head のチェックがすべて成功しているときだけ CI は通る。pending や失敗は needs_work。
 - approve が1件以上あるか、approve と判断できるコメントが1件以上あればレビューは通る。未解決の changes requested や修正依頼があれば needs_work。
 - mergeStateStatus が CLEAN、コンフリクトなし、CI とレビューの条件を満たすときだけ `GHOST_STATUS: merge_ready`。
 ",
-        Lang::En => "\
+        (Lang::En, false) => "\
 CI and review rule (judge `GHOST_STATUS` the same way):
 - An empty `gh pr checks` list (statusCheckRollup) means CI is not configured and is acceptable. If the list is not empty, CI passes only when every check on the current head has passed. Pending or failed checks mean `needs_work`.
 - Reviews pass with at least one approval or at least one comment you judge to be an approval equivalent. Outstanding changes requested or fix requests mean `needs_work`.
@@ -100,32 +112,6 @@ ghost re-checks mergeStateStatus and conflicts for the same head.
 "
         }
     }
-}
-
-pub fn skip_approval_rule(lang: Lang) -> String {
-    lang.say(
-        "`--skip-approval` が指定されている。approval や approval 相当のコメントがなくてもレビュー条件を満たしたものとして扱う。未解決の changes requested や修正依頼には対応する。CI の条件は変更せず、必ず満たす。\n",
-        "`--skip-approval` is set. Treat the review condition as satisfied without an approval or approval-equivalent comment. Still handle outstanding changes requested or fix requests. The CI condition is unchanged and must pass.\n",
-    )
-}
-
-/// Make the merge-status rules internally consistent when approval is optional.
-pub fn apply_skip_approval(task: String, lang: Lang) -> String {
-    let (required, optional) = match lang {
-        Lang::Ja => (
-            "- approve が1件以上あるか、approve と判断できるコメントが1件以上あればレビューは通る。未解決の changes requested や修正依頼があれば needs_work。",
-            "- approval や approval 相当のコメントがなくてもレビューは通る。未解決の changes requested や修正依頼があれば needs_work。",
-        ),
-        Lang::En => (
-            "- Reviews pass with at least one approval or at least one comment you judge to be an approval equivalent. Outstanding changes requested or fix requests mean `needs_work`.",
-            "- Reviews pass without an approval or approval-equivalent comment. Outstanding changes requested or fix requests mean `needs_work`.",
-        ),
-    };
-    format!(
-        "{}\n{}",
-        task.replace(required, optional),
-        skip_approval_rule(lang)
-    )
 }
 
 fn review_verdict_rules(lang: Lang, slug: &str, number: u64) -> String {
@@ -317,6 +303,7 @@ pub fn code_initial(
     user_notes: &[String],
     lang: Lang,
     push: &str,
+    skip_approval: bool,
 ) -> String {
     let intro = match lang {
         Lang::Ja => format!(
@@ -334,7 +321,11 @@ pub fn code_initial(
         head = header(lang, role_code(lang), slug, workdir),
         situation = code_situation(ci_failed, failing, notes, slug, number, lang),
         user = notes_block(user_notes, lang),
-        status = format!("{}{}", ci_status_rule(lang), merge_status_rule(lang)),
+        status = format!(
+            "{}{}",
+            ci_status_rule(lang, skip_approval),
+            merge_status_rule(lang)
+        ),
     )
 }
 
@@ -352,6 +343,7 @@ pub fn code_followup(
     lang: Lang,
     push: &str,
     created_here: bool,
+    skip_approval: bool,
 ) -> String {
     let intro = match lang {
         Lang::Ja => format!(
@@ -377,7 +369,11 @@ pub fn code_followup(
         head = header(lang, role_code(lang), slug, workdir),
         situation = code_situation(ci_failed, failing, notes, slug, number, lang),
         user = notes_block(user_notes, lang),
-        status = format!("{}{}", ci_status_rule(lang), merge_status_rule(lang)),
+        status = format!(
+            "{}{}",
+            ci_status_rule(lang, skip_approval),
+            merge_status_rule(lang)
+        ),
     )
 }
 
@@ -395,6 +391,7 @@ pub fn code_survey(
     user_notes: &[String],
     lang: Lang,
     push: &str,
+    skip_approval: bool,
 ) -> String {
     let intro = match lang {
         Lang::Ja => format!(
@@ -404,7 +401,7 @@ pub fn code_survey(
              未対応があればこのターンで扱う。落ちている CI は直す。未対応のコメントは直すか、スレッドに返信する。\n\
              作業ディレクトリ {wd} にブランチがチェックアウトされている。直すなら commit する。{push}\n\
              {ci}",
-            ci = ci_status_rule(Lang::Ja),
+            ci = ci_status_rule(Lang::Ja, skip_approval),
             wd = workdir.display(),
         ),
         Lang::En => format!(
@@ -414,7 +411,7 @@ pub fn code_survey(
              Handle anything outstanding in this turn. Fix failing CI. Fix or reply to unaddressed comments.\n\
              The branch is checked out in {wd}. When you change code, commit. {push}\n\
              {ci}",
-            ci = ci_status_rule(Lang::En),
+            ci = ci_status_rule(Lang::En, skip_approval),
             wd = workdir.display(),
         ),
     };
@@ -439,6 +436,7 @@ pub fn issue_initial(
     workdir: &Path,
     user_notes: &[String],
     lang: Lang,
+    skip_approval: bool,
 ) -> String {
     let body = truncate(body, 12_000);
     let title = untrusted("TITLE", title);
@@ -478,7 +476,11 @@ pub fn issue_initial(
         "{head}\n{task}{user}{status}",
         head = header(lang, role_code(lang), slug, workdir),
         user = notes_block(user_notes, lang),
-        status = format!("{}{}", ci_status_rule(lang), merge_status_rule(lang)),
+        status = format!(
+            "{}{}",
+            ci_status_rule(lang, skip_approval),
+            merge_status_rule(lang)
+        ),
     )
 }
 
@@ -495,6 +497,7 @@ pub fn issue_situation(
     pr: u64,
     user_notes: &[String],
     lang: Lang,
+    skip_approval: bool,
 ) -> String {
     let body = truncate(body, 12_000);
     let title = untrusted("TITLE", title);
@@ -522,7 +525,11 @@ pub fn issue_situation(
         "{head}\n{task}{user}{status}",
         head = header(lang, role_code(lang), slug, workdir),
         user = notes_block(user_notes, lang),
-        status = format!("{}{}", ci_status_rule(lang), merge_status_rule(lang)),
+        status = format!(
+            "{}{}",
+            ci_status_rule(lang, skip_approval),
+            merge_status_rule(lang)
+        ),
     )
 }
 
@@ -773,6 +780,7 @@ mod tests {
             &[],
             Lang::En,
             "Push only with `git push origin HEAD:feature`.",
+            false,
         );
         assert!(survey.contains("GHOST_STATUS: merge_ready"));
         assert!(survey.contains("GHOST_STATUS: needs_work"));
@@ -809,6 +817,7 @@ mod tests {
             Lang::En,
             "Push only with `git push origin HEAD:feature`.",
             false,
+            false,
         );
         assert!(!code.contains("You just created this pull request"));
         assert!(code.contains("same coding session"));
@@ -834,6 +843,7 @@ mod tests {
             Lang::En,
             "Push only with `git push origin HEAD:feature`.",
             true,
+            false,
         );
         assert!(created.contains("You just created this pull request"));
 
@@ -847,6 +857,7 @@ mod tests {
             dir,
             &[],
             Lang::En,
+            false,
         );
         assert!(issue.contains("Closes #7"));
         assert!(issue.contains("Do not open a new issue"));
@@ -871,6 +882,7 @@ mod tests {
             dir,
             &[],
             Lang::Ja,
+            false,
         );
         assert!(issue.contains("日本語"));
         assert!(issue.contains("Closes #7"));
@@ -891,6 +903,7 @@ mod tests {
             &[],
             Lang::Ja,
             "push はこのコマンドだけ",
+            false,
         );
         assert!(survey.contains("一覧が空"));
         assert!(survey.contains("CI 未設定として扱う"));
@@ -914,6 +927,7 @@ mod tests {
             &[],
             Lang::Ja,
             "push はこのコマンドだけ",
+            false,
         );
         assert!(code.contains("盲目的に従わなくてよい"));
         assert!(code.contains("無視しない"));
@@ -934,30 +948,19 @@ mod tests {
             Lang::Ja,
             "push はこのコマンドだけ",
             true,
+            false,
         );
         assert!(created.contains("あなたが今このプルリクエストを作ったばかりです"));
     }
 
     #[test]
-    fn skip_approval_keeps_ci_and_fix_requests_required() {
-        let en = skip_approval_rule(Lang::En);
-        assert!(en.contains("without an approval"));
-        assert!(en.contains("fix requests"));
-        assert!(en.contains("CI condition is unchanged"));
-
-        let ja = skip_approval_rule(Lang::Ja);
-        assert!(ja.contains("approval 相当のコメントがなくても"));
-        assert!(ja.contains("CI の条件は変更せず"));
-    }
-
-    #[test]
-    fn skip_approval_replaces_the_conflicting_status_rule() {
-        let en = apply_skip_approval(ci_status_rule(Lang::En).into(), Lang::En);
+    fn skip_approval_selects_a_consistent_status_rule() {
+        let en = ci_status_rule(Lang::En, true);
         assert!(en.contains("Reviews pass without an approval"));
         assert!(!en.contains("Reviews pass with at least one approval"));
         assert!(en.contains("Outstanding changes requested"));
 
-        let ja = apply_skip_approval(ci_status_rule(Lang::Ja).into(), Lang::Ja);
+        let ja = ci_status_rule(Lang::Ja, true);
         assert!(ja.contains("approval 相当のコメントがなくてもレビューは通る"));
         assert!(!ja.contains("approve が1件以上"));
         assert!(ja.contains("未解決の changes requested"));
