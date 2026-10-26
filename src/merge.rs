@@ -75,10 +75,10 @@ impl StopReason {
         match self {
             Self::MergeReady => lang.say(
                 &format!(
-                    "PR #{number} はマージ可能です（CLEAN、すべてのチェック成功、1件以上の approve、未解決の changes requested なし、コンフリクトなし）。終了します。"
+                    "PR #{number} はマージ可能です（CLEAN、競合なし、エージェントが CI とレビューを確認済み）。終了します。"
                 ),
                 &format!(
-                    "PR #{number} is merge-ready (CLEAN, all checks passed, at least one approval, no outstanding changes requested, mergeable). Exiting."
+                    "PR #{number} is merge-ready (CLEAN, no conflicts, and the agent accepted CI and reviews). Exiting."
                 ),
             ),
             Self::Merged => lang.say(
@@ -129,30 +129,21 @@ pub fn parse_mergeable(value: &str) -> Mergeability {
     }
 }
 
-/// Code-mode merge-ready: open, not a draft, `mergeStateStatus` CLEAN,
-/// not conflicting, all checks green, at least one approval, and no
-/// outstanding changes-requested review. Missing or pending checks wait.
+/// GitHub's structural merge state. The agent judges CI and review sentiment separately.
 pub fn is_merge_ready(input: &MergeInput) -> bool {
     input.life == PrLife::Open
         && !input.draft
         && input.merge_state == MergeState::Clean
         && input.mergeable != Mergeability::Conflicting
-        && checks_allow_merge(input.checks)
-        && input.approvals > 0
-        && !input.changes_requested
 }
 
-fn checks_allow_merge(checks: ChecksVerdict) -> bool {
-    checks == ChecksVerdict::AllGreen
-}
-
-/// One line per code poll. Empty CI is `none(wait)`; pending is `pending(wait)`.
-pub fn merge_ready_line(input: &MergeInput) -> String {
+/// One line per code poll. The answer includes the agent's judgment for this head.
+pub fn merge_ready_line(input: &MergeInput, agent_ready: bool) -> String {
     let ci = match input.checks {
-        ChecksVerdict::None => "none(wait)",
-        ChecksVerdict::AllGreen => "green(ok)",
-        ChecksVerdict::Pending => "pending(wait)",
-        ChecksVerdict::Failed => "failed(block)",
+        ChecksVerdict::None => "none",
+        ChecksVerdict::AllGreen => "green",
+        ChecksVerdict::Pending => "pending",
+        ChecksVerdict::Failed => "failed",
     };
     let state = match input.merge_state {
         MergeState::Clean => "CLEAN",
@@ -164,9 +155,13 @@ pub fn merge_ready_line(input: &MergeInput) -> String {
         MergeState::Unknown => "UNKNOWN",
     };
     let changes = if input.changes_requested { 1 } else { 0 };
-    let answer = if is_merge_ready(input) { "yes" } else { "no" };
+    let answer = if is_merge_ready(input) && agent_ready {
+        "yes"
+    } else {
+        "no"
+    };
     format!(
-        "merge-ready? CI {ci} / {state} / approvals {} / changes requested {changes} → {answer}",
+        "merge-ready? CI {ci} / {state} / approvals {} / changes requested {changes} / agent {agent_ready} → {answer}",
         input.approvals
     )
 }
@@ -326,11 +321,11 @@ pub fn merge_method_rejected(text: &str) -> bool {
     method && denied
 }
 
-pub fn stop_reason(input: &MergeInput) -> Option<StopReason> {
+pub fn stop_reason(input: &MergeInput, agent_ready: bool) -> Option<StopReason> {
     match input.life {
         PrLife::Merged => Some(StopReason::Merged),
         PrLife::Closed => Some(StopReason::Closed),
-        PrLife::Open if is_merge_ready(input) => Some(StopReason::MergeReady),
+        PrLife::Open if is_merge_ready(input) && agent_ready => Some(StopReason::MergeReady),
         PrLife::Open => None,
     }
 }
@@ -520,65 +515,48 @@ mod tests {
     }
 
     #[test]
-    fn merge_ready_requires_every_signal() {
-        assert_eq!(stop_reason(&open_ready()), Some(StopReason::MergeReady));
+    fn merge_ready_requires_github_state_and_agent_judgment() {
+        assert_eq!(
+            stop_reason(&open_ready(), true),
+            Some(StopReason::MergeReady)
+        );
+        assert_eq!(stop_reason(&open_ready(), false), None);
 
         let mut no_approval = open_ready();
         no_approval.approvals = 0;
+        no_approval.changes_requested = true;
+        no_approval.checks = ChecksVerdict::Failed;
         assert_eq!(
-            stop_reason(&no_approval),
-            None,
-            "CLEAN with green checks still requires an approval"
+            stop_reason(&no_approval, true),
+            Some(StopReason::MergeReady),
+            "the agent can accept an approve-equivalent comment and interpret CI"
         );
         assert_eq!(
-            merge_ready_line(&no_approval),
-            "merge-ready? CI green(ok) / CLEAN / approvals 0 / changes requested 0 → no"
+            merge_ready_line(&no_approval, true),
+            "merge-ready? CI failed / CLEAN / approvals 0 / changes requested 1 / agent true → yes"
         );
-
-        let mut changes = open_ready();
-        changes.changes_requested = true;
-        assert_eq!(stop_reason(&changes), None);
 
         let mut conflict = open_ready();
         conflict.mergeable = Mergeability::Conflicting;
-        assert_eq!(stop_reason(&conflict), None);
+        assert_eq!(stop_reason(&conflict, true), None);
 
         let mut unknown = open_ready();
         unknown.mergeable = Mergeability::Unknown;
         assert_eq!(
-            stop_reason(&unknown),
+            stop_reason(&unknown, true),
             Some(StopReason::MergeReady),
             "CLEAN and not conflicting is enough when mergeable is unknown"
         );
 
-        let mut pending = open_ready();
-        pending.checks = ChecksVerdict::Pending;
-        assert_eq!(stop_reason(&pending), None);
-
-        let mut failed = open_ready();
-        failed.checks = ChecksVerdict::Failed;
-        assert_eq!(stop_reason(&failed), None);
-
         let mut draft = open_ready();
         draft.draft = true;
-        assert_eq!(stop_reason(&draft), None);
+        assert_eq!(stop_reason(&draft, true), None);
 
-        let mut no_checks = open_ready();
-        no_checks.checks = ChecksVerdict::None;
-        assert!(
-            !is_merge_ready(&no_checks),
-            "an empty check list waits even when the PR is approved"
-        );
+        let no_checks = open_ready();
+        assert!(is_merge_ready(&no_checks));
         assert_eq!(
-            merge_ready_line(&no_checks),
-            "merge-ready? CI none(wait) / CLEAN / approvals 1 / changes requested 0 → no"
-        );
-        let mut pending_empty_state = no_checks.clone();
-        pending_empty_state.checks = ChecksVerdict::Pending;
-        assert!(!is_merge_ready(&pending_empty_state));
-        assert_eq!(
-            merge_ready_line(&pending_empty_state),
-            "merge-ready? CI pending(wait) / CLEAN / approvals 1 / changes requested 0 → no"
+            merge_ready_line(&no_checks, false),
+            "merge-ready? CI green / CLEAN / approvals 1 / changes requested 0 / agent false → no"
         );
 
         let mut behind = open_ready();
@@ -750,11 +728,11 @@ mod tests {
         let mut merged = open_ready();
         merged.life = PrLife::Merged;
         merged.checks = ChecksVerdict::Failed;
-        assert_eq!(stop_reason(&merged), Some(StopReason::Merged));
+        assert_eq!(stop_reason(&merged, false), Some(StopReason::Merged));
 
         let mut closed = open_ready();
         closed.life = PrLife::Closed;
-        assert_eq!(stop_reason(&closed), Some(StopReason::Closed));
+        assert_eq!(stop_reason(&closed, false), Some(StopReason::Closed));
         assert_eq!(StopReason::Closed.exit_code(), 2);
         assert_eq!(StopReason::MergeReady.exit_code(), 0);
     }

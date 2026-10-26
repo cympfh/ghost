@@ -173,8 +173,8 @@ This program deliberately runs coding agents with their permission prompts disab
 - `--trust-comments` controls which feedback wakes code mode and defaults to `all`. `--trust-issues` separately controls automatic issue selection and defaults to `collaborators`.
 - The generated `gh` and `git` wrappers are accident guards, not sandboxing or authorization boundaries. Agents can bypass them with aliases, absolute executable paths, or other commands.
 - Review mode refuses pushes through the wrapper. Code mode constrains pushes to the planned remote and refspec, including fork-specific handling. Do not weaken these checks without preserving their tested behavior.
-- Agents are instructed never to merge. Ghost itself performs merges only through its merge flow, re-checking the head SHA and passing exactly one method plus `--match-head-commit`.
-- Merge readiness still requires the same head to be observed ready on two checks at least one polling interval apart. `--merge-yes` and `--merge-no` do not bypass that delay.
+- Agents may use `gh pr merge` and merge endpoints. Ghost's own merge flow re-checks the head SHA and passes exactly one method plus `--match-head-commit`.
+- The coding agent judges CI and review sentiment with `GHOST_STATUS`; ghost separately checks the structural GitHub state. Merge readiness still requires the same head to be observed ready on two checks at least one polling interval apart. `--merge-yes` and `--merge-no` do not bypass that delay.
 - Issue mode continues into code mode automatically after opening or finding a pull request. A newly created PR adds that context to the first code follow-up. Review mode exits automatically after an approve verdict. `--merge-yes` is the separate auto-merge option; `--merge-no` exits successfully without merging or asking.
 - Do not print tokens or credential contents in logs or errors. Existing preflight error handling deliberately suppresses lines that appear to contain tokens.
 - Avoid live GitHub operations in ordinary unit tests, especially pushes, merges, issue creation, or comments.

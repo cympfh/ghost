@@ -185,6 +185,27 @@ pub fn parse_ghost_verdict(text: &str) -> Option<ReviewVerdict> {
     found
 }
 
+/// Last `GHOST_STATUS:` line in a coding-agent turn.
+pub fn merge_ready_signal(output: &str) -> Option<bool> {
+    let mut found = None;
+    for line in output.lines() {
+        let line = line.trim();
+        let Some(rest) = line.split("GHOST_STATUS:").nth(1) else {
+            continue;
+        };
+        let word = rest
+            .split(|c: char| c.is_whitespace() || c == '"' || c == '`' || c == ',')
+            .find(|s| !s.is_empty())
+            .unwrap_or("");
+        found = match word {
+            "merge_ready" => Some(true),
+            "needs_work" => Some(false),
+            _ => found,
+        };
+    }
+    found
+}
+
 /// Review stops on merged/closed, or an approve verdict for this head.
 /// Merge-ready does not end a review.
 pub fn decide_review(
@@ -275,8 +296,9 @@ pub fn decide_code(
     turns: u32,
     max_turns: u32,
     handled_ci: Option<&CiHandled>,
+    agent_ready: bool,
 ) -> Result<CodeAction, MaxTurns> {
-    if let Some(reason) = stop_reason(&snap.merge) {
+    if let Some(reason) = stop_reason(&snap.merge, agent_ready) {
         return Ok(CodeAction::Stop(reason));
     }
     let new_notes = unseen_notes(&snap.notes, seen);
@@ -673,7 +695,7 @@ mod tests {
     }
 
     fn code(pr: &PrSnap, seen: &BTreeSet<String>) -> CodeAction {
-        decide_code(pr, seen, 0, 20, None).unwrap()
+        decide_code(pr, seen, 0, 20, None, false).unwrap()
     }
 
     #[test]
@@ -737,6 +759,13 @@ mod tests {
             parse_ghost_verdict("GHOST_VERDICT: comment\nGHOST_VERDICT: request_changes"),
             Some(ReviewVerdict::RequestChanges)
         );
+        assert_eq!(merge_ready_signal("GHOST_STATUS: merge_ready"), Some(true));
+        assert_eq!(merge_ready_signal("GHOST_STATUS: needs_work"), Some(false));
+        assert_eq!(
+            merge_ready_signal("GHOST_STATUS: merge_ready\nGHOST_STATUS: needs_work"),
+            Some(false)
+        );
+        assert_eq!(merge_ready_signal("looks ready"), None);
     }
 
     #[test]
@@ -744,7 +773,7 @@ mod tests {
         let mut ready = snap("abc", ChecksVerdict::AllGreen);
         ready.merge.merge_state = crate::merge::MergeState::Clean;
         ready.merge.approvals = 1;
-        let action = decide_code(&ready, &BTreeSet::new(), 0, 20, None).unwrap();
+        let action = decide_code(&ready, &BTreeSet::new(), 0, 20, None, true).unwrap();
         assert!(matches!(action, CodeAction::Stop(StopReason::MergeReady)));
         assert_eq!(
             code_step(CodeLaunch::Survey, false, action),
@@ -753,7 +782,7 @@ mod tests {
         assert_eq!(after_opening_survey(true), AfterSurvey::MergePrompt);
         assert_eq!(after_opening_survey(false), AfterSurvey::Poll);
         let idle = snap("abc", ChecksVerdict::Pending);
-        let idle = decide_code(&idle, &BTreeSet::new(), 0, 20, None).unwrap();
+        let idle = decide_code(&idle, &BTreeSet::new(), 0, 20, None, false).unwrap();
         assert_eq!(
             code_step(
                 CodeLaunch::Handoff {
@@ -792,7 +821,7 @@ mod tests {
         assert_eq!(code(&pr, &seen), CodeAction::Idle);
 
         pr.merge.checks = ChecksVerdict::Failed;
-        match decide_code(&pr, &seen, 0, 20, None).unwrap() {
+        match decide_code(&pr, &seen, 0, 20, None, false).unwrap() {
             CodeAction::Fix {
                 ci_failed,
                 new_notes,
@@ -806,7 +835,7 @@ mod tests {
         pr.merge.checks = ChecksVerdict::AllGreen;
         pr.notes
             .push(Note::new("c1", "ada", "please rename this", "review"));
-        match decide_code(&pr, &seen, 0, 20, None).unwrap() {
+        match decide_code(&pr, &seen, 0, 20, None, false).unwrap() {
             CodeAction::Fix {
                 ci_failed,
                 new_notes,
@@ -820,7 +849,7 @@ mod tests {
         let mut seen = BTreeSet::new();
         seen.insert("c1".to_string());
         assert_eq!(
-            decide_code(&pr, &seen, 0, 20, None).unwrap(),
+            decide_code(&pr, &seen, 0, 20, None, false).unwrap(),
             CodeAction::Idle,
             "already-seen comments are not a new update"
         );
@@ -834,12 +863,12 @@ mod tests {
         let seen = BTreeSet::new();
         let handled = CiHandled::new("abc", ["build"]);
         assert_eq!(
-            decide_code(&pr, &seen, 0, 20, Some(&handled)).unwrap(),
+            decide_code(&pr, &seen, 0, 20, Some(&handled), false).unwrap(),
             CodeAction::Idle
         );
         pr.failing_checks = vec!["lint".into(), "build".into()];
         assert!(matches!(
-            decide_code(&pr, &seen, 0, 20, Some(&handled)).unwrap(),
+            decide_code(&pr, &seen, 0, 20, Some(&handled), false).unwrap(),
             CodeAction::Fix {
                 ci_failed: true,
                 ..
@@ -848,7 +877,7 @@ mod tests {
         pr.failing_checks = vec!["build".into()];
         pr.head_sha = "def".into();
         assert!(matches!(
-            decide_code(&pr, &seen, 0, 20, Some(&handled)).unwrap(),
+            decide_code(&pr, &seen, 0, 20, Some(&handled), false).unwrap(),
             CodeAction::Fix {
                 ci_failed: true,
                 ..
@@ -857,41 +886,33 @@ mod tests {
     }
 
     #[test]
-    fn clean_pull_waits_for_ci_and_approval() {
+    fn clean_pull_waits_for_agent_judgment_instead_of_raw_review_counts() {
         let mut pr = snap("abc", ChecksVerdict::None);
         pr.ci_label = "none".into();
         pr.merge.merge_state = crate::merge::MergeState::Clean;
         pr.merge.mergeable = Mergeability::Mergeable;
-        pr.merge.approvals = 1;
+        pr.merge.approvals = 0;
         pr.merge.changes_requested = false;
-        let action = decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap();
+        let action = decide_code(&pr, &BTreeSet::new(), 0, 20, None, false).unwrap();
         assert_eq!(action, CodeAction::Idle);
         assert_eq!(
-            code_step(CodeLaunch::Survey, true, action.clone()),
-            CodeStep::Action(action),
-            "after the opening turn, a quiet no-CI poll does not offer merge"
+            crate::merge::merge_ready_line(&pr.merge, false),
+            "merge-ready? CI none / CLEAN / approvals 0 / changes requested 0 / agent false → no"
         );
         assert_eq!(
-            crate::merge::merge_ready_line(&pr.merge),
-            "merge-ready? CI none(wait) / CLEAN / approvals 1 / changes requested 0 → no"
+            decide_code(&pr, &BTreeSet::new(), 0, 20, None, true).unwrap(),
+            CodeAction::Stop(StopReason::MergeReady),
+            "the agent may treat no CI and an approve-equivalent comment as ready"
         );
-        pr.merge.checks = ChecksVerdict::Pending;
-        assert_eq!(
-            decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap(),
-            CodeAction::Idle,
-            "pending checks wait and do not prompt"
-        );
-        pr.merge.checks = ChecksVerdict::AllGreen;
-        assert_eq!(
-            decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap(),
-            CodeAction::Stop(StopReason::MergeReady)
-        );
-        pr.merge.approvals = 0;
-        assert_eq!(
-            decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap(),
-            CodeAction::Idle,
-            "a newly opened PR with green CI but no review does not prompt"
-        );
+        pr.merge.checks = ChecksVerdict::Failed;
+        pr.merge.changes_requested = true;
+        assert!(matches!(
+            decide_code(&pr, &BTreeSet::new(), 0, 20, None, false).unwrap(),
+            CodeAction::Fix {
+                ci_failed: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -899,7 +920,7 @@ mod tests {
         let pr = snap("abc", ChecksVerdict::None);
         let review = decide_review(&pr, Some("abc"), 0, 20, ReviewSignal::default()).unwrap();
         assert!(!wakes_agent_review(&review));
-        let code_action = decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap();
+        let code_action = decide_code(&pr, &BTreeSet::new(), 0, 20, None, false).unwrap();
         assert!(!wakes_agent_code(&code_action));
         assert_eq!(code_action, CodeAction::Idle);
     }
@@ -953,7 +974,7 @@ mod tests {
             &agent_ids,
         );
         assert_eq!(pr.notes.len(), 2);
-        match decide_code(&pr, &seen, 0, 20, None).unwrap() {
+        match decide_code(&pr, &seen, 0, 20, None, false).unwrap() {
             CodeAction::Fix { new_notes, .. } => {
                 assert_eq!(new_notes.len(), 2);
                 assert!(new_notes.iter().any(|n| n.id == "review:10"));
@@ -1121,7 +1142,7 @@ mod tests {
         assert_eq!(restricted.stats.log_line(), "filtered 3 (untrusted author)");
         let mut pr = snap("abc", ChecksVerdict::None);
         pr.notes = kept;
-        match decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap() {
+        match decide_code(&pr, &BTreeSet::new(), 0, 20, None, false).unwrap() {
             CodeAction::Fix { new_notes, .. } => {
                 assert!(new_notes.iter().any(|n| n.author == "Copilot"));
                 assert!(new_notes
@@ -1145,7 +1166,7 @@ mod tests {
     fn sha_change_alone_does_not_wake_code_mode() {
         let pr = snap("brand-new", ChecksVerdict::AllGreen);
         assert_eq!(
-            decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap(),
+            decide_code(&pr, &BTreeSet::new(), 0, 20, None, false).unwrap(),
             CodeAction::Idle
         );
     }

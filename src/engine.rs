@@ -36,9 +36,10 @@ use crate::tui::{
 };
 use crate::watch::{
     after_review_verdict, approve_signal, baseline_agent_comments, code_step, decide_code,
-    decide_review, ensure_closing_line, feedback_log, filter_notes, mark_viewer, review_step,
-    seen_after_survey, CiHandled, CodeAction, CodeLaunch, CodeStep, CommentTrust, MaxTurns, Note,
-    PrSnap, ReviewAction, ReviewLaunch, ReviewSignal, ReviewStep,
+    decide_review, ensure_closing_line, feedback_log, filter_notes, mark_viewer,
+    merge_ready_signal, review_step, seen_after_survey, CiHandled, CodeAction, CodeLaunch,
+    CodeStep, CommentTrust, MaxTurns, Note, PrSnap, ReviewAction, ReviewLaunch, ReviewSignal,
+    ReviewStep,
 };
 use crate::workdir::{self, Checkout};
 
@@ -546,6 +547,7 @@ fn babysit(
         interrupted: false,
         last_idle_sha: None,
         merge_streak: MergeReadyStreak::with_gap(interval),
+        merge_agent: None,
         merge_hold: None,
         cwd_fallback_logged: false,
         code_pr: None,
@@ -613,6 +615,7 @@ struct Ctx {
     interrupted: bool,
     last_idle_sha: Option<String>,
     merge_streak: MergeReadyStreak,
+    merge_agent: Option<(String, bool)>,
     merge_hold: Option<MergeHold>,
     cwd_fallback_logged: bool,
     code_pr: Option<u64>,
@@ -821,11 +824,16 @@ impl Ctx {
                     let agent_ids = self.code_agent_ids.clone();
                     let filtered = self.prepare_notes(&mut snap, &agent_ids);
                     self.log(filtered);
-                    self.log(merge_ready_line(&snap.merge));
-                    let merge_confirmed = self
-                        .merge_streak
-                        .observe(&snap.head_sha, is_merge_ready(&snap.merge));
-                    if is_merge_ready(&snap.merge) && !merge_confirmed {
+                    if matches!(launch, CodeLaunch::Handoff { .. }) && self.merge_agent.is_none() {
+                        self.record_merge_signal(&snap.head_sha);
+                    }
+                    let ready = self.merge_ready(&snap);
+                    self.log(merge_ready_line(
+                        &snap.merge,
+                        self.agent_merge_ready(&snap.head_sha),
+                    ));
+                    let merge_confirmed = self.merge_streak.observe(&snap.head_sha, ready);
+                    if ready && !merge_confirmed {
                         self.log_merge_wait(&snap.head_sha);
                     }
                     (snap, merge_confirmed)
@@ -850,6 +858,7 @@ impl Ctx {
                 self.turns,
                 self.spec.max_turns,
                 handled.as_ref(),
+                self.merge_ready(&snap),
             ) {
                 Err(MaxTurns) => {
                     self.stop(3, self.max_message());
@@ -958,6 +967,7 @@ impl Ctx {
             ));
             return Ok((false, false));
         }
+        self.record_merge_signal(&snap.head_sha);
         for id in seen_after_survey(&startup_ids, true) {
             self.code_seen.insert(id);
         }
@@ -978,14 +988,14 @@ impl Ctx {
                 return Ok((false, true));
             }
         };
-        self.log(merge_ready_line(&fresh.merge));
+        let ready = self.merge_ready(&fresh);
+        self.log(merge_ready_line(
+            &fresh.merge,
+            self.agent_merge_ready(&fresh.head_sha),
+        ));
         // The survey refetch is the same moment as the poll above. Counting it
         // would merge about a second after launch when CI has not registered.
-        let leave = accept_survey_refetch(
-            &mut self.merge_streak,
-            &fresh.head_sha,
-            is_merge_ready(&fresh.merge),
-        );
+        let leave = accept_survey_refetch(&mut self.merge_streak, &fresh.head_sha, ready);
         Ok((leave, true))
     }
 
@@ -1058,6 +1068,7 @@ impl Ctx {
             ));
             return Ok(());
         }
+        self.record_merge_signal(&snap.head_sha);
         for id in &prompted {
             self.code_seen.insert(id.clone());
         }
@@ -1078,14 +1089,32 @@ impl Ctx {
                 return Ok(());
             }
         };
-        self.log(merge_ready_line(&fresh.merge));
+        self.log(merge_ready_line(
+            &fresh.merge,
+            self.agent_merge_ready(&fresh.head_sha),
+        ));
         let _ = self.offer_if_merge_repeated(number, &fresh)?;
         Ok(())
     }
 
+    fn record_merge_signal(&mut self, sha: &str) {
+        let ready = merge_ready_signal(&self.turn_signal).unwrap_or(false);
+        self.merge_agent = Some((sha.to_string(), ready));
+    }
+
+    fn agent_merge_ready(&self, sha: &str) -> bool {
+        self.merge_agent
+            .as_ref()
+            .is_some_and(|(judged_sha, ready)| *ready && judged_sha == sha)
+    }
+
+    fn merge_ready(&self, snap: &PrSnap) -> bool {
+        is_merge_ready(&snap.merge) && self.agent_merge_ready(&snap.head_sha)
+    }
+
     /// Offer merge only when this head was already merge-ready on the previous look.
     fn offer_if_merge_repeated(&mut self, number: u64, snap: &PrSnap) -> Result<bool> {
-        let ready = is_merge_ready(&snap.merge);
+        let ready = self.merge_ready(snap);
         let confirmed = self.merge_streak.observe(&snap.head_sha, ready);
         if ready && !confirmed {
             self.log_merge_wait(&snap.head_sha);
@@ -1198,7 +1227,7 @@ impl Ctx {
                 return Ok(false);
             }
         };
-        if !commit_merge(is_merge_ready(&fresh.merge), expected_sha, &fresh.head_sha) {
+        if !commit_merge(self.merge_ready(&fresh), expected_sha, &fresh.head_sha) {
             self.log(self.say(
                 "head SHA が動いたか、もうマージ可能ではないので merge しません。監視を続けます。",
                 "Head SHA moved or the PR is no longer merge-ready. Not merging; continuing to watch.",
@@ -2009,6 +2038,7 @@ impl Ctx {
         self.interrupted = false;
         self.last_idle_sha = None;
         self.merge_streak = MergeReadyStreak::with_gap(self.spec.interval);
+        self.merge_agent = None;
         self.merge_hold = None;
         self.code_pr = None;
         self.code_path = None;
@@ -3243,6 +3273,7 @@ mod tests {
             interrupted: false,
             last_idle_sha: None,
             merge_streak: crate::merge::MergeReadyStreak::with_gap(Duration::from_secs(20)),
+            merge_agent: Some(("abc".into(), true)),
             merge_hold: None,
             cwd_fallback_logged: false,
             code_pr: None,
@@ -3254,6 +3285,25 @@ mod tests {
             auto_release: None,
         };
         (ctx, rx, cmd_tx)
+    }
+
+    #[test]
+    fn agent_merge_judgment_is_bound_to_the_judged_head() {
+        let (mut ctx, _rx, _cmd) = merge_ctx(false);
+        assert!(ctx.agent_merge_ready("abc"));
+        assert!(!ctx.agent_merge_ready("def"));
+
+        ctx.turn_signal = "GHOST_STATUS: needs_work".into();
+        ctx.record_merge_signal("abc");
+        assert!(!ctx.agent_merge_ready("abc"));
+
+        ctx.turn_signal = "no machine-readable status".into();
+        ctx.record_merge_signal("abc");
+        assert!(!ctx.agent_merge_ready("abc"));
+
+        ctx.turn_signal = "GHOST_STATUS: merge_ready".into();
+        ctx.record_merge_signal("abc");
+        assert!(ctx.agent_merge_ready("abc"));
     }
 
     #[test]

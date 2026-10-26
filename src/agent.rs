@@ -1259,7 +1259,6 @@ pos=0
 a1=""
 a2=""
 method=""
-merge_api=0
 repo_arg=""
 same_repo() {
   if [ -z "$repo_arg" ]; then
@@ -1300,9 +1299,6 @@ for arg in "$@"; do
     if [ "$expect" = "repo" ]; then
       repo_arg=$arg
     fi
-    case "$arg" in
-      *[Mm][Ee][Rr][Gg][Ee][Pp][Uu][Ll][Ll][Rr][Ee][Qq][Uu][Ee][Ss][Tt]*) merge_api=1 ;;
-    esac
     expect=""
     continue
   fi
@@ -1317,7 +1313,6 @@ for arg in "$@"; do
     --repo=*|--hostname=*|--jq=*|--field=*|--raw-field=*|--input=*|--header=*|--cache=*|--template=*|--method=*)
       case "$arg" in
         --method=DELETE|--method=delete|--method=Delete) method=DELETE ;;
-        *[Mm][Ee][Rr][Gg][Ee][Pp][Uu][Ll][Ll][Rr][Ee][Qq][Uu][Ee][Ss][Tt]*) merge_api=1 ;;
       esac
       ;;
     -*) ;;
@@ -1325,28 +1320,18 @@ for arg in "$@"; do
       pos=$((pos + 1))
       if [ "$pos" -eq 1 ]; then a1=$arg; fi
       if [ "$pos" -eq 2 ]; then a2=$arg; fi
-      case "$arg" in
-        *[Mm][Ee][Rr][Gg][Ee][Pp][Uu][Ll][Ll][Rr][Ee][Qq][Uu][Ee][Ss][Tt]*) merge_api=1 ;;
-        */merge|*/merge/|*/merge\?*|*/merges|*/merges/|*/merges\?*) merge_api=1 ;;
-      esac
       ;;
   esac
 done
 case "$a1 $a2" in
-  "pr merge"|"repo delete"|"repo archive"|"issue delete"|"release delete")
+  "repo delete"|"repo archive"|"issue delete"|"release delete")
     echo "ghost: refusing gh $a1 $a2" >&2
     exit 99
     ;;
 esac
-if [ "$a1" = "api" ]; then
-  if [ "$method" = "DELETE" ]; then
-    echo "ghost: refusing gh api DELETE" >&2
-    exit 99
-  fi
-  if [ "$merge_api" -eq 1 ]; then
-    echo "ghost: refusing gh api merge" >&2
-    exit 99
-  fi
+if [ "$a1" = "api" ] && [ "$method" = "DELETE" ]; then
+  echo "ghost: refusing gh api DELETE" >&2
+  exit 99
 fi
 if [ "$a1" = "issue" ] && [ "$a2" = "create" ]; then
   errf="${TMPDIR:-/tmp}/ghost-issue-create-$$.err"
@@ -2088,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn gh_wrapper_passes_argv_through_and_blocks_accidental_merge() {
+    fn gh_wrapper_allows_merge_and_blocks_destructive_commands() {
         let dir = std::env::temp_dir().join(format!(
             "ghost-gh-{}-{}",
             std::process::id(),
@@ -2186,22 +2171,21 @@ mod tests {
                 "denied command must not reach real gh: {args:?}"
             );
         };
-        refused(&["pr", "merge", "2", "--squash"], "refusing");
+        let merge = ["pr", "merge", "2", "--squash"];
+        assert_eq!(passed(&merge), merge);
         refused(&["repo", "delete", "acme/app", "--yes"], "refusing");
         refused(&["api", "-X", "DELETE", "repos/acme/app"], "DELETE");
         refused(&["api", "--method=DELETE", "repos/acme/app"], "DELETE");
         refused(&["api", "-XDELETE", "repos/acme/app"], "DELETE");
-        refused(&["api", "repos/o/r/pulls/1/merge"], "merge");
-        refused(&["api", "-X", "PUT", "repos/o/r/pulls/1/merge"], "merge");
-        refused(
-            &[
-                "api",
-                "graphql",
-                "-f",
-                "query=mutation { mergePullRequest(input:{}) { clientMutationId } }",
-            ],
-            "merge",
-        );
+        let merge_endpoint = ["api", "-X", "PUT", "repos/o/r/pulls/1/merge"];
+        assert_eq!(passed(&merge_endpoint), merge_endpoint);
+        let merge_mutation = [
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation { mergePullRequest(input:{}) { clientMutationId } }",
+        ];
+        assert_eq!(passed(&merge_mutation), merge_mutation);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
