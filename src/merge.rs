@@ -75,10 +75,10 @@ impl StopReason {
         match self {
             Self::MergeReady => lang.say(
                 &format!(
-                    "PR #{number} はマージ可能です（CLEAN、チェックは空かすべて成功、未解決の changes requested なし、コンフリクトなし）。終了します。"
+                    "PR #{number} はマージ可能です（CLEAN、すべてのチェック成功、1件以上の approve、未解決の changes requested なし、コンフリクトなし）。終了します。"
                 ),
                 &format!(
-                    "PR #{number} is merge-ready (CLEAN, no checks or all checks passed, no outstanding changes requested, mergeable). Exiting."
+                    "PR #{number} is merge-ready (CLEAN, all checks passed, at least one approval, no outstanding changes requested, mergeable). Exiting."
                 ),
             ),
             Self::Merged => lang.say(
@@ -130,26 +130,26 @@ pub fn parse_mergeable(value: &str) -> Mergeability {
 }
 
 /// Code-mode merge-ready: open, not a draft, `mergeStateStatus` CLEAN,
-/// not conflicting, and no outstanding changes-requested review.
-/// A non-empty check list must be all green. Pending waits. An empty list
-/// means this PR has no CI, so CI is ignored. Approvals are not required.
+/// not conflicting, all checks green, at least one approval, and no
+/// outstanding changes-requested review. Missing or pending checks wait.
 pub fn is_merge_ready(input: &MergeInput) -> bool {
     input.life == PrLife::Open
         && !input.draft
         && input.merge_state == MergeState::Clean
         && input.mergeable != Mergeability::Conflicting
         && checks_allow_merge(input.checks)
+        && input.approvals > 0
         && !input.changes_requested
 }
 
 fn checks_allow_merge(checks: ChecksVerdict) -> bool {
-    matches!(checks, ChecksVerdict::None | ChecksVerdict::AllGreen)
+    checks == ChecksVerdict::AllGreen
 }
 
-/// One line per code poll. Empty CI is `none(ok)`; pending is `pending(wait)`.
+/// One line per code poll. Empty CI is `none(wait)`; pending is `pending(wait)`.
 pub fn merge_ready_line(input: &MergeInput) -> String {
     let ci = match input.checks {
-        ChecksVerdict::None => "none(ok)",
+        ChecksVerdict::None => "none(wait)",
         ChecksVerdict::AllGreen => "green(ok)",
         ChecksVerdict::Pending => "pending(wait)",
         ChecksVerdict::Failed => "failed(block)",
@@ -165,7 +165,10 @@ pub fn merge_ready_line(input: &MergeInput) -> String {
     };
     let changes = if input.changes_requested { 1 } else { 0 };
     let answer = if is_merge_ready(input) { "yes" } else { "no" };
-    format!("merge-ready? CI {ci} / {state} / changes requested {changes} → {answer}")
+    format!(
+        "merge-ready? CI {ci} / {state} / approvals {} / changes requested {changes} → {answer}",
+        input.approvals
+    )
 }
 
 /// What the merge prompt decided. Enter, Esc, and Ctrl-C are exit.
@@ -524,8 +527,12 @@ mod tests {
         no_approval.approvals = 0;
         assert_eq!(
             stop_reason(&no_approval),
-            Some(StopReason::MergeReady),
-            "CLEAN with registered green checks does not also require an approval count"
+            None,
+            "CLEAN with green checks still requires an approval"
+        );
+        assert_eq!(
+            merge_ready_line(&no_approval),
+            "merge-ready? CI green(ok) / CLEAN / approvals 0 / changes requested 0 → no"
         );
 
         let mut changes = open_ready();
@@ -558,21 +565,20 @@ mod tests {
 
         let mut no_checks = open_ready();
         no_checks.checks = ChecksVerdict::None;
-        no_checks.approvals = 0;
         assert!(
-            is_merge_ready(&no_checks),
-            "an empty check list means no CI and is ignored when CLEAN"
+            !is_merge_ready(&no_checks),
+            "an empty check list waits even when the PR is approved"
         );
         assert_eq!(
             merge_ready_line(&no_checks),
-            "merge-ready? CI none(ok) / CLEAN / changes requested 0 → yes"
+            "merge-ready? CI none(wait) / CLEAN / approvals 1 / changes requested 0 → no"
         );
         let mut pending_empty_state = no_checks.clone();
         pending_empty_state.checks = ChecksVerdict::Pending;
         assert!(!is_merge_ready(&pending_empty_state));
         assert_eq!(
             merge_ready_line(&pending_empty_state),
-            "merge-ready? CI pending(wait) / CLEAN / changes requested 0 → no"
+            "merge-ready? CI pending(wait) / CLEAN / approvals 1 / changes requested 0 → no"
         );
 
         let mut behind = open_ready();

@@ -168,11 +168,11 @@ fn code_scene(tx: &Sender<UiEvent>) {
 
 fn merge_confirm_scene(tx: &Sender<UiEvent>) {
     send_status(
-        tx, "code", "PR #3", "confirm", "abc1234", "none", "1/20", "codex", "—",
+        tx, "code", "PR #3", "confirm", "abc1234", "green", "1/20", "codex", "—",
     );
     sys(
         tx,
-        "merge-ready? CI none(ok) / CLEAN / changes requested 0 → yes",
+        "merge-ready? CI green(ok) / CLEAN / approvals 1 / changes requested 0 → yes",
     );
     let method = MergeStyle::Squash;
     let _ = tx.send(UiEvent::Confirm {

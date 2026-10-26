@@ -743,6 +743,7 @@ mod tests {
     fn standalone_code_surveys_before_the_merge_prompt() {
         let mut ready = snap("abc", ChecksVerdict::AllGreen);
         ready.merge.merge_state = crate::merge::MergeState::Clean;
+        ready.merge.approvals = 1;
         let action = decide_code(&ready, &BTreeSet::new(), 0, 20, None).unwrap();
         assert!(matches!(action, CodeAction::Stop(StopReason::MergeReady)));
         assert_eq!(
@@ -856,23 +857,23 @@ mod tests {
     }
 
     #[test]
-    fn no_ci_clean_pull_is_merge_ready_on_a_quiet_poll() {
+    fn clean_pull_waits_for_ci_and_approval() {
         let mut pr = snap("abc", ChecksVerdict::None);
         pr.ci_label = "none".into();
         pr.merge.merge_state = crate::merge::MergeState::Clean;
         pr.merge.mergeable = Mergeability::Mergeable;
-        pr.merge.approvals = 0;
+        pr.merge.approvals = 1;
         pr.merge.changes_requested = false;
         let action = decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap();
-        assert_eq!(action, CodeAction::Stop(StopReason::MergeReady));
+        assert_eq!(action, CodeAction::Idle);
         assert_eq!(
             code_step(CodeLaunch::Survey, true, action.clone()),
             CodeStep::Action(action),
-            "after the opening turn, a quiet no-CI poll still offers merge"
+            "after the opening turn, a quiet no-CI poll does not offer merge"
         );
         assert_eq!(
             crate::merge::merge_ready_line(&pr.merge),
-            "merge-ready? CI none(ok) / CLEAN / changes requested 0 → yes"
+            "merge-ready? CI none(wait) / CLEAN / approvals 1 / changes requested 0 → no"
         );
         pr.merge.checks = ChecksVerdict::Pending;
         assert_eq!(
@@ -884,6 +885,12 @@ mod tests {
         assert_eq!(
             decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap(),
             CodeAction::Stop(StopReason::MergeReady)
+        );
+        pr.merge.approvals = 0;
+        assert_eq!(
+            decide_code(&pr, &BTreeSet::new(), 0, 20, None).unwrap(),
+            CodeAction::Idle,
+            "a newly opened PR with green CI but no review does not prompt"
         );
     }
 
