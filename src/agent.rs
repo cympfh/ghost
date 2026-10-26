@@ -260,6 +260,8 @@ pub fn command_for(
             args: vec![
                 "--session".into(),
                 session_id.clone(),
+                "--add-dir".into(),
+                dir,
                 "--output-format".into(),
                 "stream-json".into(),
                 "--prompt".into(),
@@ -655,6 +657,9 @@ pub struct AgentSession {
     fallback_dir: PathBuf,
     prompt_dir: PathBuf,
     session_id: Option<String>,
+    /// Kimi ties a session to the directory where it was created. Keep using
+    /// that directory after an issue session hands off to a PR worktree.
+    kimi_session_cwd: Option<PathBuf>,
     kimi_started_at: Option<u128>,
     child: Option<Child>,
     stdin: Option<std::process::ChildStdin>,
@@ -689,6 +694,7 @@ impl AgentSession {
             fallback_dir: ghost_home.join("work"),
             prompt_dir: prompt_directory(ghost_home, slot),
             session_id: None,
+            kimi_session_cwd: None,
             kimi_started_at: None,
             child: None,
             stdin: None,
@@ -773,6 +779,7 @@ impl AgentSession {
     pub fn forget_session(&mut self) {
         self.kill_child(9);
         self.session_id = None;
+        self.kimi_session_cwd = None;
         self.turn_open = false;
     }
 
@@ -892,9 +899,10 @@ impl AgentSession {
             return;
         };
         let program = self.stub.clone().unwrap_or_else(|| PathBuf::from("kimi"));
+        let cwd = self.kimi_session_cwd.as_ref().unwrap_or(&self.workdir);
         let output = Command::new(program)
             .args(["session", "list", "--cwd"])
-            .arg(&self.workdir)
+            .arg(cwd)
             .arg("--json")
             .output();
         let Ok(output) = output else {
@@ -934,6 +942,9 @@ impl AgentSession {
         // A missing slot must not make `current_dir` fail with ENOENT.
         // The agent runs in ~/.ghost/work and the prompt carries the failed step.
         self.workdir = existing_cwd(&self.workdir, &self.fallback_dir);
+        if self.kind == AgentKind::Kimi && matches!(launch, Launch::Start { .. }) {
+            self.kimi_session_cwd = Some(self.workdir.clone());
+        }
         fs::create_dir_all(&self.prompt_dir)?;
         let file_key = match launch {
             Launch::Resume { session_id } => session_id.clone(),
@@ -953,7 +964,13 @@ impl AgentSession {
             .unwrap_or_else(|| PathBuf::from(spec.program));
         let mut cmd = Command::new(&program);
         cmd.args(&spec.args);
-        cmd.current_dir(&self.workdir)
+        let process_cwd = if self.kind == AgentKind::Kimi && matches!(launch, Launch::Resume { .. })
+        {
+            self.kimi_session_cwd.as_ref().unwrap_or(&self.workdir)
+        } else {
+            &self.workdir
+        };
+        cmd.current_dir(process_cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1794,6 +1811,8 @@ mod tests {
             vec![
                 "--session".into(),
                 "session-kimi-1".into(),
+                "--add-dir".into(),
+                dir.display().to_string(),
                 "--output-format".into(),
                 "stream-json".into(),
                 "--prompt".into(),
@@ -2441,7 +2460,7 @@ mod tests {
             ),
         );
         let home = dir.join("home");
-        let mut session = AgentSession::new(AgentKind::Kimi, work, &home, "main");
+        let mut session = AgentSession::new(AgentKind::Kimi, work.clone(), &home, "main");
         session.set_stub(stub);
         let prompt = "あ".repeat(50_000);
         assert!(prompt.len() > 131_072);
@@ -2473,10 +2492,69 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&argv_out).unwrap(),
             format!(
-                "--session\nsession-kimi-1\n--output-format\nstream-json\n--prompt\n{}\n",
+                "--session\nsession-kimi-1\n--add-dir\n{}\n--output-format\nstream-json\n--prompt\n{}\n",
+                work.display(),
                 kimi_prompt_instruction(&resume_file)
             )
         );
+        session.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kimi_resume_keeps_session_cwd_after_workdir_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-kimi-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let issue_work = dir.join("issue-13");
+        let pr_work = dir.join("pr-20-code");
+        std::fs::create_dir_all(&issue_work).unwrap();
+        std::fs::create_dir_all(&pr_work).unwrap();
+        let cwd_out = dir.join("cwd");
+        let argv_out = dir.join("argv");
+        let stub = dir.join("stub-kimi");
+        write_exe(
+            &stub,
+            &format!(
+                "#!/bin/sh\npwd -P > '{}'\nprintf '%s\\n' \"$@\" > '{}'\necho '{{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session-kimi-1\"}}'\n",
+                cwd_out.display(),
+                argv_out.display()
+            ),
+        );
+        let mut session = AgentSession::new(
+            AgentKind::Kimi,
+            issue_work.clone(),
+            &dir.join("home"),
+            "issue-13",
+        );
+        session.set_stub(stub);
+        session.dispatch("implement issue").unwrap();
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        session.set_workdir(pr_work.clone());
+        session.set_prompt_slot("pr-20-code");
+        session.dispatch("follow up").unwrap();
+        let start = std::time::Instant::now();
+        while !session.turn_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&cwd_out).unwrap().trim(),
+            issue_work.canonicalize().unwrap().display().to_string()
+        );
+        let args = std::fs::read_to_string(&argv_out).unwrap();
+        assert!(args.contains(&format!("--add-dir\n{}\n", pr_work.display())));
         session.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
