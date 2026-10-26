@@ -197,13 +197,13 @@ pub fn merge_key(key: MergeKey) -> MergeAnswer {
     }
 }
 
-/// `--merge-yes` merges without asking.
-/// A non-TTY without `--merge-yes` exits without merging.
+/// `--merge-yes` merges and `--merge-no` exits without asking.
+/// A non-TTY without either flag exits without merging.
 /// `None` means the TUI must ask.
-pub fn auto_merge_answer(merge_yes: bool, tty: bool) -> Option<MergeAnswer> {
+pub fn auto_merge_answer(merge_yes: bool, merge_no: bool, tty: bool) -> Option<MergeAnswer> {
     if merge_yes {
         Some(MergeAnswer::Merge)
-    } else if !tty {
+    } else if merge_no || !tty {
         Some(MergeAnswer::Exit)
     } else {
         None
@@ -601,9 +601,19 @@ mod tests {
         assert_eq!(merge_key(MergeKey::Esc), MergeAnswer::Exit);
         assert_eq!(merge_key(MergeKey::CtrlC), MergeAnswer::Exit);
 
-        assert_eq!(auto_merge_answer(false, true), None);
-        assert_eq!(auto_merge_answer(true, false), Some(MergeAnswer::Merge));
-        assert_eq!(auto_merge_answer(false, false), Some(MergeAnswer::Exit));
+        assert_eq!(auto_merge_answer(false, false, true), None);
+        assert_eq!(
+            auto_merge_answer(true, false, false),
+            Some(MergeAnswer::Merge)
+        );
+        assert_eq!(
+            auto_merge_answer(false, true, true),
+            Some(MergeAnswer::Exit)
+        );
+        assert_eq!(
+            auto_merge_answer(false, false, false),
+            Some(MergeAnswer::Exit)
+        );
         assert!(commit_merge(true, "abc", "abc"));
         assert!(!commit_merge(true, "abc", "zzz"));
         assert!(!commit_merge(false, "abc", "abc"));
