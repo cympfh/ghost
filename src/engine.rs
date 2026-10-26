@@ -3334,7 +3334,7 @@ mod tests {
 
         let ready = |sha: &str| {
             format!(
-                r#"{{"number":1,"title":"t","state":"OPEN","isDraft":false,"headRefOid":"{sha}","headRefName":"feature","baseRefName":"main","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"","statusCheckRollup":[],"reviews":[],"comments":[],"author":{{"login":"me"}},"isCrossRepository":false,"maintainerCanModify":true}}"#
+                r#"{{"number":1,"title":"t","state":"OPEN","isDraft":false,"headRefOid":"{sha}","headRefName":"feature","baseRefName":"main","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","statusCheckRollup":[{{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}}],"reviews":[],"comments":[],"author":{{"login":"me"}},"isCrossRepository":false,"maintainerCanModify":true}}"#
             )
         };
         std::fs::write(&view, ready("def")).unwrap();

@@ -69,16 +69,16 @@ fn role_code(lang: Lang) -> &'static str {
 fn ci_status_rule(lang: Lang) -> &'static str {
     match lang {
         Lang::Ja => "\
-CI の判断（`GHOST_STATUS` もこれと同じ）:
-- `gh pr checks` の一覧（statusCheckRollup）が空なら、この PR に CI は無い。CI は無視する。
+CI とレビューの判断（`GHOST_STATUS` もこれと同じ）:
+- `gh pr checks` の一覧（statusCheckRollup）が空なら CI 未完了として待つ（needs_work）。
 - 一覧が空でないなら、今の head のチェックがすべて成功しているときだけ CI は通る。pending やまだ出ていないチェックは待つ（needs_work）。失敗も needs_work。
-- mergeStateStatus が CLEAN、コンフリクトなし、未解決の changes requested なし、かつ CI が空かすべて成功なら `GHOST_STATUS: merge_ready`。approve の件数は要らない。
+- mergeStateStatus が CLEAN、コンフリクトなし、未解決の changes requested なし、CI がすべて成功、かつ approve が1件以上あるときだけ `GHOST_STATUS: merge_ready`。
 ",
         Lang::En => "\
-CI rule (judge `GHOST_STATUS` the same way):
-- If `gh pr checks` (statusCheckRollup) is empty, this PR has no CI. Ignore CI.
+CI and review rule (judge `GHOST_STATUS` the same way):
+- If `gh pr checks` (statusCheckRollup) is empty, CI is incomplete, so wait (`needs_work`).
 - If the list is not empty, CI passes only when every check on the current head has passed. Pending or not-yet-registered checks mean wait (`needs_work`). A failure is also `needs_work`.
-- `GHOST_STATUS: merge_ready` only when mergeStateStatus is CLEAN, there is no conflict, there is no outstanding changes requested, and CI is empty or all green. An approval count is not required.
+- `GHOST_STATUS: merge_ready` only when mergeStateStatus is CLEAN, there is no conflict, there is no outstanding changes requested, every check is green, and at least one approval exists.
 ",
     }
 }
@@ -735,7 +735,8 @@ mod tests {
         assert!(survey.contains("GHOST_STATUS: needs_work"));
         assert!(survey.contains("Never merge"));
         assert!(survey.contains("statusCheckRollup"));
-        assert!(survey.contains("Ignore CI"));
+        assert!(survey.contains("CI is incomplete"));
+        assert!(survey.contains("at least one approval"));
 
         let follow = review_followup(
             "acme/app",
@@ -846,7 +847,8 @@ mod tests {
             "push はこのコマンドだけ",
         );
         assert!(survey.contains("一覧が空"));
-        assert!(survey.contains("CI は無視する"));
+        assert!(survey.contains("CI 未完了として待つ"));
+        assert!(survey.contains("approve が1件以上"));
         assert!(survey.contains("GHOST_STATUS: merge_ready"));
         assert!(survey.contains("pending"));
         let review = review_initial("acme/app", 3, "題", "abc", dir, "diff", &[], Lang::Ja);

@@ -103,7 +103,7 @@ A review turn that ends with `GHOST_VERDICT: approve` exits automatically. On yo
 
 ## When ghost merges
 
-Mergeable means open, not a draft, `mergeStateStatus` CLEAN, not conflicting, and no outstanding changes requested. If `gh pr checks` lists checks, every one must have passed. A pending check waits. An empty list means there is no CI. Approvals are not required. A later `COMMENTED` review does not clear an earlier approval from the same reviewer.
+Mergeable means open, not a draft, `mergeStateStatus` CLEAN, not conflicting, and no outstanding changes requested. Every check listed by `gh pr checks` must have passed, and at least one approval is required. A pending check or an empty check list waits. A later `COMMENTED` review does not clear an earlier approval from the same reviewer.
 
 ghost offers merge only after the same commit has been mergeable on two checks at least one interval apart. The refetch at the end of the opening turn is not one of those checks. `--merge-yes` waits for the second check too. `y` re-reads the commit and runs `gh pr merge` with exactly one of `--merge`, `--squash`, or `--rebase`, plus `--match-head-commit`. The method on screen starts as `--merge-method`, or squash when the flag is omitted. `c` asks again only after the commit, a review or comment, or an agent turn changes.
 
