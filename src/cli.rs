@@ -36,6 +36,7 @@ Launch always starts the agent for a situation check, even when nothing is new.
 Later polls with nothing new do not call the agent. `i` always delivers text to the agent.
 `--merge-yes` (no short flag) merges in --code, issue, or --auto mode after a re-check.
 `--merge-no` exits successfully without merging or asking when merge-ready.
+`-s` / `--skip-approval` does not require approval; CI is still required.
 `--auto` is only valid with /issues. It takes the oldest open issue on each check and keeps waiting when none are left.
 `/pulls` lists open pull requests and requires --code or --review."
 )]
@@ -72,6 +73,10 @@ struct Cli {
     /// Exit successfully without merging when --code, issue, or --auto is merge-ready.
     #[arg(long)]
     merge_no: bool,
+
+    /// Do not require approval for merge readiness. CI is still required.
+    #[arg(long, short = 's')]
+    skip_approval: bool,
 
     /// `gh pr merge` method. Default is squash (`--squash`).
     #[arg(long, value_enum)]
@@ -130,6 +135,7 @@ pub fn run() -> Result<i32> {
         cli.trust_issues,
         cli.merge_yes,
         cli.merge_no,
+        cli.skip_approval,
         cli.merge_method
             .map(MergeMethod::gh_flag)
             .map(str::to_string),
@@ -166,6 +172,7 @@ fn resolve(
     trust_issues: Option<CommentTrust>,
     merge_yes: bool,
     merge_no: bool,
+    skip_approval: bool,
     merge_method: Option<String>,
 ) -> Result<Action, String> {
     if merge_yes && merge_no {
@@ -196,14 +203,14 @@ fn resolve(
     let interval = parse_interval(interval)?;
     let target = parse_target(target_raw)?;
     let mode = mode_for(&target, review, code, auto)?;
-    if (merge_yes || merge_no || merge_method.is_some())
+    if (merge_yes || merge_no || skip_approval || merge_method.is_some())
         && !matches!(
             mode,
             RunMode::Code | RunMode::Issue | RunMode::Auto | RunMode::PullList(ListedPull::Code)
         )
     {
         return Err(
-            "--merge-yes, --merge-no, and --merge-method are only valid with --code, an issue URL, or --auto"
+            "--merge-yes, --merge-no, --skip-approval, and --merge-method are only valid with --code, an issue URL, or --auto"
                 .into(),
         );
     }
@@ -215,6 +222,7 @@ fn resolve(
         agent,
         merge_yes,
         merge_no,
+        skip_approval,
         merge_method,
         max_turns: max_iterations,
         lang,
@@ -376,6 +384,7 @@ mod tests {
         let auto = args.contains(&"--auto");
         let merge_yes = args.contains(&"--merge-yes");
         let merge_no = args.contains(&"--merge-no");
+        let skip_approval = args.contains(&"--skip-approval");
         let merge_method = args
             .windows(2)
             .find(|pair| pair[0] == "--merge-method")
@@ -406,6 +415,7 @@ mod tests {
             None,
             merge_yes,
             merge_no,
+            skip_approval,
             merge_method,
         )
     }
@@ -426,6 +436,7 @@ mod tests {
             "-l, --lang",
             "--merge-yes",
             "--merge-no",
+            "-s, --skip-approval",
             "--merge-method",
             "-n, --max-iterations",
             "-t, --trust-comments",
@@ -494,6 +505,8 @@ mod tests {
         let review = Cli::try_parse_from(["ghost", "github.com/a/b/pull/1", "-r"]).unwrap();
         assert!(review.review);
         assert!(!review.code);
+        let skip = Cli::try_parse_from(["ghost", "github.com/a/b/pull/1", "-c", "-s"]).unwrap();
+        assert!(skip.skip_approval);
         let kimi =
             Cli::try_parse_from(["ghost", "github.com/a/b/pull/1", "--agent", "kimi"]).unwrap();
         assert_eq!(kimi.agent, Some(AgentKind::Kimi));
@@ -523,6 +536,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             false,
             None,
@@ -636,6 +650,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             None,
         )
         .is_err());
@@ -655,6 +670,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             None,
         )
         .is_err());
@@ -665,6 +681,15 @@ mod tests {
         assert!(go(&["github.com/a/b/pull/3", "--review", "--merge-yes"]).is_err());
         assert!(go(&["github.com/a/b/pull/3", "--merge-yes"]).is_err());
         assert!(go(&["github.com/a/b", "--merge-yes"]).is_err());
+        assert!(go(&["github.com/a/b/pull/3", "--review", "--skip-approval"]).is_err());
+        assert!(matches!(
+            go(&["github.com/a/b/pull/3", "--code", "--skip-approval"]).unwrap(),
+            Action::Run(RunSpec {
+                mode: RunMode::Code,
+                skip_approval: true,
+                ..
+            })
+        ));
         assert!(matches!(
             go(&["github.com/a/b/pull/3", "--code", "--merge-yes"]).unwrap(),
             Action::Run(RunSpec {
@@ -806,6 +831,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             None,
         )
         .unwrap()
@@ -832,6 +858,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             None,
         )
         .unwrap()
@@ -853,6 +880,7 @@ mod tests {
             None,
             Some(CommentTrust::All),
             None,
+            false,
             false,
             false,
             None,
@@ -881,6 +909,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             None,
         )
         .unwrap()
@@ -902,6 +931,7 @@ mod tests {
             None,
             None,
             Some(CommentTrust::All),
+            false,
             false,
             false,
             None,

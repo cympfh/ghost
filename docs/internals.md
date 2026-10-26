@@ -18,6 +18,7 @@ You need `gh` (`gh auth login`) and one of `codex`, `claude`, `grok`, or `kimi` 
 | `-l` | `--lang` | `ja` (`GHOST_LANG` if the flag is omitted) | `ja` or `en`. |
 | | `--merge-yes` | | Merge without confirming. Only with `--code`, an issue, or `--auto`. Conflicts with `--merge-no`. |
 | | `--merge-no` | | Exit successfully without merging or confirming. Only with `--code`, an issue, or `--auto`. Conflicts with `--merge-yes`. |
+| `-s` | `--skip-approval` | | Do not require approval for merge readiness. CI and outstanding fix requests are still required. Only with `--code`, an issue, or `--auto`. |
 | | `--auto` | | With `/issues`, take the oldest open issue on each check. No picker. |
 | | `--merge-method` | `squash` | `merge`, `squash`, or `rebase`. |
 | `-n` | `--max-iterations` | `20` | Stop after this many agent turns. |
@@ -105,6 +106,8 @@ A review turn that ends with `GHOST_VERDICT: approve` exits automatically. On yo
 ## When ghost merges
 
 The coding agent judges CI and reviews and ends each coding turn with `GHOST_STATUS: merge_ready` or `GHOST_STATUS: needs_work`. An empty `gh pr checks` list means CI is not configured and is acceptable; otherwise every check on the current head must pass. Review acceptance can come from an approval or a comment the agent judges to be an approval equivalent. Outstanding fix requests mean `needs_work`.
+
+With `-s` / `--skip-approval`, the agent treats the review condition as satisfied without an approval or approval-equivalent comment. CI requirements do not change, and outstanding changes requested or fix requests still mean `needs_work`.
 
 ghost accepts that judgment only for the same head SHA. It separately requires the PR to be open, not a draft, `mergeStateStatus` CLEAN, and not conflicting. A missing status line counts as `needs_work`.
 
