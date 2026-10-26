@@ -62,7 +62,7 @@ Install the binary directly from the repository as documented:
 cargo install --git https://github.com/cympfh/ghost
 ```
 
-There is no repository CI workflow, container definition, release script, or other deployment automation. Do not assume that a separate publishing or deployment step exists.
+GitHub Actions runs `cargo fmt --all -- --check`, `cargo test --locked`, and `cargo build --locked` on pushes and pull requests. There is no container definition, release script, or other deployment automation. Do not assume that a separate publishing or deployment step exists.
 
 ## Runtime architecture
 
@@ -175,6 +175,6 @@ This program deliberately runs coding agents with their permission prompts disab
 - Review mode refuses pushes through the wrapper. Code mode constrains pushes to the planned remote and refspec, including fork-specific handling. Do not weaken these checks without preserving their tested behavior.
 - Agents are instructed never to merge. Ghost itself performs merges only through its merge flow, re-checking the head SHA and passing exactly one method plus `--match-head-commit`.
 - Merge readiness still requires the same head to be observed ready on two checks at least one polling interval apart. `--merge-yes` does not bypass that delay.
-- `-y`/`--yes` answers continuation and review-exit prompts; it does not authorize merging. `--merge-yes` is the separate auto-merge option.
+- Issue mode continues into code mode automatically after opening or finding a pull request. A newly created PR adds that context to the first code follow-up. Review mode exits automatically after an approve verdict. `--merge-yes` is the separate auto-merge option.
 - Do not print tokens or credential contents in logs or errors. Existing preflight error handling deliberately suppresses lines that appear to contain tokens.
 - Avoid live GitHub operations in ordinary unit tests, especially pushes, merges, issue creation, or comments.

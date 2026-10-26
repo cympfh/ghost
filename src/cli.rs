@@ -23,7 +23,7 @@ Examples:
   ghost github.com/owner/repo/pull/3 -c -i 20s
   ghost github.com/owner/repo/pulls -r
   ghost github.com/owner/repo/pulls -c
-  ghost github.com/owner/repo/issues/7 -y -l ja
+  ghost github.com/owner/repo/issues/7 -l ja
   ghost github.com/owner/repo/issues --auto
   ghost -d review
 
@@ -34,7 +34,7 @@ The default poll interval is 20s (`-i`). `-l` / `--lang` defaults to ja.
 `-h` prints help and `-V` prints the version.
 Launch always starts the agent for a situation check, even when nothing is new.
 Later polls with nothing new do not call the agent. `i` always delivers text to the agent.
-`--merge-yes` (no short flag) merges in --code, issue, or --auto mode after a re-check. `-y` does not merge.
+`--merge-yes` (no short flag) merges in --code, issue, or --auto mode after a re-check.
 `--auto` is only valid with /issues. It takes the oldest open issue on each check and keeps waiting when none are left.
 `/pulls` lists open pull requests and requires --code or --review."
 )]
@@ -62,11 +62,6 @@ struct Cli {
     /// Coding agent. Default: first of codex, claude, grok, kimi on PATH.
     #[arg(long, short = 'a', value_enum)]
     agent: Option<AgentKind>,
-
-    /// Accept the issue-mode prompt to continue as --code, and the review exit prompt.
-    /// Does not merge.
-    #[arg(long, short = 'y')]
-    yes: bool,
 
     /// Merge when --code, issue, or --auto is merge-ready, after a fresh re-check.
     /// No short flag. Does not apply to --review, the picker, or ask-without---code.
@@ -121,7 +116,6 @@ pub fn run() -> Result<i32> {
         cli.auto,
         &cli.interval,
         cli.agent,
-        cli.yes,
         cli.max_iterations,
         cli.demo,
         header,
@@ -157,7 +151,6 @@ fn resolve(
     auto: bool,
     interval: &str,
     agent: Option<AgentKind>,
-    yes: bool,
     max_iterations: u32,
     demo: Option<DemoScene>,
     header: String,
@@ -210,7 +203,6 @@ fn resolve(
         mode,
         interval,
         agent,
-        yes,
         merge_yes,
         merge_method,
         max_turns: max_iterations,
@@ -371,7 +363,6 @@ mod tests {
         let review = args.contains(&"--review");
         let code = args.contains(&"--code");
         let auto = args.contains(&"--auto");
-        let yes = args.contains(&"--yes") || args.contains(&"-y");
         let merge_yes = args.contains(&"--merge-yes");
         let merge_method = args
             .windows(2)
@@ -394,7 +385,6 @@ mod tests {
             auto,
             "5m",
             None,
-            yes,
             20,
             None,
             "ghost".into(),
@@ -421,7 +411,6 @@ mod tests {
             "-a, --agent",
             "-k, --ssh-key",
             "-l, --lang",
-            "-y, --yes",
             "--merge-yes",
             "--merge-method",
             "-n, --max-iterations",
@@ -434,6 +423,7 @@ mod tests {
         ] {
             assert!(help.contains(needle), "help missing {needle}\n{help}");
         }
+        assert!(!help.contains("--yes"), "{help}");
         assert!(
             !help.contains(", --merge-yes"),
             "--merge-yes must not have a short flag\n{help}"
@@ -470,7 +460,6 @@ mod tests {
             "/keys/id_ed25519",
             "-l",
             "en",
-            "-y",
             "-n",
             "4",
             "-t",
@@ -483,7 +472,6 @@ mod tests {
         assert_eq!(cli.agent, Some(AgentKind::Claude));
         assert_eq!(cli.ssh_key.as_deref(), Some("/keys/id_ed25519"));
         assert_eq!(cli.lang, Lang::En);
-        assert!(cli.yes);
         assert_eq!(cli.max_iterations, 4);
         assert_eq!(cli.trust_comments, Some(CommentTrust::All));
         let default_trust = Cli::try_parse_from(["ghost", "github.com/a/b/pull/1", "-c"]).unwrap();
@@ -498,6 +486,8 @@ mod tests {
         let demo = Cli::try_parse_from(["ghost", "-d", "picker"]).unwrap();
         assert_eq!(demo.demo, Some(DemoScene::Picker));
         assert!(Cli::try_parse_from(["ghost", "github.com/a/b/pull/3", "-r", "-c"]).is_err());
+        assert!(Cli::try_parse_from(["ghost", "github.com/a/b/issues/7", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["ghost", "github.com/a/b/issues/7", "-y"]).is_err());
     }
 
     #[test]
@@ -512,7 +502,6 @@ mod tests {
             false,
             &cli.interval,
             None,
-            false,
             20,
             None,
             "ghost".into(),
@@ -564,10 +553,9 @@ mod tests {
             })
         ));
         assert!(matches!(
-            go(&["github.com/a/b/issues/7", "--yes"]).unwrap(),
+            go(&["github.com/a/b/issues/7"]).unwrap(),
             Action::Run(RunSpec {
                 mode: RunMode::Issue,
-                yes: true,
                 ..
             })
         ));
@@ -624,7 +612,6 @@ mod tests {
             false,
             "5m",
             None,
-            false,
             0,
             None,
             "ghost".into(),
@@ -643,7 +630,6 @@ mod tests {
             false,
             "nope",
             None,
-            false,
             20,
             None,
             "ghost".into(),
@@ -667,7 +653,6 @@ mod tests {
             Action::Run(RunSpec {
                 mode: RunMode::Code,
                 merge_yes: true,
-                yes: false,
                 ..
             })
         ));
@@ -730,7 +715,6 @@ mod tests {
             go(&[
                 "github.com/a/b/issues",
                 "--auto",
-                "--yes",
                 "--merge-yes",
                 "--merge-method",
                 "squash"
@@ -738,7 +722,6 @@ mod tests {
             .unwrap(),
             Action::Run(RunSpec {
                 mode: RunMode::Auto,
-                yes: true,
                 merge_yes: true,
                 merge_method: Some(method),
                 ..
@@ -761,7 +744,6 @@ mod tests {
             true,
             "20s",
             None,
-            false,
             20,
             None,
             "ghost".into(),
@@ -787,7 +769,6 @@ mod tests {
             false,
             "20s",
             None,
-            false,
             20,
             None,
             "ghost".into(),
@@ -810,7 +791,6 @@ mod tests {
             true,
             "20s",
             None,
-            false,
             20,
             None,
             "ghost".into(),
@@ -836,7 +816,6 @@ mod tests {
             false,
             "20s",
             None,
-            false,
             20,
             None,
             "ghost".into(),
@@ -859,7 +838,6 @@ mod tests {
             true,
             "20s",
             None,
-            false,
             20,
             None,
             "ghost".into(),

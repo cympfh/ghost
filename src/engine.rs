@@ -35,10 +35,10 @@ use crate::tui::{
     UiCmd, UiEvent,
 };
 use crate::watch::{
-    after_review_verdict, approve_signal, auto_review_exit, baseline_agent_comments, code_step,
-    decide_code, decide_review, ensure_closing_line, feedback_log, filter_notes, mark_viewer,
-    review_step, seen_after_survey, CiHandled, CodeAction, CodeLaunch, CodeStep, CommentTrust,
-    MaxTurns, Note, PrSnap, ReviewAction, ReviewExitAnswer, ReviewLaunch, ReviewSignal, ReviewStep,
+    after_review_verdict, approve_signal, baseline_agent_comments, code_step, decide_code,
+    decide_review, ensure_closing_line, feedback_log, filter_notes, mark_viewer, review_step,
+    seen_after_survey, CiHandled, CodeAction, CodeLaunch, CodeStep, CommentTrust, MaxTurns, Note,
+    PrSnap, ReviewAction, ReviewLaunch, ReviewSignal, ReviewStep,
 };
 use crate::workdir::{self, Checkout};
 
@@ -70,7 +70,6 @@ pub struct RunSpec {
     pub mode: RunMode,
     pub interval: Duration,
     pub agent: Option<AgentKind>,
-    pub yes: bool,
     /// Auto-answer yes on the merge prompt. Ignored by `--review`.
     pub merge_yes: bool,
     pub merge_method: Option<String>,
@@ -781,55 +780,14 @@ impl Ctx {
             short_sha(&snap.head_sha)
         ));
         let approve = approve_signal(&self.turn_signal);
-        if after_review_verdict(approve) == crate::watch::AfterVerdict::AskExit {
-            let leave = self.review_exit_prompt(number)?;
-            return Ok((leave, true));
+        if after_review_verdict(approve) == crate::watch::AfterVerdict::Exit {
+            self.stop(
+                0,
+                StopReason::ReviewApproved.message(self.spec.lang, number),
+            );
+            return Ok((true, true));
         }
         Ok((false, true))
-    }
-
-    fn review_exit_prompt(&mut self, number: u64) -> Result<bool> {
-        let message = self.say(
-            &format!("PR #{number} は問題なしと判断しました。終了しますか？"),
-            &format!("PR #{number} looks fine. Exit?"),
-        );
-        let answer = match auto_review_exit(self.spec.yes, stdin_is_tty()) {
-            Some(answer) => {
-                let why = if self.spec.yes { "y (-y)" } else { "y" };
-                self.log(format!("{message} {why}"));
-                answer
-            }
-            None => {
-                let _ = self.tx.send(UiEvent::Confirm {
-                    number,
-                    message,
-                    kind: ConfirmKind::ReviewExit,
-                    lang: self.spec.lang,
-                });
-                self.status.phase = "confirm".into();
-                self.push_status();
-                match self.wait_confirm()? {
-                    None => return Ok(true),
-                    Some((answer, _)) => confirm_review_answer(answer),
-                }
-            }
-        };
-        match answer {
-            ReviewExitAnswer::Continue => {
-                self.log(self.say(
-                    "監視を続けます。新しいコミットで再レビューし、次の approve でまた尋ねます。",
-                    "Continuing to watch. A new commit triggers another review, and the next approve asks again.",
-                ));
-                Ok(false)
-            }
-            ReviewExitAnswer::Exit => {
-                self.stop(
-                    0,
-                    StopReason::ReviewApproved.message(self.spec.lang, number),
-                );
-                Ok(true)
-            }
-        }
     }
 
     fn code_loop(&mut self, number: u64, launch: CodeLaunch) -> Result<()> {
@@ -849,7 +807,8 @@ impl Ctx {
         self.code_path = Some(path.clone());
         self.code_seen = stored.seen_comment_ids.iter().cloned().collect();
         self.code_agent_ids = stored.agent_comment_ids.iter().cloned().collect();
-        let mut surveyed = matches!(launch, CodeLaunch::Handoff);
+        let mut surveyed = matches!(launch, CodeLaunch::Handoff { .. });
+        let mut created_here = matches!(launch, CodeLaunch::Handoff { created_here: true });
         self.push_status();
         loop {
             if self.quit {
@@ -916,7 +875,16 @@ impl Ctx {
                     ci_failed,
                     new_notes,
                 }) => {
-                    self.run_code_fix(number, &snap, &path, &mut stored, ci_failed, new_notes)?;
+                    self.run_code_fix(
+                        number,
+                        &snap,
+                        &path,
+                        &mut stored,
+                        ci_failed,
+                        new_notes,
+                        created_here,
+                    )?;
+                    created_here = false;
                     if self.quit {
                         return Ok(());
                     }
@@ -1027,6 +995,7 @@ impl Ctx {
         stored: &mut GhostState,
         ci_failed: bool,
         new_notes: Vec<Note>,
+        created_here: bool,
     ) -> Result<()> {
         self.announce_fix(ci_failed, snap, &new_notes);
         self.checkout(
@@ -1054,6 +1023,7 @@ impl Ctx {
                 &user_notes,
                 self.spec.lang,
                 &push,
+                created_here,
             )
         } else {
             prompt::code_initial(
@@ -1156,36 +1126,35 @@ impl Ctx {
         }
         let initial = MergeStyle::from_flag(self.spec.merge_method.as_deref());
         let message = merge_question(number, initial, self.spec.lang);
-        let (answer, method) =
-            match auto_merge_answer(self.spec.merge_yes, self.spec.yes, stdin_is_tty()) {
-                Some(answer) => {
-                    let why = if self.spec.merge_yes {
-                        "y (--merge-yes)"
-                    } else if stdin_is_tty() {
-                        "n"
-                    } else {
-                        "n (not a TTY)"
-                    };
-                    self.log(format!("{message} {why}"));
-                    (answer, initial)
-                }
-                None => {
-                    let _ = self.tx.send(UiEvent::Confirm {
-                        number,
-                        message,
-                        kind: ConfirmKind::Merge(initial),
-                        lang: self.spec.lang,
-                    });
-                    self.status.phase = "confirm".into();
-                    self.push_status();
-                    match self.wait_confirm()? {
-                        None => return Ok(true),
-                        Some((answer, chosen)) => {
-                            (confirm_merge_answer(answer), chosen.unwrap_or(initial))
-                        }
+        let (answer, method) = match auto_merge_answer(self.spec.merge_yes, stdin_is_tty()) {
+            Some(answer) => {
+                let why = if self.spec.merge_yes {
+                    "y (--merge-yes)"
+                } else if stdin_is_tty() {
+                    "n"
+                } else {
+                    "n (not a TTY)"
+                };
+                self.log(format!("{message} {why}"));
+                (answer, initial)
+            }
+            None => {
+                let _ = self.tx.send(UiEvent::Confirm {
+                    number,
+                    message,
+                    kind: ConfirmKind::Merge(initial),
+                    lang: self.spec.lang,
+                });
+                self.status.phase = "confirm".into();
+                self.push_status();
+                match self.wait_confirm()? {
+                    None => return Ok(true),
+                    Some((answer, chosen)) => {
+                        (confirm_merge_answer(answer), chosen.unwrap_or(initial))
                     }
                 }
-            };
+            }
+        };
         match answer {
             MergeAnswer::Continue => {
                 self.merge_hold = Some(MergeHold {
@@ -1502,7 +1471,7 @@ impl Ctx {
             if self.quit {
                 return Ok(());
             }
-            return self.confirm_and_code(pr);
+            return self.continue_as_code(pr, false);
         }
         let Some(pr) = self.find_pr_after(number, &branch)? else {
             return Ok(());
@@ -1516,7 +1485,7 @@ impl Ctx {
             "opened PR #{pr} · keeping this {} session",
             self.agent.kind()
         ));
-        self.confirm_and_code(pr)
+        self.continue_as_code(pr, true)
     }
 
     /// Seen-set stays empty. Only viewer comments that predate the PR are agent ids.
@@ -1567,40 +1536,7 @@ impl Ctx {
         }
     }
 
-    fn confirm_and_code(&mut self, pr: u64) -> Result<()> {
-        let message = self.say(
-            &format!("PR #{pr} を --code として続けますか？"),
-            &format!("Continue as --code on PR #{pr}?"),
-        );
-        let yes = match crate::watch::auto_continue_as_code(self.spec.yes, stdin_is_tty()) {
-            Some(true) => {
-                self.log(format!("{message} yes (--yes)"));
-                true
-            }
-            Some(false) => {
-                self.log(format!("{message} n (not a TTY)"));
-                false
-            }
-            None => {
-                let _ = self.tx.send(UiEvent::Confirm {
-                    number: pr,
-                    message: message.clone(),
-                    kind: ConfirmKind::ContinueAsCode,
-                    lang: self.spec.lang,
-                });
-                self.status.phase = "confirm".into();
-                self.push_status();
-                match self.wait_confirm()? {
-                    None => return Ok(()),
-                    Some((ConfirmAnswer::Yes, _)) => true,
-                    Some((ConfirmAnswer::No | ConfirmAnswer::Continue, _)) => false,
-                }
-            }
-        };
-        if !yes {
-            self.stop(0, format!("PR #{pr} left as-is. Not continuing as --code."));
-            return Ok(());
-        }
+    fn continue_as_code(&mut self, pr: u64, created_here: bool) -> Result<()> {
         if !self.hold_pr_slot(pr, SessionSlot::Code) {
             return Ok(());
         }
@@ -1609,7 +1545,7 @@ impl Ctx {
             self.agent.kind()
         ));
         // Same AgentSession. code_loop does not resume a saved id.
-        self.code_loop(pr, CodeLaunch::Handoff)
+        self.code_loop(pr, CodeLaunch::Handoff { created_here })
     }
 
     fn hold_pr_slot(&mut self, number: u64, slot: SessionSlot) -> bool {
@@ -3137,13 +3073,6 @@ fn stdin_is_tty() -> bool {
     )
 }
 
-pub fn confirm_review_answer(answer: ConfirmAnswer) -> ReviewExitAnswer {
-    match answer {
-        ConfirmAnswer::Continue => ReviewExitAnswer::Continue,
-        ConfirmAnswer::Yes | ConfirmAnswer::No => ReviewExitAnswer::Exit,
-    }
-}
-
 pub fn confirm_merge_answer(answer: ConfirmAnswer) -> MergeAnswer {
     match answer {
         ConfirmAnswer::Yes => MergeAnswer::Merge,
@@ -3172,14 +3101,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_backoff, confirm_merge_answer, confirm_review_answer, empty_repo_notice,
-        input_delivery_log, panic_message, plan_user_input, stop_after_failures, InputPlan,
-        MAX_CONSECUTIVE_AGENT_FAILURES,
+        agent_backoff, confirm_merge_answer, empty_repo_notice, input_delivery_log, panic_message,
+        plan_user_input, stop_after_failures, InputPlan, MAX_CONSECUTIVE_AGENT_FAILURES,
     };
     use crate::lang::Lang;
     use crate::merge::MergeAnswer;
     use crate::tui::ConfirmAnswer;
-    use crate::watch::ReviewExitAnswer;
 
     #[test]
     fn agent_failure_backoff_grows_and_then_stops() {
@@ -3221,19 +3148,7 @@ mod tests {
     }
 
     #[test]
-    fn review_exit_y_leaves_and_c_continues_merge_is_separate() {
-        assert_eq!(
-            confirm_review_answer(ConfirmAnswer::Yes),
-            ReviewExitAnswer::Exit
-        );
-        assert_eq!(
-            confirm_review_answer(ConfirmAnswer::No),
-            ReviewExitAnswer::Exit
-        );
-        assert_eq!(
-            confirm_review_answer(ConfirmAnswer::Continue),
-            ReviewExitAnswer::Continue
-        );
+    fn merge_answers_stay_separate_from_other_flows() {
         assert_eq!(confirm_merge_answer(ConfirmAnswer::Yes), MergeAnswer::Merge);
         assert_eq!(confirm_merge_answer(ConfirmAnswer::No), MergeAnswer::Exit);
         assert_eq!(
@@ -3285,7 +3200,6 @@ mod tests {
                 mode: super::RunMode::Code,
                 interval: Duration::from_secs(20),
                 agent: None,
-                yes: false,
                 merge_yes,
                 merge_method: None,
                 max_turns: 20,
@@ -3700,7 +3614,6 @@ exit 0
         ctx.spec.mode = super::RunMode::Auto;
         ctx.spec.interval = Duration::from_secs(30);
         ctx.spec.lang = Lang::En;
-        ctx.spec.yes = false;
         ctx.spec.trust = crate::watch::CommentTrust::All;
         ctx.spec.trust_issues = crate::watch::CommentTrust::Collaborators;
         ctx.owner = "acme".into();

@@ -16,7 +16,6 @@ You need `gh` (`gh auth login`) and one of `codex`, `claude`, `grok`, or `kimi` 
 | `-a` | `--agent` | first on `PATH` | `codex`, `claude`, `grok`, or `kimi`. |
 | `-k` | `--ssh-key` | ssh config, or `GHOST_SSH_KEY` | Private key passed to ssh. |
 | `-l` | `--lang` | `ja` (`GHOST_LANG` if the flag is omitted) | `ja` or `en`. |
-| `-y` | `--yes` | | Accept the continue prompt and the review-exit prompt. Does not merge. |
 | | `--merge-yes` | | Merge without confirming. Only with `--code`, an issue, or `--auto`. |
 | | `--auto` | | With `/issues`, take the oldest open issue on each check. No picker. |
 | | `--merge-method` | `squash` | `merge`, `squash`, or `rebase`. |
@@ -39,8 +38,6 @@ A pull request URL with no flag asks whether to review or to fix. A repository w
 | --- | --- | --- | --- | --- | --- |
 | Merge confirm | Merge | Exit ghost without merging | Exit ghost without merging | Stay in the session | Cycle the method |
 | Merge confirm (`--auto`) | Merge, then take the next issue | Leave it unmerged and take the next issue | Leave it unmerged and take the next issue | Stay on this pull request | Cycle the method |
-| Review-end confirm | Exit ghost | Exit ghost | Exit ghost | Stay in the session | — |
-| Issue-to-code handoff | Continue fixing | Exit ghost without continuing | Continue fixing | — | — |
 
 On the merge confirm screen, Tab and the left and right arrows cycle the method the same way `m` does: squash, merge, rebase.
 
@@ -52,7 +49,7 @@ On the merge confirm screen, Tab and the left and right arrows cycle the method 
 
 An issue that already has an open pull request is skipped for that round. Issues filed after `--auto` starts are picked up on a later check. Which authors it runs is `--trust-issues` (default OWNER, MEMBER, or COLLABORATOR). An issue the agent creates with `gh issue create` in this repository is listed in `OWNER__REPO/created-issues` and skipped. See below for closed pull requests ghost opened, and for which GitHub errors are retried.
 
-Without `--yes`, a session that is not a terminal declines the prompt that would continue into code and takes the next issue. It does not reach the merge confirm. On a terminal, `y` merges and continues, `c` stays on this pull request, and `n` or Enter leaves it unmerged and takes the next issue. `--auto --yes --merge-yes` opens the pull request, handles review, merges, and then takes the next issue.
+After the pull request exists, ghost continues into code without asking, including in a non-terminal session. On a terminal, `y` merges and continues, `c` stays on this pull request, and `n` or Enter leaves it unmerged and takes the next issue. `--auto --merge-yes` opens the pull request, handles review, merges, and then takes the next issue.
 
 Issues `--auto` will not take again are stored in `OWNER__REPO/auto.json` under the state directory below. Delete that file to take them again.
 
@@ -88,7 +85,7 @@ The same CI failure on the same commit is not sent again until the commit or the
 
 ## Issue branches and closing lines
 
-The branch name comes from the issue title and labels, in the form `fix/12-crash-on-empty-config`: a type (`feat`, `fix`, `docs`, `refactor`, `chore`, `test`), the issue number, and a short kebab slug. When ghost edits the pull request body, it adds `Closes #N` if that line is missing. After the pull request exists, ghost asks whether to continue fixing. Comments posted after the pull request was opened stay unseen at that handoff. The agent's own replies are later ignored. A review from the same GitHub user is not.
+The branch name comes from the issue title and labels, in the form `fix/12-crash-on-empty-config`: a type (`feat`, `fix`, `docs`, `refactor`, `chore`, `test`), the issue number, and a short kebab slug. When ghost edits the pull request body, it adds `Closes #N` if that line is missing. After the pull request exists, ghost continues fixing without asking. When the current issue turn created the pull request, the first code follow-up tells the agent that it just created that PR. Comments posted after the pull request was opened stay unseen at that handoff. The agent's own replies are later ignored. A review from the same GitHub user is not.
 
 ## Untrusted pull request text
 
@@ -102,7 +99,7 @@ Review prompts wrap the title, diff, and comment bodies:
 
 Each block ends with `<<<END_UNTRUSTED_…>>>`. Copies of those markers inside the text, including different case and whitespace, are replaced before the real markers are added. The wrapping is not a security boundary. A hostile diff can still confuse the agent.
 
-A review turn that ends with `GHOST_VERDICT: approve` asks whether to exit. `c` keeps watching and asks again on the next approve. On your own pull request, if GitHub rejects approve, the agent posts `gh pr review --comment` with `LGTM / 承認相当` and still ends with `GHOST_VERDICT: approve`.
+A review turn that ends with `GHOST_VERDICT: approve` exits automatically. On your own pull request, if GitHub rejects approve, the agent posts `gh pr review --comment` with `LGTM / 承認相当` and still ends with `GHOST_VERDICT: approve`.
 
 ## When ghost merges
 
@@ -110,9 +107,9 @@ Mergeable means open, not a draft, `mergeStateStatus` CLEAN, not conflicting, an
 
 ghost offers merge only after the same commit has been mergeable on two checks at least one interval apart. The refetch at the end of the opening turn is not one of those checks. `--merge-yes` waits for the second check too. `y` re-reads the commit and runs `gh pr merge` with exactly one of `--merge`, `--squash`, or `--rebase`, plus `--match-head-commit`. The method on screen starts as `--merge-method`, or squash when the flag is omitted. `c` asks again only after the commit, a review or comment, or an agent turn changes.
 
-`--merge-yes` merges without asking and exits 1 if `gh pr merge` fails, instead of trying again on every check. If the repository rejects the method, the log says so and points at `--merge-method` or the `m` key. ghost does not pick another method. `-y` answers the continue and review-exit prompts only.
+`--merge-yes` merges without asking and exits 1 if `gh pr merge` fails, instead of trying again on every check. If the repository rejects the method, the log says so and points at `--merge-method` or the `m` key. ghost does not pick another method.
 
-When stdin or stdout is not a terminal, ghost does not open `/dev/tty`. Opening that device with no controlling terminal fails with ENXIO (os error 6). Confirms then take the non-interactive answers: review exits, an issue does not continue into code without `-y`, and a merge happens only with `--merge-yes`.
+When stdin or stdout is not a terminal, ghost does not open `/dev/tty`. Opening that device with no controlling terminal fails with ENXIO (os error 6). Review exits and issue mode continues into code without asking. A merge happens only with `--merge-yes`.
 
 The agent's `PATH` starts with a `gh` wrapper that refuses `gh pr merge`, `gh repo delete`, `gh api` DELETE, and merge endpoints such as `mergePullRequest`. The `git` wrapper skips global options (`-C`, `-c`, `--git-dir`, `--work-tree`, `--namespace`, `--no-pager`, `--bare`, and the rest) and then sends `git push` to the planned remote and refspec, or refuses it in review and when a fork is not pushable. An alias or an absolute `/usr/bin/gh` or `/usr/bin/git` still runs. Neither wrapper is a security boundary.
 

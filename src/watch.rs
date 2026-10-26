@@ -214,7 +214,7 @@ pub fn opening_runs_agent(saved_says_idle: bool) -> bool {
     true
 }
 
-/// True when this head should ask the review-exit prompt.
+/// True when this head should end review mode with an approve verdict.
 /// An explicit non-approve verdict wins. With no verdict line, a self-review
 /// comment that says `LGTM / 承認相当` still counts as approve.
 pub fn approve_signal(output: &str) -> bool {
@@ -250,62 +250,18 @@ pub fn review_step(launch: ReviewLaunch, opened: bool, action: ReviewAction) -> 
     ReviewStep::Action(action)
 }
 
-/// Approve (verdict or a real APPROVE on this SHA) asks whether to exit.
+/// Approve (verdict or a real APPROVE on this SHA) exits review mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfterVerdict {
-    AskExit,
+    Exit,
     Poll,
 }
 
 pub fn after_review_verdict(approve: bool) -> AfterVerdict {
     if approve {
-        AfterVerdict::AskExit
+        AfterVerdict::Exit
     } else {
         AfterVerdict::Poll
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewExitAnswer {
-    Exit,
-    Continue,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewExitKey {
-    Yes,
-    Continue,
-    Enter,
-    Esc,
-    CtrlC,
-}
-
-pub fn review_exit_key(key: ReviewExitKey) -> ReviewExitAnswer {
-    match key {
-        ReviewExitKey::Continue => ReviewExitAnswer::Continue,
-        ReviewExitKey::Yes | ReviewExitKey::Enter | ReviewExitKey::Esc | ReviewExitKey::CtrlC => {
-            ReviewExitAnswer::Exit
-        }
-    }
-}
-
-/// `-y` continues as code. A non-TTY does not wait and does not continue.
-pub fn auto_continue_as_code(yes: bool, tty: bool) -> Option<bool> {
-    if yes {
-        Some(true)
-    } else if !tty {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-/// `-y` exits without asking. A non-TTY also exits. Review never merges.
-pub fn auto_review_exit(yes: bool, tty: bool) -> Option<ReviewExitAnswer> {
-    if yes || !tty {
-        Some(ReviewExitAnswer::Exit)
-    } else {
-        None
     }
 }
 
@@ -345,7 +301,7 @@ pub fn decide_code(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeLaunch {
     Survey,
-    Handoff,
+    Handoff { created_here: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -765,28 +721,8 @@ mod tests {
             review_step(ReviewLaunch::Watching, true, rev(&pr, Some("abc"))),
             ReviewStep::Action(ReviewAction::Idle)
         );
-        assert_eq!(after_review_verdict(true), AfterVerdict::AskExit);
+        assert_eq!(after_review_verdict(true), AfterVerdict::Exit);
         assert_eq!(after_review_verdict(false), AfterVerdict::Poll);
-        assert_eq!(review_exit_key(ReviewExitKey::Yes), ReviewExitAnswer::Exit);
-        assert_eq!(
-            review_exit_key(ReviewExitKey::Continue),
-            ReviewExitAnswer::Continue
-        );
-        assert_eq!(
-            review_exit_key(ReviewExitKey::Enter),
-            ReviewExitAnswer::Exit
-        );
-        assert_eq!(review_exit_key(ReviewExitKey::Esc), ReviewExitAnswer::Exit);
-        assert_eq!(
-            review_exit_key(ReviewExitKey::CtrlC),
-            ReviewExitAnswer::Exit
-        );
-        assert_eq!(auto_review_exit(true, true), Some(ReviewExitAnswer::Exit));
-        assert_eq!(auto_review_exit(false, false), Some(ReviewExitAnswer::Exit));
-        assert_eq!(auto_review_exit(false, true), None);
-        assert_eq!(auto_continue_as_code(true, false), Some(true));
-        assert_eq!(auto_continue_as_code(false, false), Some(false));
-        assert_eq!(auto_continue_as_code(false, true), None);
         assert!(opening_runs_agent(true));
         assert!(opening_runs_agent(false));
         assert!(approve_signal("notes\nGHOST_VERDICT: approve\n"));
@@ -818,7 +754,13 @@ mod tests {
         let idle = snap("abc", ChecksVerdict::Pending);
         let idle = decide_code(&idle, &BTreeSet::new(), 0, 20, None).unwrap();
         assert_eq!(
-            code_step(CodeLaunch::Handoff, true, idle.clone()),
+            code_step(
+                CodeLaunch::Handoff {
+                    created_here: false
+                },
+                true,
+                idle.clone()
+            ),
             CodeStep::Action(idle)
         );
         assert!(seen_after_survey(&["comment:1".into()], false).is_empty());

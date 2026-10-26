@@ -102,7 +102,7 @@ pub fn sample_items() -> Vec<OpenItem> {
         OpenItem {
             kind: ItemKind::Issue,
             number: 7,
-            title: "Honor --yes when a PR already exists".into(),
+            title: "Continue when a PR already exists".into(),
             author: "cympfh".into(),
             labels: vec!["ux".into()],
             ci: None,
@@ -166,26 +166,6 @@ fn code_scene(tx: &Sender<UiEvent>) {
     );
 }
 
-fn confirm_scene(tx: &Sender<UiEvent>) {
-    send_status(
-        tx, "issue", "issue #7", "confirm", "9ab31c0", "pending", "1/20", "claude", "7f3ac2e1",
-    );
-    sys(tx, "workdir ~/.ghost/work/cympfh__xxx (reused clone)");
-    sys(tx, "branch fix/7-crash");
-    agent(tx, "implemented the issue and pushed fix/7-crash.");
-    agent(
-        tx,
-        "gh pr create --repo cympfh/xxx --base main --head fix/7-crash --body $'...\\n\\nCloses #7'",
-    );
-    sys(tx, "opened PR #12 · keeping this claude session");
-    let _ = tx.send(UiEvent::Confirm {
-        number: 12,
-        message: "Continue as --code on PR #12?".into(),
-        kind: tui::ConfirmKind::ContinueAsCode,
-        lang: Lang::En,
-    });
-}
-
 fn merge_confirm_scene(tx: &Sender<UiEvent>) {
     send_status(
         tx, "code", "PR #3", "confirm", "abc1234", "none", "1/20", "codex", "—",
@@ -220,7 +200,7 @@ fn wait_picker(tx: &Sender<UiEvent>, rx: &Receiver<UiCmd>) {
                 }));
                 match (kind, side) {
                     (ItemKind::Pull, Some(Side::Code)) => code_scene(tx),
-                    (ItemKind::Issue, _) => confirm_scene(tx),
+                    (ItemKind::Issue, _) => code_scene(tx),
                     _ => review_scene(tx),
                 }
             }
