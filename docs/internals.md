@@ -58,7 +58,7 @@ Issues `--auto` will not take again are stored in `OWNER__REPO/auto.json` under 
 
 The agent runs with its permission prompts turned off (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, or `--yolo`). Use `--review` only on a repository you trust with that agent's credentials.
 
-The `gh` and `git` commands placed in front of the agent only stop accidents, such as an unintended merge. To block merges for real, use a token that does not have permission to merge.
+The `gh` and `git` commands placed in front of the agent only stop selected accidents. The agent can use `gh pr merge` and merge endpoints. To block merges, use a token that does not have permission to merge.
 
 `--auto` runs that agent on each chosen issue without asking first. Text in such an issue can still tell the agent what to do, so use `--auto` only on a repository you trust. `--trust-issues all` also takes issues opened by other people. `--trust-comments` defaults to `all` and chooses who may wake `--code`, including review comments while implementing an issue and during `--code`. It does not choose issue authors.
 
@@ -104,7 +104,9 @@ A review turn that ends with `GHOST_VERDICT: approve` exits automatically. On yo
 
 ## When ghost merges
 
-Mergeable means open, not a draft, `mergeStateStatus` CLEAN, not conflicting, and no outstanding changes requested. Every check listed by `gh pr checks` must have passed, and at least one approval is required. A pending check or an empty check list waits. A later `COMMENTED` review does not clear an earlier approval from the same reviewer.
+The coding agent judges CI and reviews and ends each coding turn with `GHOST_STATUS: merge_ready` or `GHOST_STATUS: needs_work`. An empty `gh pr checks` list means CI is not configured and is acceptable; otherwise every check on the current head must pass. Review acceptance can come from an approval or a comment the agent judges to be an approval equivalent. Outstanding fix requests mean `needs_work`.
+
+ghost accepts that judgment only for the same head SHA. It separately requires the PR to be open, not a draft, `mergeStateStatus` CLEAN, and not conflicting. A missing status line counts as `needs_work`.
 
 ghost handles merge readiness only after the same commit has been mergeable on two checks at least one interval apart. The refetch at the end of the opening turn is not one of those checks. `--merge-yes` and `--merge-no` wait for the second check too. `y` re-reads the commit and runs `gh pr merge` with exactly one of `--merge`, `--squash`, or `--rebase`, plus `--match-head-commit`. The method on screen starts as `--merge-method`, or squash when the flag is omitted. `c` asks again only after the commit, a review or comment, or an agent turn changes.
 
@@ -112,7 +114,7 @@ ghost handles merge readiness only after the same commit has been mergeable on t
 
 When stdin or stdout is not a terminal, ghost does not open `/dev/tty`. Opening that device with no controlling terminal fails with ENXIO (os error 6). Review exits and issue mode continues into code without asking. A merge happens only with `--merge-yes`.
 
-The agent's `PATH` starts with a `gh` wrapper that refuses `gh pr merge`, `gh repo delete`, `gh api` DELETE, and merge endpoints such as `mergePullRequest`. The `git` wrapper skips global options (`-C`, `-c`, `--git-dir`, `--work-tree`, `--namespace`, `--no-pager`, `--bare`, and the rest) and then sends `git push` to the planned remote and refspec, or refuses it in review and when a fork is not pushable. An alias or an absolute `/usr/bin/gh` or `/usr/bin/git` still runs. Neither wrapper is a security boundary.
+The agent's `PATH` starts with a `gh` wrapper that allows `gh pr merge` and merge endpoints but refuses `gh repo delete` and `gh api` DELETE. The `git` wrapper skips global options (`-C`, `-c`, `--git-dir`, `--work-tree`, `--namespace`, `--no-pager`, `--bare`, and the rest) and then sends `git push` to the planned remote and refspec, or refuses it in review and when a fork is not pushable. An alias or an absolute `/usr/bin/gh` or `/usr/bin/git` still runs. Neither wrapper is a security boundary.
 
 A successful `gh issue create` for this repository appends the issue number to `OWNER__REPO/created-issues`, and `--auto` skips that number. `-R` and `--repo` must be omitted or name this repository; another repository is not recorded. `gh issue create --web` often prints no issue number, and `gh api` (including a GraphQL `createIssue`) is not watched, so those issues are not skipped. A successful `gh pr create` for this repository is recorded in `OWNER__REPO/created-prs`. Together with the issue branch name, that is how a closed pull request counts as ghost's.
 
@@ -120,7 +122,7 @@ A GitHub failure is transient only when `gh` says so on stderr (or the command t
 
 ## Agent commands
 
-Prompts tell the agent to use `gh` for GitHub, to reply in the selected language, and to leave merging to ghost.
+Prompts tell the agent to use `gh` for GitHub, to reply in the selected language, and to report merge readiness with `GHOST_STATUS`. The agent may also run `gh pr merge`; ghost detects the merged PR on a later check.
 
 - Claude: `claude --print --dangerously-skip-permissions --input-format stream-json --output-format stream-json --verbose --session-id <uuid>`. Later prompts are JSON on stdin. If the process exits, the same flags use `--resume <uuid>`.
 - Codex: `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <dir> -`, then `codex --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check resume <thread_id>`. Resume has no `-C` and no `-s`.

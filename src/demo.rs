@@ -172,7 +172,7 @@ fn merge_confirm_scene(tx: &Sender<UiEvent>) {
     );
     sys(
         tx,
-        "merge-ready? CI green(ok) / CLEAN / approvals 1 / changes requested 0 → yes",
+        "merge-ready? CI green / CLEAN / approvals 1 / changes requested 0 / agent true → yes",
     );
     let method = MergeStyle::Squash;
     let _ = tx.send(UiEvent::Confirm {
