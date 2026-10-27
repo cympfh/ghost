@@ -614,6 +614,7 @@ pub fn parse_pr_view(json: &str) -> Result<PrSnap, String> {
         .and_then(|c| c.as_array())
         .cloned()
         .unwrap_or_default();
+    let ci_signature = crate::merge::check_signature(&rollup);
     let (checks, failing_checks) = judge_checks(&rollup);
     let reviews = review_refs(v.get("reviews").unwrap_or(&Value::Null));
     let decision = v
@@ -687,6 +688,7 @@ pub fn parse_pr_view(json: &str) -> Result<PrSnap, String> {
             changes_requested,
         },
         failing_checks,
+        ci_signature,
         notes: notes_from(
             v.get("reviews").unwrap_or(&Value::Null),
             v.get("comments").unwrap_or(&Value::Null),

@@ -22,9 +22,13 @@ pub struct GhostState {
     pub code_session_id: Option<String>,
     #[serde(default)]
     pub agent_kind: Option<String>,
-    /// SHA whose failing-check set was already handed to the agent.
+    /// SHA whose CI state was already handed to the agent.
     #[serde(default)]
     pub handled_ci_sha: Option<String>,
+    #[serde(default)]
+    pub handled_ci_label: String,
+    #[serde(default)]
+    pub handled_ci_signature: Vec<String>,
     #[serde(default)]
     pub handled_failing_checks: Vec<String>,
     /// Comment ids written by the agent (same gh user) so they are not new work.

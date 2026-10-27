@@ -75,23 +75,38 @@ impl std::fmt::Display for CommentTrust {
     }
 }
 
-/// CI failure ghost has already handed to the agent for this SHA.
+/// CI state ghost has already handed to the agent for this SHA.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiHandled {
     pub sha: String,
+    pub label: String,
+    pub signature: BTreeSet<String>,
     pub checks: BTreeSet<String>,
 }
 
 impl CiHandled {
-    pub fn new(sha: impl Into<String>, checks: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+    pub fn new(
+        sha: impl Into<String>,
+        label: impl Into<String>,
+        signature: impl IntoIterator<Item = impl AsRef<str>>,
+        checks: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Self {
         Self {
             sha: sha.into(),
+            label: label.into(),
+            signature: signature
+                .into_iter()
+                .map(|row| row.as_ref().to_string())
+                .collect(),
             checks: checks.into_iter().map(|c| c.as_ref().to_string()).collect(),
         }
     }
 
-    pub fn covers(&self, sha: &str, checks: &[String]) -> bool {
-        self.sha == sha && self.checks == checks.iter().cloned().collect()
+    pub fn covers(&self, snap: &PrSnap) -> bool {
+        self.sha == snap.head_sha
+            && self.label == snap.ci_label
+            && self.signature == snap.ci_signature.iter().cloned().collect()
+            && self.checks == snap.failing_checks.iter().cloned().collect()
     }
 }
 
@@ -107,6 +122,7 @@ pub struct PrSnap {
     pub base_branch: String,
     pub merge: MergeInput,
     pub failing_checks: Vec<String>,
+    pub ci_signature: Vec<String>,
     pub notes: Vec<Note>,
     pub ci_label: String,
     pub author: String,
@@ -303,10 +319,7 @@ pub fn decide_code(
     }
     let new_notes = unseen_notes(&snap.notes, seen);
     let ci_failed = snap.merge.checks == crate::merge::ChecksVerdict::Failed;
-    let ci_is_new = ci_failed
-        && !handled_ci
-            .map(|h| h.covers(&snap.head_sha, &snap.failing_checks))
-            .unwrap_or(false);
+    let ci_is_new = handled_ci.map(|h| !h.covers(snap)).unwrap_or(ci_failed);
     if !ci_is_new && new_notes.is_empty() {
         return Ok(CodeAction::Idle);
     }
@@ -680,6 +693,7 @@ mod tests {
             },
             comments_unavailable: false,
             failing_checks: vec![],
+            ci_signature: vec![],
             notes: vec![],
             ci_label: "pending".into(),
             author: "cympfh".into(),
@@ -861,7 +875,7 @@ mod tests {
         pr.failing_checks = vec!["build".into()];
         pr.ci_label = "failed".into();
         let seen = BTreeSet::new();
-        let handled = CiHandled::new("abc", ["build"]);
+        let handled = CiHandled::new("abc", "failed", Vec::<String>::new(), ["build"]);
         assert_eq!(
             decide_code(&pr, &seen, 0, 20, Some(&handled), false).unwrap(),
             CodeAction::Idle
@@ -882,6 +896,49 @@ mod tests {
                 ci_failed: true,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn ci_state_change_retriggers_for_the_same_head() {
+        let mut pr = snap("abc", ChecksVerdict::Pending);
+        pr.ci_label = "pending".into();
+        let seen = BTreeSet::new();
+        let handled = CiHandled::new("abc", "pending", Vec::<String>::new(), Vec::<String>::new());
+        assert_eq!(
+            decide_code(&pr, &seen, 0, 20, Some(&handled), false).unwrap(),
+            CodeAction::Idle
+        );
+
+        pr.merge.checks = ChecksVerdict::AllGreen;
+        pr.ci_label = "green".into();
+        assert!(matches!(
+            decide_code(&pr, &seen, 0, 20, Some(&handled), false).unwrap(),
+            CodeAction::Fix {
+                ci_failed: false,
+                new_notes
+            } if new_notes.is_empty()
+        ));
+    }
+
+    #[test]
+    fn individual_check_change_retriggers_with_the_same_ci_label() {
+        let mut pr = snap("abc", ChecksVerdict::Pending);
+        pr.ci_signature = vec!["build:pending".into(), "lint:pending".into()];
+        let handled = CiHandled::new(
+            "abc",
+            "pending",
+            pr.ci_signature.clone(),
+            Vec::<String>::new(),
+        );
+
+        pr.ci_signature = vec!["build:green".into(), "lint:pending".into()];
+        assert!(matches!(
+            decide_code(&pr, &BTreeSet::new(), 0, 20, Some(&handled), false).unwrap(),
+            CodeAction::Fix {
+                ci_failed: false,
+                new_notes
+            } if new_notes.is_empty()
         ));
     }
 
