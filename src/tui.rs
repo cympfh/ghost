@@ -820,8 +820,24 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
                 .block(block)
                 .scroll((app.scroll as u16, 0));
             frame.render_widget(para, area);
+            if matches!(app.view, View::Log) && app.scroll < max_scroll {
+                draw_goto_bottom(frame, area);
+            }
         }
     }
+}
+
+fn draw_goto_bottom(frame: &mut Frame, area: Rect) {
+    const LABEL: &str = " G goto bottom ";
+    let width = LABEL.len() as u16;
+    let rect = Rect::new(
+        area.right().saturating_sub(width + 1),
+        area.bottom().saturating_sub(2),
+        width,
+        1,
+    );
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(Span::styled(LABEL, theme::selected())), rect);
 }
 
 fn log_rows(lines: &[LogLine], width: usize) -> Vec<Line<'static>> {
@@ -1482,6 +1498,29 @@ mod tests {
             text.contains("running") || text.contains("review"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn goto_bottom_button_only_shows_above_the_log_end() {
+        let mut app = App::new("ghost".into());
+        app.lines = (0..30)
+            .map(|i| LogLine {
+                kind: LogKind::System,
+                text: format!("line {i}"),
+            })
+            .collect();
+        app.stick = false;
+        app.scroll = 0;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("G goto bottom"), "{text}");
+
+        on_key(&mut app, key(KeyCode::Char('G')));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(!text.contains("G goto bottom"), "{text}");
     }
 
     #[test]
