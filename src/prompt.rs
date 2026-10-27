@@ -621,7 +621,7 @@ fn code_comment_policy(lang: Lang, slug: &str, number: u64) -> String {
             "\
 レビューコメントは盲目的に従わなくてよい。一つずつ判断する。
 同意するなら直して commit し、`git push` した後、そのコメントのスレッドに「対応しました」と返信する。
-意図的に対応しないなら、無視しない。そのコメントのスレッドに `gh` で返信し、対応しない理由を書く。判断できないなら、確認の質問をする。
+意図的に対応しない場合も無視しない。そのコメントのスレッドに `gh` で返信し、対応しない理由を書く。判断できないなら、確認の質問をする。
 インラインコメント（id が `inline:123` の形）への返信例:
   gh api --method POST repos/{slug}/pulls/{number}/comments/123/replies -f body='...'
 レビュー本文や issue コメントには `gh pr comment {number} --repo {slug} --body '...'` でよい。curl や API ライブラリは使わない。
