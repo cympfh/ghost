@@ -68,15 +68,15 @@ fn ci_status_rule(lang: Lang, skip_approval: bool) -> &'static str {
     match (lang, skip_approval) {
         (Lang::Ja, true) => "\
 CI とレビューの判断（`GHOST_STATUS` もこれと同じ）:
-- `gh pr checks` の一覧（statusCheckRollup）が空なら CI 未設定として扱う。一覧が空でないなら、今の head のチェックがすべて成功しているときだけ CI は通る。pending や失敗は needs_work。
+- `gh pr checks` の一覧（statusCheckRollup）が空なら CI 未設定として扱う。一覧が空でないなら、今の head のチェックがすべて成功しているときだけ CI が通っている。CIが全て通っているならマージできる。pending や失敗は needs_work。
 - approval や approval 相当のコメントがなくてもCIが通っていればマージできる。未解決の changes requested や修正依頼があれば needs_work。
-- mergeStateStatus が CLEAN、コンフリクトなし、CI とレビューの条件を満たすときだけ `GHOST_STATUS: merge_ready`。
+- mergeStateStatus が CLEAN、コンフリクトなし、CI の条件を満たすときだけ `GHOST_STATUS: merge_ready`。
 ",
         (Lang::En, true) => "\
 CI and review rule (judge `GHOST_STATUS` the same way):
-- An empty `gh pr checks` list (statusCheckRollup) means CI is not configured and is acceptable. If the list is not empty, CI passes only when every check on the current head has passed. Pending or failed checks mean `needs_work`.
+- An empty `gh pr checks` list (statusCheckRollup) means CI is not configured and is acceptable. If the list is not empty, CI passes only when every check on the current head has passed. The pull request can merge when CI passes. Pending or failed checks mean `needs_work`.
 - The pull request can merge when CI passes, even without an approval or approval-equivalent comment. Outstanding changes requested or fix requests mean `needs_work`.
-- Use `GHOST_STATUS: merge_ready` only when mergeStateStatus is CLEAN, there is no conflict, and both the CI and review conditions pass.
+- Use `GHOST_STATUS: merge_ready` only when mergeStateStatus is CLEAN, there is no conflict, and the CI condition passes.
 ",
         (Lang::Ja, false) => "\
 CI とレビューの判断（`GHOST_STATUS` もこれと同じ）:
