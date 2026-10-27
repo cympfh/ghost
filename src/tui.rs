@@ -5,7 +5,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -251,6 +254,8 @@ pub struct App {
     picker_backup: Vec<OpenItem>,
     picker_selected: usize,
     picker_kind: PickerKind,
+    goto_bottom: Option<Rect>,
+    goto_bottom_hovered: bool,
 }
 
 impl App {
@@ -272,6 +277,8 @@ impl App {
             picker_backup: Vec::new(),
             picker_selected: 0,
             picker_kind: PickerKind::Mixed,
+            goto_bottom: None,
+            goto_bottom_hovered: false,
         }
     }
 
@@ -317,7 +324,7 @@ where
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let mut app = App::new(header);
 
@@ -326,7 +333,7 @@ where
     std::panic::set_hook(Box::new(move |info| {
         crate::agent::kill_tracked_agent();
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         hook(info);
     }));
 
@@ -339,13 +346,17 @@ where
             break;
         }
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Release {
-                    continue;
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    if let Some(cmd) = on_key(&mut app, key) {
+                        let _ = cmd_tx.send(cmd);
+                    }
                 }
-                if let Some(cmd) = on_key(&mut app, key) {
-                    let _ = cmd_tx.send(cmd);
-                }
+                Event::Mouse(mouse) => on_mouse(&mut app, mouse),
+                _ => {}
             }
         }
         app.spinner = app.spinner.wrapping_add(1);
@@ -430,7 +441,11 @@ where
 
 fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -728,7 +743,22 @@ fn on_input_key(app: &mut App, key: KeyEvent) -> Option<UiCmd> {
     }
 }
 
+fn on_mouse(app: &mut App, mouse: MouseEvent) {
+    let inside = app
+        .goto_bottom
+        .is_some_and(|rect| rect.contains((mouse.column, mouse.row).into()));
+    match mouse.kind {
+        MouseEventKind::Moved => app.goto_bottom_hovered = inside,
+        MouseEventKind::Down(MouseButton::Left) if inside => app.stick = true,
+        _ => {}
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.goto_bottom = None;
+    if !matches!(app.view, View::Log) {
+        app.goto_bottom_hovered = false;
+    }
     let area = frame.area();
     if area.width < 40 || area.height < 10 {
         frame.render_widget(Paragraph::new("terminal too small"), area);
@@ -821,14 +851,16 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
                 .scroll((app.scroll as u16, 0));
             frame.render_widget(para, area);
             if matches!(app.view, View::Log) && app.scroll < max_scroll {
-                draw_goto_bottom(frame, area);
+                app.goto_bottom = Some(draw_goto_bottom(frame, area, app.goto_bottom_hovered));
+            } else {
+                app.goto_bottom_hovered = false;
             }
         }
     }
 }
 
-fn draw_goto_bottom(frame: &mut Frame, area: Rect) {
-    const LABEL: &str = " G goto bottom ";
+fn draw_goto_bottom(frame: &mut Frame, area: Rect, hovered: bool) -> Rect {
+    const LABEL: &str = " goto bottom ";
     let width = LABEL.len() as u16;
     let rect = Rect::new(
         area.right().saturating_sub(width + 1),
@@ -837,7 +869,13 @@ fn draw_goto_bottom(frame: &mut Frame, area: Rect) {
         1,
     );
     frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(Span::styled(LABEL, theme::selected())), rect);
+    let style = if hovered {
+        theme::cursor()
+    } else {
+        theme::selected()
+    };
+    frame.render_widget(Paragraph::new(Span::styled(LABEL, style)), rect);
+    rect
 }
 
 fn log_rows(lines: &[LogLine], width: usize) -> Vec<Line<'static>> {
@@ -1502,6 +1540,7 @@ mod tests {
 
     #[test]
     fn goto_bottom_button_only_shows_above_the_log_end() {
+        theme::force_colors_for_test(Some(true));
         let mut app = App::new("ghost".into());
         app.lines = (0..30)
             .map(|i| LogLine {
@@ -1515,12 +1554,41 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(term.backend().buffer());
-        assert!(text.contains("G goto bottom"), "{text}");
+        assert!(text.contains("goto bottom"), "{text}");
+        assert!(!text.contains("G goto bottom"), "{text}");
 
-        on_key(&mut app, key(KeyCode::Char('G')));
+        let button = app.goto_bottom.expect("button should be visible");
+        on_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: button.x,
+                row: button.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.goto_bottom_hovered);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(
+            term.backend().buffer()[(button.x, button.y)].bg,
+            ratatui::style::Color::Yellow
+        );
+
+        on_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: button.x,
+                row: button.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.stick);
+
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(term.backend().buffer());
-        assert!(!text.contains("G goto bottom"), "{text}");
+        assert!(!text.contains("goto bottom"), "{text}");
+        theme::force_colors_for_test(None);
     }
 
     #[test]
