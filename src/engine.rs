@@ -3121,18 +3121,23 @@ pub fn confirm_merge_answer(answer: ConfirmAnswer) -> MergeAnswer {
 }
 
 fn record_handled_ci(stored: &mut GhostState, snap: &PrSnap) {
-    if snap.merge.checks == crate::merge::ChecksVerdict::Failed {
-        stored.handled_ci_sha = Some(snap.head_sha.clone());
-        stored.handled_failing_checks = snap.failing_checks.clone();
-    } else {
-        stored.handled_ci_sha = None;
-        stored.handled_failing_checks.clear();
-    }
+    stored.handled_ci_sha = Some(snap.head_sha.clone());
+    stored.handled_ci_label = snap.ci_label.clone();
+    stored.handled_failing_checks = snap.failing_checks.clone();
 }
 
 fn ci_handled(stored: &GhostState) -> Option<CiHandled> {
     let sha = stored.handled_ci_sha.clone()?;
-    Some(CiHandled::new(sha, stored.handled_failing_checks.clone()))
+    let label = if stored.handled_ci_label.is_empty() {
+        "failed".to_string()
+    } else {
+        stored.handled_ci_label.clone()
+    };
+    Some(CiHandled::new(
+        sha,
+        label,
+        stored.handled_failing_checks.clone(),
+    ))
 }
 
 #[cfg(test)]
