@@ -3123,6 +3123,7 @@ pub fn confirm_merge_answer(answer: ConfirmAnswer) -> MergeAnswer {
 fn record_handled_ci(stored: &mut GhostState, snap: &PrSnap) {
     stored.handled_ci_sha = Some(snap.head_sha.clone());
     stored.handled_ci_label = snap.ci_label.clone();
+    stored.handled_ci_signature = snap.ci_signature.clone();
     stored.handled_failing_checks = snap.failing_checks.clone();
 }
 
@@ -3136,6 +3137,7 @@ fn ci_handled(stored: &GhostState) -> Option<CiHandled> {
     Some(CiHandled::new(
         sha,
         label,
+        stored.handled_ci_signature.clone(),
         stored.handled_failing_checks.clone(),
     ))
 }
@@ -3438,6 +3440,7 @@ exit 0
                 changes_requested: false,
             },
             failing_checks: Vec::new(),
+            ci_signature: Vec::new(),
             notes: Vec::new(),
             ci_label: String::new(),
             author: "me".into(),

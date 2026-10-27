@@ -28,6 +28,8 @@ pub struct GhostState {
     #[serde(default)]
     pub handled_ci_label: String,
     #[serde(default)]
+    pub handled_ci_signature: Vec<String>,
+    #[serde(default)]
     pub handled_failing_checks: Vec<String>,
     /// Comment ids written by the agent (same gh user) so they are not new work.
     #[serde(default)]

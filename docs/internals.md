@@ -81,7 +81,7 @@ Each check logs `reviews N, inline N, comments N` from `gh api`: review submissi
 
 On launch, review, code, and issue mode each start the agent once, even when saved state says nothing is new. That launch starts a new session. Later checks call the agent only when something changed: a new commit in review, or new feedback or a changed CI state in code. A failed turn does not mark that commit, CI state, or those comments done. A failed resume starts a fresh session with the same context. A resume that dies because the session is missing (`no rollout found`) or because the arguments were rejected does not count as a turn and does not wait. A prompt write that gets `EPIPE` fails that turn and does not kill ghost. Real failures back off from 20 seconds, doubling up to 10 minutes, and ghost exits 1 after five in a row.
 
-The same CI state on the same commit is not sent again until the state changes. A failed state also changes when its set of failing checks changes. A rate-limit retry happens only when the command's exit code is not 0 and stderr says rate limit, HTTP 429, or secondary rate.
+The same CI state on the same commit is not sent again until the state changes. This includes aggregate transitions between no checks, pending, failed, and green, plus changes to each check's status or conclusion while the aggregate state stays the same. A rate-limit retry happens only when the command's exit code is not 0 and stderr says rate limit, HTTP 429, or secondary rate.
 
 `i` always reaches the agent. A running turn queues the line and sends it when the turn ends. Comments the agent posts during that queued follow-up are not treated as new work. The log says `→ エージェントに送信`, or a queued line that includes that phrase.
 

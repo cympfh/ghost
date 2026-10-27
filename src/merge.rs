@@ -360,6 +360,25 @@ pub fn judge_checks(rollup: &[Value]) -> (ChecksVerdict, Vec<String>) {
     }
 }
 
+/// Stable details for detecting changes within the same aggregate CI verdict.
+pub fn check_signature(rollup: &[Value]) -> Vec<String> {
+    let mut signature: Vec<String> = rollup
+        .iter()
+        .map(|item| {
+            serde_json::to_string(&(
+                item.get("__typename").and_then(Value::as_str).unwrap_or(""),
+                check_name(item),
+                item.get("status").and_then(Value::as_str).unwrap_or(""),
+                item.get("conclusion").and_then(Value::as_str).unwrap_or(""),
+                item.get("state").and_then(Value::as_str).unwrap_or(""),
+            ))
+            .unwrap_or_default()
+        })
+        .collect();
+    signature.sort();
+    signature
+}
+
 fn check_name(v: &Value) -> String {
     for key in ["name", "context", "workflowName"] {
         if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
