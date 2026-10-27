@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-27
+
+### Added
+
+- Add `--skip-approval` to allow merge readiness without an approving review while still requiring passing CI.
+- Wake the coding agent when the CI state changes, including transitions between pending, success, and failure.
+
+### Changed
+
+- Tell the coding agent to reply to actionable review comments after addressing them.
+
+### Fixed
+
+- Preserve Kimi sessions when handing off from issue mode to a code worktree.
+- Build skip-approval prompts from the effective merge policy so agent status matches ghost's structural checks.
+
+(git commit: 7c8b711)
+
 ## [0.3.0] - 2026-10-26
 
 ### Added
