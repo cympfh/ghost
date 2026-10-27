@@ -951,6 +951,7 @@ impl Ctx {
             &user_notes,
             self.spec.lang,
             &push,
+            self.spec.skip_approval,
         ));
         let ok = self.dispatch_task(&task)?;
         self.note_setup_result(ok);
@@ -1034,6 +1035,7 @@ impl Ctx {
                 self.spec.lang,
                 &push,
                 created_here,
+                self.spec.skip_approval,
             )
         } else {
             prompt::code_initial(
@@ -1048,6 +1050,7 @@ impl Ctx {
                 &user_notes,
                 self.spec.lang,
                 &push,
+                self.spec.skip_approval,
             )
         });
         let prompted: BTreeSet<String> = new_notes.iter().map(|n| n.id.clone()).collect();
@@ -1471,6 +1474,7 @@ impl Ctx {
                 pr,
                 &user_notes,
                 self.spec.lang,
+                self.spec.skip_approval,
             )
         } else {
             prompt::issue_initial(
@@ -1483,6 +1487,7 @@ impl Ctx {
                 &self.workdir,
                 &user_notes,
                 self.spec.lang,
+                self.spec.skip_approval,
             )
         };
         if self.agent.session_id().is_some() {
@@ -2189,11 +2194,6 @@ impl Ctx {
     }
 
     fn decorate(&mut self, task: String) -> String {
-        let task = if self.spec.skip_approval {
-            format!("{task}\n{}", prompt::skip_approval_rule(self.spec.lang))
-        } else {
-            task
-        };
         if self.setup_failures.is_empty() {
             return task;
         }
@@ -3392,12 +3392,23 @@ exit 0
     }
 
     #[test]
-    fn skip_approval_is_added_to_agent_tasks() {
-        let (mut ctx, _events, _commands) = merge_ctx(false);
-        ctx.spec.skip_approval = true;
-        let task = ctx.decorate("task".into());
+    fn skip_approval_is_selected_when_building_agent_tasks() {
+        let task = crate::prompt::code_survey(
+            "acme/app",
+            1,
+            "feature",
+            "abc",
+            std::path::Path::new("/tmp/work"),
+            false,
+            &[],
+            &[],
+            &[],
+            crate::lang::Lang::Ja,
+            "push",
+            true,
+        );
         assert!(task.contains("approval 相当のコメントがなくても"));
-        assert!(task.contains("CI の条件は変更せず"));
+        assert!(!task.contains("approve が1件以上"));
     }
 
     #[test]
