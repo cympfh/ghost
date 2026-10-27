@@ -255,6 +255,7 @@ pub struct App {
     picker_selected: usize,
     picker_kind: PickerKind,
     goto_bottom: Option<Rect>,
+    goto_bottom_hovered: bool,
 }
 
 impl App {
@@ -277,6 +278,7 @@ impl App {
             picker_selected: 0,
             picker_kind: PickerKind::Mixed,
             goto_bottom: None,
+            goto_bottom_hovered: false,
         }
     }
 
@@ -742,19 +744,21 @@ fn on_input_key(app: &mut App, key: KeyEvent) -> Option<UiCmd> {
 }
 
 fn on_mouse(app: &mut App, mouse: MouseEvent) {
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-        return;
-    }
-    if app
+    let inside = app
         .goto_bottom
-        .is_some_and(|rect| rect.contains((mouse.column, mouse.row).into()))
-    {
-        app.stick = true;
+        .is_some_and(|rect| rect.contains((mouse.column, mouse.row).into()));
+    match mouse.kind {
+        MouseEventKind::Moved => app.goto_bottom_hovered = inside,
+        MouseEventKind::Down(MouseButton::Left) if inside => app.stick = true,
+        _ => {}
     }
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.goto_bottom = None;
+    if !matches!(app.view, View::Log) {
+        app.goto_bottom_hovered = false;
+    }
     let area = frame.area();
     if area.width < 40 || area.height < 10 {
         frame.render_widget(Paragraph::new("terminal too small"), area);
@@ -847,13 +851,15 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
                 .scroll((app.scroll as u16, 0));
             frame.render_widget(para, area);
             if matches!(app.view, View::Log) && app.scroll < max_scroll {
-                app.goto_bottom = Some(draw_goto_bottom(frame, area));
+                app.goto_bottom = Some(draw_goto_bottom(frame, area, app.goto_bottom_hovered));
+            } else {
+                app.goto_bottom_hovered = false;
             }
         }
     }
 }
 
-fn draw_goto_bottom(frame: &mut Frame, area: Rect) -> Rect {
+fn draw_goto_bottom(frame: &mut Frame, area: Rect, hovered: bool) -> Rect {
     const LABEL: &str = " goto bottom ";
     let width = LABEL.len() as u16;
     let rect = Rect::new(
@@ -863,7 +869,12 @@ fn draw_goto_bottom(frame: &mut Frame, area: Rect) -> Rect {
         1,
     );
     frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(Span::styled(LABEL, theme::selected())), rect);
+    let style = if hovered {
+        theme::cursor()
+    } else {
+        theme::selected()
+    };
+    frame.render_widget(Paragraph::new(Span::styled(LABEL, style)), rect);
     rect
 }
 
@@ -1529,6 +1540,7 @@ mod tests {
 
     #[test]
     fn goto_bottom_button_only_shows_above_the_log_end() {
+        theme::force_colors_for_test(Some(true));
         let mut app = App::new("ghost".into());
         app.lines = (0..30)
             .map(|i| LogLine {
@@ -1549,6 +1561,22 @@ mod tests {
         on_mouse(
             &mut app,
             MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: button.x,
+                row: button.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.goto_bottom_hovered);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(
+            term.backend().buffer()[(button.x, button.y)].bg,
+            ratatui::style::Color::Yellow
+        );
+
+        on_mouse(
+            &mut app,
+            MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: button.x,
                 row: button.y,
@@ -1560,6 +1588,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(term.backend().buffer());
         assert!(!text.contains("goto bottom"), "{text}");
+        theme::force_colors_for_test(None);
     }
 
     #[test]
