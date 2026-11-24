@@ -67,7 +67,7 @@ fn is_exec(path: &Path) -> bool {
 }
 
 /// `Tty` inherits the terminal so ssh can ask for a passphrase.
-/// `Batch` refuses prompts (`GIT_TERMINAL_PROMPT=0` and ssh `BatchMode`).
+/// Both modes refuse Git username/password prompts; `Batch` also sets ssh `BatchMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptMode {
     Tty,
@@ -140,10 +140,8 @@ pub fn prompt_env(
     let mut env = vec![
         ("GH_PROMPT_DISABLED", "1".into()),
         ("GH_NO_UPDATE_NOTIFIER", "1".into()),
+        ("GIT_TERMINAL_PROMPT", "0".into()),
     ];
-    if mode == PromptMode::Batch {
-        env.push(("GIT_TERMINAL_PROMPT", "0".into()));
-    }
     if let Some(cmd) = git_ssh_command(mode, ssh_key, existing_ssh) {
         env.push(("GIT_SSH_COMMAND", cmd));
     }
@@ -177,14 +175,30 @@ pub fn with_credential_hint(text: &str) -> String {
     }
 }
 
-fn apply_prompt_env(cmd: &mut Command, mode: PromptMode) {
+pub(crate) fn apply_prompt_env(cmd: &mut Command, mode: PromptMode) {
     let existing = std::env::var("GIT_SSH_COMMAND").ok();
     let key = ssh_key();
     for (name, value) in prompt_env(mode, key.as_deref(), existing.as_deref()) {
         cmd.env(name, value);
     }
-    if mode == PromptMode::Tty {
-        cmd.env_remove("GIT_TERMINAL_PROMPT");
+    // Append process-local Git config, preserving any inherited entries. This
+    // covers clone, reused checkouts, and the agent without changing user config.
+    let count = cmd
+        .get_envs()
+        .find(|(key, _)| *key == "GIT_CONFIG_COUNT")
+        .and_then(|(_, value)| value)
+        .and_then(|value| value.to_str())
+        .map(str::to_owned)
+        .or_else(|| std::env::var("GIT_CONFIG_COUNT").ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    cmd.env("GIT_CONFIG_COUNT", (count + 2).to_string());
+    for (index, value) in [(count, ""), (count + 1, "!gh auth git-credential")] {
+        cmd.env(
+            format!("GIT_CONFIG_KEY_{index}"),
+            "credential.https://github.com.helper",
+        );
+        cmd.env(format!("GIT_CONFIG_VALUE_{index}"), value);
     }
 }
 
@@ -457,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_env_refuses_prompts_and_tty_allows_them() {
+    fn both_modes_refuse_git_prompts_and_only_batch_disables_ssh_prompts() {
         let batch = prompt_env(PromptMode::Batch, None, None);
         assert!(batch
             .iter()
@@ -469,7 +483,81 @@ mod tests {
         let tty = prompt_env(PromptMode::Tty, None, None);
         assert!(tty
             .iter()
-            .all(|(k, _)| { *k != "GIT_TERMINAL_PROMPT" && *k != "GIT_SSH_COMMAND" }));
+            .any(|(k, v)| *k == "GIT_TERMINAL_PROMPT" && v == "0"));
+        assert!(tty.iter().all(|(k, _)| *k != "GIT_SSH_COMMAND"));
+    }
+
+    #[test]
+    fn github_credentials_use_gh_and_preserve_existing_git_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-credentials-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gh = dir.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GHOST_TEST_CREDENTIAL_ARGS\"\ncat > \"$GHOST_TEST_CREDENTIAL_INPUT\"\nprintf 'username=ghost-test\\npassword=fake-test-password\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for mode in [PromptMode::Tty, PromptMode::Batch] {
+            let mut cmd = Command::new("git");
+            cmd.args(["credential", "fill"])
+                .current_dir(&dir)
+                .env(
+                    "PATH",
+                    format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+                )
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_COUNT", "2")
+                .env("GIT_CONFIG_KEY_0", "credential.helper")
+                .env(
+                    "GIT_CONFIG_VALUE_0",
+                    "!printf 'username=wrong\\npassword=wrong\\n'",
+                )
+                .env("GIT_CONFIG_KEY_1", "credential.useHttpPath")
+                .env("GIT_CONFIG_VALUE_1", "true")
+                .env("GHOST_TEST_CREDENTIAL_ARGS", dir.join("args"))
+                .env("GHOST_TEST_CREDENTIAL_INPUT", dir.join("input"));
+            apply_prompt_env(&mut cmd, mode);
+            let out = capture_once(
+                &mut cmd,
+                Some(b"url=https://github.com/acme/app.git\n\n"),
+                "git credential fill",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert!(out.stdout.contains("username=ghost-test"), "{}", out.stdout);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("args")).unwrap(),
+                "auth\ngit-credential\nget\n"
+            );
+            let input = std::fs::read_to_string(dir.join("input")).unwrap();
+            assert!(input.contains("host=github.com"), "{input}");
+            assert!(input.contains("path=acme/app.git"), "{input}");
+
+            let other = capture_once(
+                &mut cmd,
+                Some(b"url=https://example.com/acme/app.git\n\n"),
+                "git credential fill for another host",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(other.code, 0, "{}", other.stderr);
+            assert!(other.stdout.contains("username=wrong"), "{}", other.stdout);
+            assert_eq!(std::fs::read_to_string(dir.join("input")).unwrap(), input);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

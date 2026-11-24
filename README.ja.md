@@ -10,6 +10,8 @@ ghost はローカルのコーディングエージェントにプルリクエ�
 
 [GitHub CLI](https://cli.github.com/) と、`PATH` 上の `codex`、`claude`、`grok`、`kimi` のいずれかが必要です。ログインには `gh auth login` を使います。
 
+ghost は `gh repo clone` でクローンし、HTTPS の Git 操作にも `gh` の認証を使います。Git のユーザー名やパスワードは尋ねません。`gh` が未認証なら、ログイン方法を表示して TUI を開く前に終了します。
+
 ```sh
 cargo install --git https://github.com/cympfh/ghost
 ```

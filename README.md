@@ -10,6 +10,8 @@ ghost has a local coding agent review a pull request, implement an issue, or fix
 
 You need the [GitHub CLI](https://cli.github.com/) and one of `codex`, `claude`, `grok`, or `kimi` on `PATH`. Log in with `gh auth login`.
 
+ghost clones with `gh repo clone` and uses `gh` authentication for HTTPS Git operations without asking for a Git username or password. If `gh` is not authenticated, ghost prints the login instructions and exits before opening the TUI.
+
 ```sh
 cargo install --git https://github.com/cympfh/ghost
 ```

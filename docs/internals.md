@@ -4,7 +4,7 @@ Details behind the short READMEs. ghost talks to GitHub only through `gh`.
 
 A target is `github.com/OWNER/REPO`, `.../pull/N`, `.../pulls`, `.../issues/N`, or `.../issues`. `/pulls` lists open pull requests and requires `--code` or `--review` before any network call; the error is `/pulls requires --code or --review`. `/pulls/N` is rejected, and the error names `/pull/N`. `/pr/N` and `/issue/N` are rejected, and the error names `/pull/N` or `/issues/N`. The local ref `refs/remotes/origin/pr/N` is where a fetched `pull/N/head` is stored. It is not a URL ghost accepts.
 
-You need `gh` (`gh auth login`) and one of `codex`, `claude`, `grok`, or `kimi` on `PATH`. Install with `cargo install --git https://github.com/cympfh/ghost`. If `gh` is missing, not logged in, or cannot read the repository, ghost explains the fix and exits. It also stops when no coding agent is on `PATH`.
+You need `gh` (`gh auth login`) and one of `codex`, `claude`, `grok`, or `kimi` on `PATH`. Install with `cargo install --git https://github.com/cympfh/ghost`. If `gh` is missing or not logged in, ghost explains the fix and exits before opening the TUI or preparing a checkout. A repository probe failure is handed to the agent as a setup failure. ghost also stops when no coding agent is on `PATH`.
 
 ## Flags
 
@@ -139,6 +139,8 @@ Secondary text is ANSI gray, not bright black. A non-empty `NO_COLOR` turns colo
 ## Working copies
 
 `gh repo clone` writes `~/.ghost/work/OWNER__REPO` and leaves it after exit. Review and code use separate directories, `pr-N-review` and `pr-N-code`, each with its own worktree, lock, and state file under `~/.ghost/work/OWNER__REPO.wt/`. The local branch name is that directory name. It does not track `origin`.
+
+HTTPS Git operations on `github.com` use `gh auth git-credential` as their credential helper, including fetches in reused clones and Git commands run by the agent. This is process-local Git configuration; user and repository config files are not changed. Git username/password prompts are disabled even during initial setup. SSH setup still allows a key passphrase prompt before the TUI starts.
 
 ghost fetches `origin pull/N/head` into `refs/remotes/origin/pr/N` and checks that commit out. It does not fetch `refs/heads/<headRef>` into `origin`, so a fork whose branch is also named `main` leaves `origin/main` where it is. A same-repository push is `git push origin HEAD:<headRef>`. A fork is pushed to the head repository only when `maintainerCanModify` is set. If `gh` omits the head URL, ghost uses `git@github.com:owner/name.git` so `--ssh-key` applies. Otherwise `git push` is refused.
 

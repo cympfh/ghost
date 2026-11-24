@@ -99,7 +99,7 @@ pub fn run(spec: RunSpec) -> Result<i32> {
     let header = spec.header.clone();
     let mut failures = Vec::new();
     let login = match classify_startup(&spec.target.slug(), spec.lang) {
-        Startup::Fatal(message) => return show_fatal(header, message),
+        Startup::Fatal(message) => anyhow::bail!("{message}"),
         Startup::Continue { login, failure } => {
             if let Some(failure) = failure {
                 failures.push(failure);
@@ -190,14 +190,6 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
         "unknown panic".into()
     };
     format!("worker panicked: {text}")
-}
-
-fn show_fatal(header: String, message: String) -> Result<i32> {
-    tui::run(header, move |tx, rx| {
-        let _ = tx.send(UiEvent::Fatal(message.clone()));
-        wait_quit(&rx);
-        let _ = tx.send(UiEvent::Exit { code: 1, message });
-    })
 }
 
 fn prime_checkout(
@@ -2998,15 +2990,6 @@ fn failed_checkout(
     }
 }
 
-fn wait_quit(rx: &Receiver<UiCmd>) {
-    loop {
-        match rx.recv() {
-            Ok(UiCmd::Quit) | Err(_) => return,
-            Ok(_) => {}
-        }
-    }
-}
-
 fn pull_number(target: &GhTarget) -> Result<u64> {
     match target {
         GhTarget::Pull { number, .. } => Ok(*number),
@@ -3226,6 +3209,42 @@ mod tests {
                 None => std::env::remove_var(self.0),
             }
         }
+    }
+
+    #[test]
+    fn unauthenticated_startup_exits_before_preparing_a_checkout() {
+        let _lock = path_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "ghost-unauthenticated-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("unexpected-command");
+        write_exe(
+            &dir.join("gh"),
+            "#!/bin/sh\nif [ \"$1 $2\" = 'auth status' ]; then\n  echo 'You are not logged into any GitHub hosts.' >&2\n  exit 1\nfi\n: > \"${0%/*}/unexpected-command\"\nexit 1\n",
+        );
+        let old_path = std::env::var("PATH").ok();
+        let _path = RestoreVar("PATH", old_path.clone());
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", dir.display(), old_path.unwrap_or_default()),
+        );
+        let _home = RestoreVar("GHOST_HOME", std::env::var("GHOST_HOME").ok());
+        let home = dir.join("home");
+        std::env::set_var("GHOST_HOME", &home);
+
+        let (ctx, _rx, _cmd) = merge_ctx(false);
+        let err = super::run(ctx.spec).unwrap_err();
+        assert!(err.to_string().contains("認証されていません"), "{err}");
+        assert!(err.to_string().contains("gh auth login"), "{err}");
+        assert!(!marker.exists(), "startup must not query or clone the repo");
+        assert!(!home.exists(), "startup must not create a checkout");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn merge_ctx(
