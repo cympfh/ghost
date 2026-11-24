@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-24
+
+### Added
+
+- Add a clickable goto-bottom button with hover feedback when the log view is scrolled above the latest output.
+
+### Fixed
+
+- Use GitHub CLI credentials for HTTPS Git operations during setup and agent turns, and disable Git username/password prompts.
+- Exit before opening the TUI or preparing a checkout when GitHub CLI is missing or not authenticated.
+- Require successful GitHub approval reviews instead of approval-equivalent comments before the agent reports approval and review mode exits.
+
+(git commit: e2f01d0)
+
 ## [0.4.0] - 2026-10-27
 
 ### Added
