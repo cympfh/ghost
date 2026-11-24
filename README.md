@@ -28,6 +28,8 @@ ghost github.com/OWNER/REPO/issues/N         # implement, open a pull request, t
 ghost github.com/OWNER/REPO/issues --auto    # oldest open issue, then the next
 ```
 
+In review mode, the agent submits `gh pr review --approve` when the change is fine. An approval-equivalent comment does not end review mode. GitHub rejects approval of your own pull request; use a different reviewer account to approve it.
+
 The agent runs with its permission prompts turned off, and --auto acts on issue text without asking. Use ghost only on repositories you trust. See [Agent permissions](docs/internals.md#agent-permissions).
 
 The rest of the guide is in [docs/internals.md](docs/internals.md).

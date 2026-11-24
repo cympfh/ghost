@@ -90,8 +90,8 @@ impl StopReason {
                 &format!("PR #{number} is closed. Exiting."),
             ),
             Self::ReviewApproved => lang.say(
-                "承認相当のレビューを投稿したので終了します",
-                "Posted an approve-equivalent review. Exiting.",
+                "承認レビューを投稿したので終了します",
+                "Posted an approval review. Exiting.",
             ),
         }
     }

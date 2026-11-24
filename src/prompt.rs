@@ -121,18 +121,20 @@ fn review_verdict_rules(lang: Lang, slug: &str, number: u64) -> String {
              GHOST_VERDICT: approve\n\
              GHOST_VERDICT: request_changes\n\
              GHOST_VERDICT: comment\n\
-             あなたがこのプルリクエストの作者で、GitHub が approve を拒否する場合は `--approve` を使わない。\
-             代わりに `gh pr review {number} --repo {slug} --comment --body \"LGTM / 承認相当\"` を投稿し、\
-             最後の行は `GHOST_VERDICT: approve` のままにする。\n"
+             問題がなければ、必ず `gh pr review {number} --repo {slug} --approve --body \"...\"` を実行する。\
+             承認相当のコメントで代用しない。コマンドが成功した場合だけ `GHOST_VERDICT: approve` を出す。\
+             自分の PR への承認などを GitHub が拒否した場合は、失敗した理由を報告し、\
+             最後の行は `GHOST_VERDICT: comment` にする。\n"
         ),
         Lang::En => format!(
             "The last line must be exactly one of these, with nothing else on that line:\n\
              GHOST_VERDICT: approve\n\
              GHOST_VERDICT: request_changes\n\
              GHOST_VERDICT: comment\n\
-             If you are the pull request author and GitHub rejects approve, do not use `--approve`. \
-             Post `gh pr review {number} --repo {slug} --comment --body \"LGTM / 承認相当\"` instead, \
-             and still end with `GHOST_VERDICT: approve`.\n"
+             When the change is fine, you must run `gh pr review {number} --repo {slug} --approve --body \"...\"`. \
+             Do not substitute an approval-equivalent comment. Emit `GHOST_VERDICT: approve` only after the command succeeds. \
+             If GitHub rejects the approval, including approval of your own pull request, report the failure reason \
+             and end with `GHOST_VERDICT: comment`.\n"
         ),
     }
 }
@@ -726,6 +728,30 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn review_prompts_require_successful_github_approval() {
+        let dir = Path::new("/tmp/work");
+        for (lang, success_rule, failure_rule) in [
+            (Lang::Ja, "コマンドが成功した場合だけ", "失敗した理由を報告"),
+            (
+                Lang::En,
+                "only after the command succeeds",
+                "report the failure reason",
+            ),
+        ] {
+            for task in [
+                review_initial("acme/app", 3, "title", "abc", dir, "diff", &[], lang),
+                review_followup("acme/app", 3, "title", "abc", "def", dir, "diff", &[], lang),
+            ] {
+                assert!(task.contains("gh pr review 3 --repo acme/app --approve --body"));
+                assert!(task.contains(success_rule), "{task}");
+                assert!(task.contains(failure_rule), "{task}");
+                assert!(task.contains("GHOST_VERDICT: comment"));
+                assert!(!task.contains("LGTM / 承認相当"));
+            }
+        }
+    }
+
+    #[test]
     fn prompts_require_gh_and_allow_merge() {
         let dir = Path::new("/home/u/.ghost/work/acme__app");
         let review = review_initial(
@@ -744,7 +770,7 @@ mod tests {
         assert!(review.contains("api.github.com"));
         assert!(review.contains("--approve"));
         assert!(review.contains("GHOST_VERDICT: approve"));
-        assert!(review.contains("LGTM / 承認相当"));
+        assert!(!review.contains("LGTM / 承認相当"));
         assert!(review.contains("<<<UNTRUSTED_DIFF>>>"));
         assert!(review.contains("<<<UNTRUSTED_TITLE>>>"));
         assert!(review.contains("Fix login"));
@@ -918,7 +944,7 @@ mod tests {
         assert!(review.contains("日本語"));
         assert!(!review.contains("マージしない"));
         assert!(review.contains("GHOST_VERDICT: approve"));
-        assert!(review.contains("LGTM / 承認相当"));
+        assert!(!review.contains("LGTM / 承認相当"));
         let code = code_initial(
             "acme/app",
             2,

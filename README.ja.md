@@ -28,6 +28,8 @@ ghost github.com/OWNER/REPO/issues/N         # 実装してプルリクエスト
 ghost github.com/OWNER/REPO/issues --auto    # いちばん古い issue から順に進める
 ```
 
+レビューでは、問題がなければエージェントが `gh pr review --approve` で承認します。承認相当のコメントだけではレビューを終了しません。GitHub は自分の PR への承認を拒否するため、承認には別のレビュー担当者のアカウントが必要です。
+
 エージェントは許可の確認を切った状態で動きます。--auto は issue の本文に従って、確認せずに作業します。信頼できるリポジトリでだけ使ってください。詳しくは [Agent permissions](docs/internals.md#agent-permissions) を見てください。
 
 詳しい説明は [docs/internals.md](docs/internals.md) にあります。
