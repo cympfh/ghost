@@ -251,15 +251,10 @@ pub fn opening_runs_agent(saved_says_idle: bool) -> bool {
     true
 }
 
-/// True when this head should end review mode with an approve verdict.
-/// An explicit non-approve verdict wins. With no verdict line, a self-review
-/// comment that says `LGTM / 承認相当` still counts as approve.
+/// Only an explicit approve verdict ends review mode. An approval-equivalent
+/// comment does not mean a GitHub approval was submitted.
 pub fn approve_signal(output: &str) -> bool {
-    match parse_ghost_verdict(output) {
-        Some(ReviewVerdict::Approve) => true,
-        Some(_) => false,
-        None => output.contains("LGTM / 承認相当"),
-    }
+    parse_ghost_verdict(output) == Some(ReviewVerdict::Approve)
 }
 
 /// First turn of a review process always runs, even when this SHA was reviewed before.
@@ -287,7 +282,7 @@ pub fn review_step(launch: ReviewLaunch, opened: bool, action: ReviewAction) -> 
     ReviewStep::Action(action)
 }
 
-/// Approve (verdict or a real APPROVE on this SHA) exits review mode.
+/// An explicit approve verdict exits review mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfterVerdict {
     Exit,
@@ -761,10 +756,6 @@ mod tests {
         assert_eq!(after_review_verdict(false), AfterVerdict::Poll);
         assert!(opening_runs_agent(true));
         assert!(opening_runs_agent(false));
-        assert!(approve_signal("notes\nGHOST_VERDICT: approve\n"));
-        assert!(!approve_signal("LGTM / 承認相当\nGHOST_VERDICT: comment"));
-        assert!(approve_signal("posted LGTM / 承認相当"));
-        assert!(!approve_signal("looks fine"));
         assert_eq!(
             parse_ghost_verdict("notes\nGHOST_VERDICT: approve\n"),
             Some(ReviewVerdict::Approve)
@@ -780,6 +771,24 @@ mod tests {
             Some(false)
         );
         assert_eq!(merge_ready_signal("looks ready"), None);
+    }
+
+    #[test]
+    fn review_approval_requires_an_explicit_verdict() {
+        assert!(approve_signal("notes\nGHOST_VERDICT: approve\n"));
+        for output in [
+            "posted LGTM / 承認相当",
+            "looks fine",
+            "LGTM / 承認相当\nGHOST_VERDICT: comment",
+            "GHOST_VERDICT: approve\nGitHub rejected approval\nGHOST_VERDICT: comment",
+            "GHOST_VERDICT: request_changes",
+        ] {
+            assert!(!approve_signal(output), "{output}");
+            assert_eq!(
+                after_review_verdict(approve_signal(output)),
+                AfterVerdict::Poll
+            );
+        }
     }
 
     #[test]

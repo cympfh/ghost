@@ -101,7 +101,7 @@ Review prompts wrap the title, diff, and comment bodies:
 
 Each block ends with `<<<END_UNTRUSTED_…>>>`. Copies of those markers inside the text, including different case and whitespace, are replaced before the real markers are added. The wrapping is not a security boundary. A hostile diff can still confuse the agent.
 
-A review turn that ends with `GHOST_VERDICT: approve` exits automatically. On your own pull request, if GitHub rejects approve, the agent posts `gh pr review --comment` with `LGTM / 承認相当` and still ends with `GHOST_VERDICT: approve`.
+A review turn that ends with an explicit `GHOST_VERDICT: approve` exits automatically. The agent must submit `gh pr review --approve` successfully before emitting that verdict; an approval-equivalent comment is not a substitute and does not end review mode. If GitHub rejects the approval, including approval of your own pull request, the agent reports the failure reason and ends with `GHOST_VERDICT: comment`. Review mode continues watching for a new head or user input. Use a different reviewer account to approve your own pull request.
 
 ## When ghost merges
 
