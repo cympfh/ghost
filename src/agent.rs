@@ -974,14 +974,7 @@ impl AgentSession {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let existing_ssh = std::env::var("GIT_SSH_COMMAND").ok();
-        for (key, value) in shell::prompt_env(
-            PromptMode::Batch,
-            shell::ssh_key().as_deref(),
-            existing_ssh.as_deref(),
-        ) {
-            cmd.env(key, value);
-        }
+        shell::apply_prompt_env(&mut cmd, PromptMode::Batch);
         let parent_path = std::env::var("PATH").unwrap_or_default();
         let bin = self.prompt_dir.join("bin");
         let mut guard_dir = None;
